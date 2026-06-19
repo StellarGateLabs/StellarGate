@@ -20,6 +20,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
     axum::Router::new()
         .route("/", get(|| async { "StellarGate API v0.1.0" }))
         .route("/health", get(health))
+        .route("/ready", axum::routing::get(ready))
         .route("/payments", post(payments::create).get(payments::list))
         .route("/payments/:id", get(payments::get_by_id))
         .fallback(not_found)
@@ -31,6 +32,23 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
 
 async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
+}
+
+use axum::extract::State;
+
+async fn ready(
+    State(state): State<Arc<AppState>>,
+) -> (axum::http::StatusCode, &'static str) {
+    match sqlx::query("SELECT 1")
+        .fetch_one(&state.db)
+        .await
+    {
+        Ok(_) => (axum::http::StatusCode::OK, "ready"),
+        Err(_) => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "db down",
+        ),
+    }
 }
 
 async fn not_found() -> impl IntoResponse {
