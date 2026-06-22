@@ -266,61 +266,53 @@ pub async fn list_payments_keyset(
     cursor: Option<(&str, &str)>,
 ) -> Result<Vec<Payment>> {
     let rows = match (status, cursor) {
-        (None, None) => {
-            sqlx::query(
-                "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+        (None, None) => sqlx::query(
+            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments ORDER BY created_at DESC, id DESC LIMIT ?",
-            )
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
-        }
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await?,
 
-        (None, Some((ts, cid))) => {
-            sqlx::query(
-                "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+        (None, Some((ts, cid))) => sqlx::query(
+            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments
              WHERE (created_at < ? OR (created_at = ? AND id < ?))
              ORDER BY created_at DESC, id DESC LIMIT ?",
-            )
-            .bind(ts)
-            .bind(ts)
-            .bind(cid)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
-        }
+        )
+        .bind(ts)
+        .bind(ts)
+        .bind(cid)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?,
 
-        (Some(s), None) => {
-            sqlx::query(
-                "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+        (Some(s), None) => sqlx::query(
+            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments WHERE status = ? ORDER BY created_at DESC, id DESC LIMIT ?",
-            )
-            .bind(s)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
-        }
+        )
+        .bind(s)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?,
 
-        (Some(s), Some((ts, cid))) => {
-            sqlx::query(
-                "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+        (Some(s), Some((ts, cid))) => sqlx::query(
+            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments
              WHERE status = ? AND (created_at < ? OR (created_at = ? AND id < ?))
              ORDER BY created_at DESC, id DESC LIMIT ?",
-            )
-            .bind(s)
-            .bind(ts)
-            .bind(ts)
-            .bind(cid)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
-        }
+        )
+        .bind(s)
+        .bind(ts)
+        .bind(ts)
+        .bind(cid)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?,
     };
 
     Ok(rows.iter().map(row_to_payment).collect())
@@ -469,12 +461,7 @@ pub async fn save_webhook_delivery(
     Ok(())
 }
 
-pub async fn update_webhook_delivery(
-    pool: &Db,
-    id: &str,
-    status: &str,
-    attempts: i64,
-) -> Result<()> {
+pub async fn update_webhook_delivery(pool: &Db, id: &str, status: &str, attempts: i64) -> Result<()> {
     sqlx::query(
         "UPDATE webhook_deliveries SET status = ?, attempts = ?, last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
     )
@@ -614,10 +601,7 @@ mod tests {
         let fetched = get_payment(&pool, "dead").await.unwrap().unwrap();
         assert_eq!(fetched.status, "expired");
         // The live intent is untouched.
-        assert_eq!(
-            get_payment(&pool, "live").await.unwrap().unwrap().status,
-            "pending"
-        );
+        assert_eq!(get_payment(&pool, "live").await.unwrap().unwrap().status, "pending");
 
         // A second sweep is a no-op — nothing is double-reported.
         assert_eq!(expire_overdue(&pool).await.unwrap().len(), 0);
