@@ -22,6 +22,8 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/health", get(health))
         .route("/payments", post(payments::create).get(payments::list))
         .route("/payments/:id", get(payments::get_by_id))
+        .route("/payments/:id/webhooks", get(payments::list_webhooks))
+        .route("/payments/:id/webhooks/:delivery_id/redeliver", post(payments::redeliver_webhook))
         .fallback(not_found)
         .layer(TraceLayer::new_for_http())
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
