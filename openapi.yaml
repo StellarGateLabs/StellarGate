@@ -1,0 +1,332 @@
+openapi: 3.1.0
+info:
+  title: StellarGate
+  description: Payment gateway API built on Stellar for accepting and managing payments in XLM and USDC.
+  version: 0.1.0
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+
+paths:
+  /health:
+    get:
+      operationId: health
+      summary: Health check
+      responses:
+        "200":
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /payments:
+    post:
+      operationId: createPayment
+      summary: Create a payment intent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePaymentRequest"
+      responses:
+        "201":
+          description: Payment intent created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Payment"
+        "400":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+    get:
+      operationId: listPayments
+      summary: List payments
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/PaymentStatus"
+          description: Filter by status
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: Page size
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+          description: Rows to skip (offset pagination)
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque cursor for keyset pagination (returned as next_cursor)
+      responses:
+        "200":
+          description: Paginated list of payments
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListPaymentsResponse"
+        "400":
+          description: Invalid query parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /payments/{id}:
+    get:
+      operationId: getPayment
+      summary: Get a payment by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Payment found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Payment"
+        "404":
+          description: Payment not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /payments/{id}/webhooks:
+    get:
+      operationId: listWebhookDeliveries
+      summary: List webhook deliveries for a payment
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Webhook delivery history
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListWebhookDeliveriesResponse"
+        "404":
+          description: Payment not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /payments/{id}/webhooks/{delivery_id}/redeliver:
+    post:
+      operationId: redeliverWebhook
+      summary: Re-attempt a webhook delivery
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: delivery_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Redelivery succeeded
+        "404":
+          description: Payment or delivery not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "502":
+          description: Webhook endpoint returned an error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          example: ok
+
+    PaymentStatus:
+      type: string
+      enum: [pending, completed, failed, expired, underpaid]
+
+    Payment:
+      type: object
+      required:
+        - id
+        - merchant_id
+        - destination_address
+        - memo
+        - amount
+        - asset
+        - status
+        - created_at
+        - updated_at
+        - expires_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        merchant_id:
+          type: string
+          example: my-shop
+        destination_address:
+          type: string
+          description: Stellar public key the user must pay to
+          example: GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5
+        memo:
+          type: string
+          description: 8-character memo the user must include in their transaction
+          example: A1B2C3D4
+        amount:
+          type: string
+          description: Requested amount as a decimal string
+          example: "10.00"
+        asset:
+          type: string
+          enum: [XLM, USDC]
+        status:
+          $ref: "#/components/schemas/PaymentStatus"
+        tx_hash:
+          type: string
+          nullable: true
+          description: On-chain transaction hash once settled
+        paid_amount:
+          type: string
+          nullable: true
+          description: Cumulative amount received
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+
+    CreatePaymentRequest:
+      type: object
+      required: [amount]
+      properties:
+        amount:
+          type: string
+          description: Positive decimal, up to 7 decimal places
+          example: "10.00"
+        asset:
+          type: string
+          enum: [XLM, USDC]
+          default: XLM
+        merchant_id:
+          type: string
+          example: my-shop
+        webhook_url:
+          type: string
+          format: uri
+          example: https://yourapp.com/webhooks/stellar
+
+    ListPaymentsResponse:
+      type: object
+      required: [payments, limit]
+      properties:
+        payments:
+          type: array
+          items:
+            $ref: "#/components/schemas/Payment"
+        total:
+          type: integer
+          description: Total matching rows (offset pagination only)
+        limit:
+          type: integer
+        offset:
+          type: integer
+          description: Present when using offset pagination
+        next_cursor:
+          type: string
+          nullable: true
+          description: Pass as cursor on the next request to get the following page
+
+    WebhookDelivery:
+      type: object
+      required: [id, url, status, attempts, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        url:
+          type: string
+          format: uri
+        status:
+          type: string
+          enum: [pending, delivered, failed]
+        attempts:
+          type: integer
+        last_attempt:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+    ListWebhookDeliveriesResponse:
+      type: object
+      required: [payment_id, deliveries]
+      properties:
+        payment_id:
+          type: string
+          format: uuid
+        deliveries:
+          type: array
+          items:
+            $ref: "#/components/schemas/WebhookDelivery"
+
+    ErrorResponse:
+      type: object
+      required: [error, code]
+      properties:
+        error:
+          type: string
+        code:
+          type: string

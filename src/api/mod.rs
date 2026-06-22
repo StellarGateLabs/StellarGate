@@ -22,6 +22,39 @@ mod payments;
 /// Reject request bodies larger than this (256 KiB) before they hit a handler.
 const MAX_BODY_BYTES: usize = 256 * 1024;
 
+static OPENAPI_SPEC: &str = include_str!("../../openapi.yaml");
+
+async fn openapi() -> impl IntoResponse {
+    // Parse once to validate and re-serialise as JSON; the YAML source is the
+    // canonical spec so a single include_str keeps them in sync automatically.
+    match serde_yaml::from_str::<serde_json::Value>(OPENAPI_SPEC) {
+        Ok(v) => (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")], Json(v)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to parse openapi spec: {e}") })),
+        ).into_response(),
+    }
+}
+
+async fn swagger_ui() -> impl IntoResponse {
+    let html = r#"<!DOCTYPE html>
+<html>
+<head>
+  <title>StellarGate API</title>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script>
+    SwaggerUIBundle({ url: "/openapi.json", dom_id: '#swagger-ui', presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset] });
+  </script>
+</body>
+</html>"#;
+    (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")], html)
+}
+
 pub fn router(state: Arc<AppState>) -> axum::Router {
     let cors = build_cors(&state.config);
     let rate_limit_rps = state.config.rate_limit_requests_per_sec;
@@ -29,6 +62,8 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
     axum::Router::new()
         .route("/", get(|| async { "StellarGate API v0.1.0" }))
         .route("/health", get(health))
+        .route("/openapi.json", get(openapi))
+        .route("/docs", get(swagger_ui))
         .nest("/payments", {
             axum::Router::new()
                 .route("/", post(payments::create).get(payments::list))
