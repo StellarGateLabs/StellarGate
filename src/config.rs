@@ -43,8 +43,7 @@ pub struct Config {
     /// Comma-separated list of allowed CORS origins, e.g. `https://app.example.com`.
     /// Required when `STELLAR_NETWORK=public`; optional (falls back to permissive) on testnet.
     pub cors_allowed_origins: Vec<String>,
-    /// Rate limit for POST /payments (requests per second per IP)
-    pub rate_limit_requests_per_sec: u32,
+    pub listener_mode: ListenerMode,
 }
 
 impl Config {
@@ -72,7 +71,9 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .map(String::from)
                 .collect(),
-            rate_limit_requests_per_sec: parse_env("RATE_LIMIT_REQUESTS_PER_SEC", 10),
+            listener_mode: ListenerMode::parse(
+                &std::env::var("STELLAR_LISTENER_MODE").unwrap_or_default(),
+            ),
         })
     }
 
@@ -98,6 +99,7 @@ impl std::fmt::Debug for Config {
             .field("webhook_retry_delay_ms", &self.webhook_retry_delay_ms)
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("cors_allowed_origins", &self.cors_allowed_origins)
+            .field("listener_mode", &self.listener_mode)
             .finish()
     }
 }
@@ -120,7 +122,9 @@ mod tests {
             webhook_retry_attempts: 3,
             webhook_retry_delay_ms: 5000,
             poll_interval_secs: 10,
+            payment_ttl_secs: 3600,
             cors_allowed_origins: vec![],
+            listener_mode: ListenerMode::Stream,
         };
         let output = format!("{cfg:?}");
         assert!(!output.contains("super-secret-key"), "gateway_secret must not appear in Debug output");
