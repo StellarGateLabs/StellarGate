@@ -43,6 +43,8 @@ pub struct Config {
     /// Comma-separated list of allowed CORS origins, e.g. `https://app.example.com`.
     /// Required when `STELLAR_NETWORK=public`; optional (falls back to permissive) on testnet.
     pub cors_allowed_origins: Vec<String>,
+    /// Rate limit for POST /payments (requests per second per IP)
+    pub rate_limit_requests_per_sec: u32,
 }
 
 impl Config {
@@ -70,6 +72,7 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .map(String::from)
                 .collect(),
+            rate_limit_requests_per_sec: parse_env("RATE_LIMIT_REQUESTS_PER_SEC", 10),
         })
     }
 

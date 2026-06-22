@@ -1,11 +1,14 @@
 use crate::AppState;
 use axum::{
+    extract::ConnectInfo,
     http::StatusCode,
+    middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
-    Json,
+    Json, Request,
 };
 use serde_json::json;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::{
     cors::CorsLayer,
@@ -21,13 +24,22 @@ const MAX_BODY_BYTES: usize = 256 * 1024;
 
 pub fn router(state: Arc<AppState>) -> axum::Router {
     let cors = build_cors(&state.config);
+    let rate_limit_rps = state.config.rate_limit_requests_per_sec;
+    
     axum::Router::new()
         .route("/", get(|| async { "StellarGate API v0.1.0" }))
         .route("/health", get(health))
-        .route("/payments", post(payments::create).get(payments::list))
-        .route("/payments/:id", get(payments::get_by_id))
-        .route("/payments/:id/webhooks", get(payments::list_webhooks))
-        .route("/payments/:id/webhooks/:delivery_id/redeliver", post(payments::redeliver_webhook))
+        .nest("/payments", {
+            axum::Router::new()
+                .route("/", post(payments::create).get(payments::list))
+                .route("/:id", get(payments::get_by_id))
+                .route("/:id/webhooks", get(payments::list_webhooks))
+                .route("/:id/webhooks/:delivery_id/redeliver", post(payments::redeliver_webhook))
+                .layer(middleware::from_fn_with_state(
+                    rate_limit_rps,
+                    rate_limit_middleware,
+                ))
+        })
         .fallback(not_found)
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(TraceLayer::new_for_http())
@@ -35,6 +47,45 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .layer(cors)
         .with_state(state)
+}
+
+async fn rate_limit_middleware(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    rate_limit_rps: u32,
+    req: Request,
+    next: Next,
+) -> axum::response::Response {
+    static LIMITERS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, governor::RateLimiter>>> = std::sync::OnceLock::new();
+    
+    let limiters = LIMITERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let ip = addr.ip().to_string();
+    
+    let mut map = limiters.lock().unwrap();
+    let limiter = map.entry(ip).or_insert_with(|| {
+        governor::RateLimiter::direct(
+            governor::Quota::per_second(
+                std::num::NonZeroU32::new(rate_limit_rps).unwrap()
+            )
+        )
+    });
+    
+    if limiter.check().is_err() {
+        let retry_after = (1000 / rate_limit_rps).max(1);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_str(&retry_after.to_string()).unwrap(),
+            )],
+            axum::Json(json!({
+                "error": "rate limit exceeded",
+                "code": "rate_limit_exceeded"
+            })),
+        )
+            .into_response();
+    }
+    
+    next.run(req).await
 }
 
 fn build_cors(cfg: &crate::config::Config) -> CorsLayer {
