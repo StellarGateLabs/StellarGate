@@ -1,0 +1,16 @@
+services:
+  api:
+    build: .
+    ports:
+      - "${PORT:-3000}:3000"
+    env_file:
+      - .env
+    environment:
+      # Override the DATABASE_URL to point at the persistent volume
+      DATABASE_URL: sqlite:///data/stellargate.db
+    volumes:
+      - stellargate_data:/data
+    restart: unless-stopped
+
+volumes:
+  stellargate_data:

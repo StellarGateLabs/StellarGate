@@ -82,6 +82,31 @@ cp .env.example .env
 cargo run
 ```
 
+### Docker Compose
+
+The quickest way to run StellarGate without installing Rust:
+
+```bash
+cp .env.example .env
+# Edit .env with your Stellar keys, then:
+docker compose up --build
+```
+
+The API will be available at `http://localhost:3000`. The SQLite database is
+stored in a named Docker volume (`stellargate_data`) so it persists across
+container restarts. Verify the service is healthy:
+
+```bash
+curl http://localhost:3000/health
+# {"status":"ok"}
+```
+
+To stop and remove containers while keeping the database volume:
+
+```bash
+docker compose down
+```
+
 ### Test
 
 ```bash
