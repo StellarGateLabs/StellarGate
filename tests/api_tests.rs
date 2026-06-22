@@ -1,5 +1,4 @@
 use axum::http::StatusCode;
-use axum::body::Bytes;
 use axum_test::TestServer;
 use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -21,8 +20,17 @@ async fn test_server_with_pool() -> (TestServer, db::Db) {
         webhook_retry_attempts: 1,
         webhook_retry_delay_ms: 0,
         poll_interval_secs: 10,
+        listener_mode: stellargate::config::ListenerMode::Poll,
         cors_allowed_origins: vec![],
-    };
+    }
+}
+
+async fn test_server() -> TestServer {
+    test_server_with_pool().await.0
+}
+
+async fn test_server_with_pool() -> (TestServer, db::Db) {
+    let cfg = make_config();
     let pool = SqlitePoolOptions::new()
         .connect_with(SqliteConnectOptions::from_str(&cfg.database_url).unwrap().create_if_missing(true))
         .await
@@ -84,6 +92,8 @@ async fn test_create_invalid_asset() {
         .json(&json!({ "amount": "10", "asset": "BTC" }))
         .await;
     res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "unsupported_asset");
+    res.assert_contains_header("x-request-id");
 }
 
 #[tokio::test]
@@ -232,14 +242,19 @@ async fn test_list_cursor_invalid() {
 async fn test_unknown_route_returns_json_404() {
     let res = test_server().await.get("/nope").await;
     res.assert_status(StatusCode::NOT_FOUND);
-    assert_eq!(res.json::<Value>()["error"], "not found");
+    let body: Value = res.json();
+    assert_eq!(body["error"], "not found");
+    assert_eq!(body["code"], "not_found");
+    res.assert_contains_header("x-request-id");
 }
 
 #[tokio::test]
 async fn test_list_webhooks_not_found() {
     let res = test_server().await.get("/payments/nonexistent/webhooks").await;
     res.assert_status(StatusCode::NOT_FOUND);
-    assert_eq!(res.json::<Value>()["error"], "payment not found");
+    let body: Value = res.json();
+    assert_eq!(body["error"], "payment not found");
+    assert_eq!(body["code"], "payment_not_found");
 }
 
 #[tokio::test]
