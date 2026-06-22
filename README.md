@@ -1,5 +1,7 @@
 # StellarGate
 
+[![CI](https://github.com/StellarGateLabs/StellarGate/actions/workflows/ci.yml/badge.svg)](https://github.com/StellarGateLabs/StellarGate/actions/workflows/ci.yml)
+
 A developer-friendly payment gateway API built on [Stellar](https://stellar.org) for accepting, verifying, and managing payments in XLM and USDC.
 
 > Think Stripe — but powered by the Stellar blockchain instead of banks.
@@ -67,7 +69,7 @@ cp .env.example .env
 | `STELLAR_HORIZON_URL` | Horizon endpoint | testnet |
 | `STELLAR_GATEWAY_PUBLIC` | Your gateway wallet public key | — |
 | `STELLAR_GATEWAY_SECRET` | Your gateway wallet secret key | — |
-| `USDC_ISSUER` | USDC issuer address | testnet issuer |
+| `ACCEPTED_ASSETS` | Comma-separated assets to accept. Format: `CODE` for native (e.g. `XLM`) or `CODE:ISSUER` for non-native (e.g. `USDC:GISSUER`). Adding an asset is config-only — no code changes needed. | `XLM,USDC:<testnet-issuer>` |
 | `STELLAR_LISTENER_MODE` | `stream` (SSE + poller reconciler) or `poll` (interval only) | `stream` |
 | `POLL_INTERVAL_SECS` | How often the Horizon poller reconciles | `10` |
 | `PAYMENT_TTL_SECS` | How long a payment intent stays `pending` before it is expired (from `created_at`) | `3600` |
@@ -223,8 +225,19 @@ List payments, newest first.
 
 ### `GET /health`
 
+Cheap liveness probe. Always returns `200 OK` as long as the process is running.
+
 ```json
 200 OK — { "status": "ok" }
+```
+
+### `GET /ready`
+
+Readiness probe. Runs `SELECT 1` against the database; returns `503` when unreachable.
+
+```json
+200 OK          — { "status": "ok" }
+503 Unavailable — { "status": "unavailable" }
 ```
 
 ## Payment Flow

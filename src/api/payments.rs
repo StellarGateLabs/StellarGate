@@ -77,8 +77,6 @@ where
     }
 }
 
-const SUPPORTED_ASSETS: [&str; 2] = ["XLM", "USDC"];
-
 #[derive(Deserialize)]
 pub struct CreatePaymentRequest {
     pub amount: String,
@@ -97,10 +95,12 @@ pub async fn create(
     JsonBody(body): JsonBody<CreatePaymentRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let asset = body.asset.to_uppercase();
-    if !SUPPORTED_ASSETS.contains(&asset.as_str()) {
+    let accepted = &state.config.accepted_assets;
+    if !accepted.iter().any(|a| a.code == asset) {
+        let codes = accepted.iter().map(|a| a.code.as_str()).collect::<Vec<_>>().join(", ");
         return Err(AppError::bad_request(
             "unsupported_asset",
-            format!("unsupported asset '{}'; supported: {}", body.asset, SUPPORTED_ASSETS.join(", ")),
+            format!("unsupported asset '{}'; supported: {}", body.asset, codes),
         ));
     }
     if !money::is_valid_amount(&body.amount) {
@@ -176,7 +176,7 @@ pub async fn list(
     if let Some(raw_cursor) = &q.cursor {
         // Keyset (cursor) pagination — stable, O(log n) regardless of page depth.
         let (cursor_ts, cursor_id) = decode_cursor(raw_cursor)
-            .ok_or_else(|| AppError::bad_request("invalid cursor"))?;
+            .ok_or_else(|| AppError::bad_request("invalid_cursor", "invalid cursor"))?;
 
         let payments = db::list_payments_keyset(
             &state.pool,
@@ -214,6 +214,17 @@ pub async fn list(
             "next_cursor": next_cursor,
         })))
     }
+}
+
+fn encode_cursor(ts: &str, id: &str) -> String {
+    hex::encode(format!("{}\t{}", ts, id))
+}
+
+fn decode_cursor(raw: &str) -> Option<(String, String)> {
+    let bytes = hex::decode(raw).ok()?;
+    let s = String::from_utf8(bytes).ok()?;
+    let (ts, id) = s.split_once('\t')?;
+    Some((ts.to_string(), id.to_string()))
 }
 
 async fn generate_unique_memo(pool: &db::Db) -> Result<String, AppError> {
