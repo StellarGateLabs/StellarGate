@@ -65,6 +65,18 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Durable key/value state — used by the Horizon poller to persist its
+    // paging cursor so it resumes exactly where it left off across restarts.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS kv_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     // Normalise legacy rows that were written by the old datetime('now') default,
     // which produced "YYYY-MM-DD HH:MM:SS" (space, no Z). Safe to run on every
     // startup — the WHERE clause skips rows that are already RFC 3339.
@@ -252,6 +264,31 @@ pub async fn update_payment_status(
     Ok(())
 }
 
+/// Read a value from the durable key/value state table, if present.
+pub async fn get_state(pool: &Db, key: &str) -> Result<Option<String>> {
+    let value: Option<String> = sqlx::query_scalar("SELECT value FROM kv_state WHERE key = ?")
+        .bind(key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(value)
+}
+
+/// Insert or update a value in the durable key/value state table.
+pub async fn set_state(pool: &Db, key: &str, value: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO kv_state (key, value, updated_at)
+         VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = excluded.updated_at",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn memo_exists(pool: &Db, memo: &str) -> Result<bool> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE memo = ?")
         .bind(memo)
@@ -340,4 +377,47 @@ pub async fn get_webhook_delivery(pool: &Db, id: &str) -> Result<Option<WebhookD
     .await?;
 
     Ok(row.as_ref().map(row_to_webhook_delivery))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn memory_db() -> Db {
+        let pool = SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        migrate(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn kv_state_round_trips_and_upserts() {
+        let pool = memory_db().await;
+
+        // Absent key reads as None.
+        assert_eq!(get_state(&pool, "horizon_payment_cursor").await.unwrap(), None);
+
+        // First write persists.
+        set_state(&pool, "horizon_payment_cursor", "100-1").await.unwrap();
+        assert_eq!(
+            get_state(&pool, "horizon_payment_cursor").await.unwrap(),
+            Some("100-1".to_string())
+        );
+
+        // Second write to the same key overwrites (upsert), not duplicates.
+        set_state(&pool, "horizon_payment_cursor", "200-2").await.unwrap();
+        assert_eq!(
+            get_state(&pool, "horizon_payment_cursor").await.unwrap(),
+            Some("200-2".to_string())
+        );
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kv_state")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
 }

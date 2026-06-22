@@ -75,6 +75,9 @@ cp .env.example .env
 
 > `DATABASE_URL` is a sqlx connection string (`sqlite:stellargate.db`), not a
 > file path. The Horizon poller stays idle until `STELLAR_GATEWAY_PUBLIC` is set.
+> The poller pages forward through payments from a cursor persisted in the
+> database, so it never misses an intent regardless of on-chain volume and
+> resumes from where it left off after a restart.
 
 ### Run
 

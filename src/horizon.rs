@@ -1,19 +1,29 @@
 //! Stellar Horizon integration: detecting and verifying on-chain payments.
 //!
-//! A background poller periodically asks Horizon for the most recent payments
-//! into the gateway account, matches them against pending payment intents by
-//! transaction memo, verifies the asset and amount, and transitions the intent
-//! to `completed` (or `failed` on underpayment), firing a webhook either way.
+//! A background poller pages forward through the gateway account's payments
+//! from a persisted cursor, matches each record against pending payment intents
+//! by transaction memo, verifies the asset and amount, and transitions the
+//! intent to `completed` (or `failed` on underpayment), firing a webhook either
+//! way. Because it pages forward from where it last left off — rather than
+//! re-scanning a fixed newest-first window — no intent is skipped no matter how
+//! many payments land between cycles, and a restart resumes from the saved
+//! cursor instead of "now".
 //!
 //! The matching logic in [`verify`] is pure and unit-tested; the networked
-//! [`fetch_recent_payments`] and [`run_poller`] wrap it with I/O.
+//! [`fetch_payments_page`] and [`run_poller`] wrap it with I/O.
 
 use crate::{db, money, webhook, AppState};
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
+
+/// Key under which the last fully-processed Horizon paging token is stored in
+/// the `kv_state` table, so polling resumes from it across restarts.
+const PAYMENT_CURSOR_KEY: &str = "horizon_payment_cursor";
+
+/// How many payment records to request per Horizon page while catching up.
+const PAGE_LIMIT: u32 = 200;
 
 /// A single payment operation as returned by Horizon, with the embedded
 /// transaction (requested via `join=transactions`) so we can read its memo.
@@ -35,6 +45,10 @@ pub struct HorizonPayment {
     pub transaction_hash: Option<String>,
     #[serde(default)]
     pub transaction: Option<TransactionRef>,
+    /// Horizon's opaque paging cursor for this record. We persist the latest
+    /// processed token so polling resumes from it instead of re-scanning.
+    #[serde(default)]
+    pub paging_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -116,18 +130,22 @@ pub fn verify(payment: &db::Payment, hp: &HorizonPayment, usdc_issuer: &str) -> 
     }
 }
 
-/// Fetch the most recent payments into `account` from Horizon, newest first,
-/// with their transactions joined so memos are available.
-pub async fn fetch_recent_payments(
+/// Fetch one page of payments into `account` from Horizon in ascending
+/// (oldest-first) order starting strictly after `cursor`, with transactions
+/// joined so memos are available. A `cursor` of `"0"` starts from the account's
+/// first payment.
+pub async fn fetch_payments_page(
     client: &reqwest::Client,
     horizon_url: &str,
     account: &str,
+    cursor: &str,
     limit: u32,
 ) -> anyhow::Result<Vec<HorizonPayment>> {
     let url = format!(
-        "{}/accounts/{}/payments?order=desc&limit={}&join=transactions",
+        "{}/accounts/{}/payments?order=asc&cursor={}&limit={}&join=transactions",
         horizon_url.trim_end_matches('/'),
         account,
+        cursor,
         limit
     );
     let page: PaymentsPage = client
@@ -141,54 +159,123 @@ pub async fn fetch_recent_payments(
     Ok(page.embedded.records)
 }
 
-/// Run one poll cycle: reconcile pending intents against recent on-chain
-/// payments. Safe to call repeatedly; already-settled intents are ignored.
-pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
-    let pending = db::list_pending(&state.pool).await?;
-    if pending.is_empty() {
-        return Ok(0);
+/// Resolve the cursor this cycle should start paging from.
+///
+/// On the very first run (no persisted cursor) we baseline at the account's
+/// most recent payment so we don't replay its entire history; from then on we
+/// resume from the saved token. If the account has no payments yet, we start
+/// from `"0"` so the first payment that ever arrives is still captured.
+async fn starting_cursor(state: &Arc<AppState>) -> anyhow::Result<String> {
+    if let Some(cursor) = db::get_state(&state.pool, PAYMENT_CURSOR_KEY).await? {
+        return Ok(cursor);
     }
 
-    let payments = fetch_recent_payments(
-        &state.http,
-        &state.config.horizon_url,
-        &state.config.gateway_public,
-        200,
-    )
-    .await?;
+    let url = format!(
+        "{}/accounts/{}/payments?order=desc&limit=1",
+        state.config.horizon_url.trim_end_matches('/'),
+        state.config.gateway_public,
+    );
+    let page: PaymentsPage = state
+        .http
+        .get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
 
-    // Index pending intents by memo for O(1) lookup against on-chain records.
-    let by_memo: HashMap<&str, &db::Payment> =
-        pending.iter().map(|p| (p.memo.as_str(), p)).collect();
+    match page.embedded.records.first().and_then(|p| p.paging_token.clone()) {
+        Some(token) => {
+            // Persist immediately so a crash before the first page still leaves
+            // us baselined rather than replaying history next time.
+            db::set_state(&state.pool, PAYMENT_CURSOR_KEY, &token).await?;
+            info!(cursor = %token, "Horizon poller baselined at latest payment");
+            Ok(token)
+        }
+        None => Ok("0".to_string()),
+    }
+}
 
+/// Run one poll cycle: page forward from the persisted cursor through every
+/// payment that has landed since, settling any that satisfy a pending intent,
+/// until caught up. The cursor is advanced (and persisted) only after a page's
+/// records have been processed, so no record is ever skipped and a restart
+/// resumes exactly where it left off. Safe to call repeatedly; re-seeing an
+/// already-settled record is a no-op (its intent is no longer pending).
+pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
+    let mut cursor = starting_cursor(state).await?;
     let mut settled = 0;
-    for hp in &payments {
-        let Some(memo) = hp.memo() else { continue };
-        let Some(payment) = by_memo.get(memo) else {
-            continue;
-        };
 
-        match verify(payment, hp, &state.config.usdc_issuer) {
-            Some(Verdict::Completed {
-                tx_hash,
-                paid_amount,
-            }) => {
-                settle(state, payment, "completed", &tx_hash, &paid_amount, "payment.success").await;
-                settled += 1;
+    loop {
+        let page = fetch_payments_page(
+            &state.http,
+            &state.config.horizon_url,
+            &state.config.gateway_public,
+            &cursor,
+            PAGE_LIMIT,
+        )
+        .await?;
+
+        if page.is_empty() {
+            break;
+        }
+        let count = page.len();
+
+        for hp in &page {
+            settled += process_record(state, hp).await? as usize;
+            // Advance the in-memory cursor past this processed record.
+            if let Some(token) = hp.paging_token.as_deref() {
+                cursor = token.to_string();
             }
-            Some(Verdict::Underpaid {
-                tx_hash,
-                paid_amount,
-            }) => {
-                warn!(payment_id = %payment.id, expected = %payment.amount, paid = %paid_amount, "underpayment");
-                settle(state, payment, "failed", &tx_hash, &paid_amount, "payment.failed").await;
-                settled += 1;
-            }
-            None => {}
+        }
+
+        // Checkpoint after the whole page is processed. If we crash mid-page the
+        // cursor still points at the last fully-processed page, and re-reading
+        // the unfinished page is harmless (settled intents are skipped).
+        db::set_state(&state.pool, PAYMENT_CURSOR_KEY, &cursor).await?;
+
+        // A short page means Horizon has nothing newer — we're caught up.
+        if count < PAGE_LIMIT as usize {
+            break;
         }
     }
 
     Ok(settled)
+}
+
+/// Match a single Horizon record against the pending intent with its memo and
+/// settle it if the payment satisfies the intent. Returns whether an intent was
+/// settled. Records with no memo, no matching pending intent, or that fail
+/// verification are ignored.
+async fn process_record(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow::Result<bool> {
+    let Some(memo) = hp.memo() else {
+        return Ok(false);
+    };
+    // Look the intent up fresh per record so an intent created mid-cycle is
+    // still matched, and one already settled this cycle is not touched again.
+    let Some(payment) = db::find_pending_by_memo(&state.pool, memo).await? else {
+        return Ok(false);
+    };
+
+    match verify(&payment, hp, &state.config.usdc_issuer) {
+        Some(Verdict::Completed {
+            tx_hash,
+            paid_amount,
+        }) => {
+            settle(state, &payment, "completed", &tx_hash, &paid_amount, "payment.success").await;
+            Ok(true)
+        }
+        Some(Verdict::Underpaid {
+            tx_hash,
+            paid_amount,
+        }) => {
+            warn!(payment_id = %payment.id, expected = %payment.amount, paid = %paid_amount, "underpayment");
+            settle(state, &payment, "failed", &tx_hash, &paid_amount, "payment.failed").await;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 /// Persist a terminal status for `payment` and fire its webhook.
@@ -275,6 +362,7 @@ mod tests {
                 memo: Some(memo.into()),
                 memo_type: Some("text".into()),
             }),
+            paging_token: Some("1".into()),
         }
     }
 
@@ -352,6 +440,7 @@ mod tests {
                 memo: Some("MEMO1234".into()),
                 memo_type: Some("text".into()),
             }),
+            paging_token: Some("1".into()),
         };
         assert!(matches!(
             verify(&p, &hp, USDC_ISSUER),
@@ -374,6 +463,7 @@ mod tests {
                 memo: Some("MEMO1234".into()),
                 memo_type: Some("text".into()),
             }),
+            paging_token: Some("1".into()),
         };
         assert_eq!(verify(&p, &hp, USDC_ISSUER), None);
         // Sanity: with the right issuer it would have matched.
@@ -399,6 +489,7 @@ mod tests {
                     "asset_type": "native",
                     "to": "GGATEWAY",
                     "transaction_hash": "abc",
+                    "paging_token": "123456789-1",
                     "transaction": { "memo": "MEMO1234", "memo_type": "text" }
                 }
             ]}
@@ -406,5 +497,9 @@ mod tests {
         let page: PaymentsPage = serde_json::from_str(body).unwrap();
         assert_eq!(page.embedded.records.len(), 1);
         assert_eq!(page.embedded.records[0].memo(), Some("MEMO1234"));
+        assert_eq!(
+            page.embedded.records[0].paging_token.as_deref(),
+            Some("123456789-1")
+        );
     }
 }
