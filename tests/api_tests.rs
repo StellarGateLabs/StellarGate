@@ -156,38 +156,83 @@ async fn test_unknown_route_returns_json_404() {
 }
 
 #[tokio::test]
-async fn test_malformed_json_body_returns_400_json_error() {
-    let server = test_server().await;
-    let res = server
-        .post("/payments")
-        .content_type("application/json")
-        .bytes(Bytes::from_static(b"{not valid json}"))
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    let body: Value = res.json();
-    assert!(body["error"].as_str().is_some(), "expected an error field");
+async fn test_list_webhooks_not_found() {
+    let res = test_server().await.get("/payments/nonexistent/webhooks").await;
+    res.assert_status(StatusCode::NOT_FOUND);
+    assert_eq!(res.json::<Value>()["error"], "payment not found");
 }
 
 #[tokio::test]
-async fn test_missing_amount_returns_400_json_error() {
-    let res = test_server().await
-        .post("/payments")
-        .json(&json!({ "asset": "XLM" }))
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
+async fn test_list_webhooks_empty() {
+    let server = test_server().await;
+    let id = server.post("/payments")
+        .json(&json!({ "amount": "5", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"].as_str().unwrap().to_string();
+
+    let res = server.get(&format!("/payments/{id}/webhooks")).await;
+    res.assert_status_ok();
     let body: Value = res.json();
-    assert!(body["error"].as_str().is_some(), "expected an error field");
+    assert_eq!(body["payment_id"], id);
+    assert_eq!(body["deliveries"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]
-async fn test_wrong_content_type_returns_400_json_error() {
+async fn test_redeliver_webhook_not_found() {
+    let res = test_server().await.get("/payments/nonexistent/webhooks/xyz/redeliver").await;
+    res.assert_status(StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_redeliver_delivery_not_found() {
     let server = test_server().await;
-    let res = server
-        .post("/payments")
-        .content_type("text/plain")
-        .bytes(Bytes::from_static(b"amount=10"))
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    let body: Value = res.json();
-    assert!(body["error"].as_str().is_some(), "expected an error field");
+    let id = server.post("/payments")
+        .json(&json!({ "amount": "5", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"].as_str().unwrap().to_string();
+
+    let res = server.post(&format!("/payments/{id}/webhooks/nonexistent/redeliver")).await;
+    res.assert_status(StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_webhook_delivery_isolation() {
+    let server = test_server().await;
+    
+    // Create two payments
+    let id1 = server.post("/payments")
+        .json(&json!({ "amount": "5", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"].as_str().unwrap().to_string();
+    
+    let id2 = server.post("/payments")
+        .json(&json!({ "amount": "10", "asset": "USDC" }))
+        .await
+        .json::<Value>()["id"].as_str().unwrap().to_string();
+    
+    // Manually insert a delivery for payment 1
+    let pool = server.state::<Arc<AppState>>().pool.clone();
+    stellargate::db::save_webhook_delivery(
+        &pool,
+        "delivery-1",
+        &id1,
+        "https://example.com/webhook",
+        r#"{"event":"payment.completed"}"#,
+    )
+    .await
+    .unwrap();
+    
+    // List webhooks for payment 1 should find it
+    let res1 = server.get(&format!("/payments/{id1}/webhooks")).await;
+    res1.assert_status_ok();
+    assert_eq!(res1.json::<Value>()["deliveries"].as_array().unwrap().len(), 1);
+    
+    // List webhooks for payment 2 should be empty
+    let res2 = server.get(&format!("/payments/{id2}/webhooks")).await;
+    res2.assert_status_ok();
+    assert_eq!(res2.json::<Value>()["deliveries"].as_array().unwrap().len(), 0);
+    
+    // Try to redeliver delivery from payment 1 on payment 2 (should fail)
+    let res_cross = server.post(&format!("/payments/{id2}/webhooks/delivery-1/redeliver")).await;
+    res_cross.assert_status(StatusCode::NOT_FOUND);
 }

@@ -254,3 +254,54 @@ pub async fn update_webhook_delivery(pool: &Db, id: &str, status: &str, attempts
     .await?;
     Ok(())
 }
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WebhookDelivery {
+    pub id: String,
+    pub payment_id: String,
+    pub url: String,
+    pub payload: String,
+    pub status: String,
+    pub attempts: i64,
+    pub last_attempt: Option<String>,
+    pub created_at: String,
+}
+
+fn row_to_webhook_delivery(row: &sqlx::sqlite::SqliteRow) -> WebhookDelivery {
+    WebhookDelivery {
+        id: row.get("id"),
+        payment_id: row.get("payment_id"),
+        url: row.get("url"),
+        payload: row.get("payload"),
+        status: row.get("status"),
+        attempts: row.get("attempts"),
+        last_attempt: row.get("last_attempt"),
+        created_at: row.get("created_at"),
+    }
+}
+
+/// Get all webhook deliveries for a payment, ordered by created_at descending.
+pub async fn list_webhook_deliveries(pool: &Db, payment_id: &str) -> Result<Vec<WebhookDelivery>> {
+    let rows = sqlx::query(
+        "SELECT id, payment_id, url, payload, status, attempts, last_attempt, created_at
+         FROM webhook_deliveries WHERE payment_id = ? ORDER BY created_at DESC",
+    )
+    .bind(payment_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.iter().map(row_to_webhook_delivery).collect())
+}
+
+/// Get a specific webhook delivery by id.
+pub async fn get_webhook_delivery(pool: &Db, id: &str) -> Result<Option<WebhookDelivery>> {
+    let row = sqlx::query(
+        "SELECT id, payment_id, url, payload, status, attempts, last_attempt, created_at
+         FROM webhook_deliveries WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.as_ref().map(row_to_webhook_delivery))
+}

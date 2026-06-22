@@ -216,3 +216,74 @@ fn to_json(p: &db::Payment) -> Value {
         "updated_at": p.updated_at,
     })
 }
+
+pub async fn list_webhooks(
+    State(state): State<Arc<AppState>>,
+    Path(payment_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    // Verify payment exists
+    let payment = db::get_payment(&state.pool, &payment_id)
+        .await?
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "payment not found"))?;
+
+    let deliveries = db::list_webhook_deliveries(&state.pool, &payment_id).await?;
+
+    Ok(Json(json!({
+        "payment_id": payment.id,
+        "deliveries": deliveries.iter().map(|d| json!({
+            "id": d.id,
+            "url": d.url,
+            "status": d.status,
+            "attempts": d.attempts,
+            "last_attempt": d.last_attempt,
+            "created_at": d.created_at,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+pub async fn redeliver_webhook(
+    State(state): State<Arc<AppState>>,
+    Path((payment_id, delivery_id)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    // Verify payment exists
+    db::get_payment(&state.pool, &payment_id)
+        .await?
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "payment not found"))?;
+
+    // Get the delivery
+    let delivery = db::get_webhook_delivery(&state.pool, &delivery_id)
+        .await?
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "delivery not found"))?;
+
+    // Verify the delivery belongs to this payment
+    if delivery.payment_id != payment_id {
+        return Err(AppError::new(StatusCode::NOT_FOUND, "delivery not found"));
+    }
+
+    // Re-send using the original signed payload
+    let payload_bytes = delivery.payload.as_bytes();
+    let signature = crate::webhook::sign(&state.config.webhook_secret, payload_bytes);
+
+    let result = state
+        .http
+        .post(&delivery.url)
+        .header("Content-Type", "application/json")
+        .header("X-StellarGate-Signature", &signature)
+        .header("X-StellarGate-Event", "payment.completed")
+        .body(delivery.payload.clone())
+        .send()
+        .await;
+
+    let new_status = match result {
+        Ok(resp) if resp.status().is_success() => "delivered",
+        _ => "failed",
+    };
+
+    db::update_webhook_delivery(&state.pool, &delivery_id, new_status, delivery.attempts + 1).await?;
+
+    if new_status == "delivered" {
+        Ok(StatusCode::OK)
+    } else {
+        Err(AppError::new(StatusCode::BAD_GATEWAY, "webhook delivery failed"))
+    }
+}
