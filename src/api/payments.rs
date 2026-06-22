@@ -11,36 +11,33 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// An error with an HTTP status and a JSON-serializable message.
+/// An error with an HTTP status, a stable machine-readable code, and a human message.
 pub struct AppError {
     status: StatusCode,
+    code: &'static str,
     message: String,
 }
 
 impl AppError {
-    fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            message: message.into(),
-        }
+    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self { status, code, message: message.into() }
     }
 
-    pub fn bad_request(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, message)
+    pub fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, code, message)
     }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
+        (self.status, Json(json!({ "error": self.message, "code": self.code }))).into_response()
     }
 }
 
 impl From<anyhow::Error> for AppError {
     fn from(err: anyhow::Error) -> Self {
-        // Log the real cause; never leak internals to the client.
         tracing::error!(error = %err, "internal error");
-        AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
+        AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", "internal server error")
     }
 }
 
@@ -64,7 +61,6 @@ where
                 use axum::extract::rejection::JsonRejection;
                 let message = match &rejection {
                     JsonRejection::JsonDataError(_) => {
-                        // Deserialization failed: wrong type, missing required field, etc.
                         format!("invalid request body: {}", rejection.body_text())
                     }
                     JsonRejection::JsonSyntaxError(_) => {
@@ -75,7 +71,7 @@ where
                     }
                     _ => "invalid request body".to_string(),
                 };
-                Err(AppError::bad_request(message))
+                Err(AppError::bad_request("invalid_request", message))
             }
         }
     }
@@ -102,20 +98,20 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let asset = body.asset.to_uppercase();
     if !SUPPORTED_ASSETS.contains(&asset.as_str()) {
-        return Err(AppError::bad_request(format!(
-            "unsupported asset '{}'; supported: {}",
-            body.asset,
-            SUPPORTED_ASSETS.join(", ")
-        )));
+        return Err(AppError::bad_request(
+            "unsupported_asset",
+            format!("unsupported asset '{}'; supported: {}", body.asset, SUPPORTED_ASSETS.join(", ")),
+        ));
     }
     if !money::is_valid_amount(&body.amount) {
         return Err(AppError::bad_request(
+            "invalid_amount",
             "amount must be a positive number with at most 7 decimal places",
         ));
     }
     if let Some(url) = &body.webhook_url {
         if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return Err(AppError::bad_request("webhook_url must be an http(s) URL"));
+            return Err(AppError::bad_request("invalid_webhook_url", "webhook_url must be an http(s) URL"));
         }
     }
 
@@ -145,7 +141,7 @@ pub async fn get_by_id(
 ) -> Result<Json<Value>, AppError> {
     match db::get_payment(&state.pool, &id).await? {
         Some(p) => Ok(Json(to_json(&p))),
-        None => Err(AppError::new(StatusCode::NOT_FOUND, "payment not found")),
+        None => Err(AppError::new(StatusCode::NOT_FOUND, "payment_not_found", "payment not found")),
     }
 }
 
@@ -166,11 +162,10 @@ pub async fn list(
 ) -> Result<Json<Value>, AppError> {
     if let Some(s) = &q.status {
         if !VALID_STATUSES.contains(&s.as_str()) {
-            return Err(AppError::bad_request(format!(
-                "invalid status '{}'; valid: {}",
-                s,
-                VALID_STATUSES.join(", ")
-            )));
+            return Err(AppError::bad_request(
+                "invalid_status",
+                format!("invalid status '{}'; valid: {}", s, VALID_STATUSES.join(", ")),
+            ));
         }
     }
 
@@ -197,6 +192,7 @@ async fn generate_unique_memo(pool: &db::Db) -> Result<String, AppError> {
     }
     Err(AppError::new(
         StatusCode::INTERNAL_SERVER_ERROR,
+        "internal_error",
         "memo generation failed",
     ))
 }
@@ -224,7 +220,7 @@ pub async fn list_webhooks(
     // Verify payment exists
     let payment = db::get_payment(&state.pool, &payment_id)
         .await?
-        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "payment not found"))?;
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "payment_not_found", "payment not found"))?;
 
     let deliveries = db::list_webhook_deliveries(&state.pool, &payment_id).await?;
 
@@ -248,16 +244,16 @@ pub async fn redeliver_webhook(
     // Verify payment exists
     db::get_payment(&state.pool, &payment_id)
         .await?
-        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "payment not found"))?;
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "payment_not_found", "payment not found"))?;
 
     // Get the delivery
     let delivery = db::get_webhook_delivery(&state.pool, &delivery_id)
         .await?
-        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "delivery not found"))?;
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "delivery_not_found", "delivery not found"))?;
 
     // Verify the delivery belongs to this payment
     if delivery.payment_id != payment_id {
-        return Err(AppError::new(StatusCode::NOT_FOUND, "delivery not found"));
+        return Err(AppError::new(StatusCode::NOT_FOUND, "delivery_not_found", "delivery not found"));
     }
 
     // Re-send using the original signed payload
@@ -284,6 +280,6 @@ pub async fn redeliver_webhook(
     if new_status == "delivered" {
         Ok(StatusCode::OK)
     } else {
-        Err(AppError::new(StatusCode::BAD_GATEWAY, "webhook delivery failed"))
+        Err(AppError::new(StatusCode::BAD_GATEWAY, "webhook_delivery_failed", "webhook delivery failed"))
     }
 }

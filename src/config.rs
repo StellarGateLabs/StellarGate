@@ -1,5 +1,29 @@
 use anyhow::Result;
 
+/// How the service detects incoming on-chain payments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListenerMode {
+    /// Subscribe to Horizon's Server-Sent-Events payment stream for near
+    /// real-time settlement, with the interval poller running alongside as a
+    /// reconciler for any events missed during reconnects.
+    Stream,
+    /// Only run the interval poller; no streaming connection is opened.
+    Poll,
+}
+
+impl ListenerMode {
+    fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "poll" => Self::Poll,
+            "stream" => Self::Stream,
+            other => {
+                tracing::warn!("invalid STELLAR_LISTENER_MODE={other:?}, using \"stream\"");
+                Self::Stream
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub port: u16,
@@ -13,6 +37,9 @@ pub struct Config {
     pub webhook_retry_attempts: u32,
     pub webhook_retry_delay_ms: u64,
     pub poll_interval_secs: u64,
+    /// Whether to detect payments via Horizon's SSE stream (with the poller as
+    /// a reconciler) or via interval polling alone. See [`ListenerMode`].
+    pub listener_mode: ListenerMode,
     /// Comma-separated list of allowed CORS origins, e.g. `https://app.example.com`.
     /// Required when `STELLAR_NETWORK=public`; optional (falls back to permissive) on testnet.
     pub cors_allowed_origins: Vec<String>,
@@ -35,6 +62,7 @@ impl Config {
             webhook_retry_attempts: parse_env("WEBHOOK_RETRY_ATTEMPTS", 3),
             webhook_retry_delay_ms: parse_env("WEBHOOK_RETRY_DELAY_MS", 5000),
             poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10),
+            listener_mode: ListenerMode::parse(&env_or("STELLAR_LISTENER_MODE", "stream")),
             cors_allowed_origins: std::env::var("CORS_ALLOWED_ORIGINS")
                 .unwrap_or_default()
                 .split(',')

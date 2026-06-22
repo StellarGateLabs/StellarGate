@@ -3,7 +3,11 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use stellargate::{api, config::Config, db, horizon, AppState};
+use stellargate::{
+    api,
+    config::{Config, ListenerMode},
+    db, horizon, AppState,
+};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -32,7 +36,12 @@ async fn main() -> Result<()> {
         http,
     });
 
-    // Background reconciliation of pending payments against Horizon.
+    // Detect on-chain payments. In stream mode the SSE listener settles intents
+    // in near real time while the poller runs alongside as a reconciler; in
+    // poll mode only the interval poller runs.
+    if cfg.listener_mode == ListenerMode::Stream {
+        tokio::spawn(horizon::run_stream_listener(state.clone()));
+    }
     tokio::spawn(horizon::run_poller(state.clone()));
 
     let addr = format!("0.0.0.0:{}", cfg.port);
