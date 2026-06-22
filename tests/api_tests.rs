@@ -1,5 +1,4 @@
 use axum::http::StatusCode;
-use axum::body::Bytes;
 use axum_test::TestServer;
 use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -8,7 +7,7 @@ use std::sync::Arc;
 use stellargate::{api, config::Config, db, AppState};
 use time::format_description::well_known::Rfc3339;
 
-async fn test_server() -> TestServer {
+async fn test_server_with_pool() -> (TestServer, db::Db) {
     let cfg = Config {
         port: 0,
         database_url: "sqlite::memory:".into(),
@@ -21,15 +20,29 @@ async fn test_server() -> TestServer {
         webhook_retry_attempts: 1,
         webhook_retry_delay_ms: 0,
         poll_interval_secs: 10,
+        listener_mode: stellargate::config::ListenerMode::Poll,
         cors_allowed_origins: vec![],
-    };
+    }
+}
+
+async fn test_server() -> TestServer {
+    test_server_with_pool().await.0
+}
+
+async fn test_server_with_pool() -> (TestServer, db::Db) {
+    let cfg = make_config();
     let pool = SqlitePoolOptions::new()
         .connect_with(SqliteConnectOptions::from_str(&cfg.database_url).unwrap().create_if_missing(true))
         .await
         .unwrap();
     db::migrate(&pool).await.unwrap();
     let http = reqwest::Client::new();
-    TestServer::new(api::router(Arc::new(AppState { pool, config: cfg, http }))).unwrap()
+    let server = TestServer::new(api::router(Arc::new(AppState { pool: pool.clone(), config: cfg, http }))).unwrap();
+    (server, pool)
+}
+
+async fn test_server() -> TestServer {
+    test_server_with_pool().await.0
 }
 
 #[tokio::test]
@@ -79,6 +92,8 @@ async fn test_create_invalid_asset() {
         .json(&json!({ "amount": "10", "asset": "BTC" }))
         .await;
     res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "unsupported_asset");
+    res.assert_contains_header("x-request-id");
 }
 
 #[tokio::test]
@@ -180,17 +195,66 @@ async fn test_list_invalid_status() {
 }
 
 #[tokio::test]
+async fn test_list_cursor_pagination() {
+    let server = test_server().await;
+    for amt in ["1", "2", "3", "4", "5"] {
+        server.post("/payments").json(&json!({ "amount": amt, "asset": "XLM" })).await;
+    }
+
+    // Page 1 via offset path — also returns next_cursor for migration.
+    let res = server.get("/payments?limit=2").await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+    assert_eq!(body["payments"].as_array().unwrap().len(), 2);
+    let cursor = body["next_cursor"].as_str().expect("next_cursor must be present on a full page");
+
+    // Page 2 via keyset cursor.
+    let res2 = server.get(&format!("/payments?cursor={cursor}&limit=2")).await;
+    res2.assert_status_ok();
+    let body2: Value = res2.json();
+    assert_eq!(body2["payments"].as_array().unwrap().len(), 2);
+    let cursor2 = body2["next_cursor"].as_str().expect("next_cursor must be present on a full page");
+
+    // Page 3 — last page, fewer items than limit.
+    let res3 = server.get(&format!("/payments?cursor={cursor2}&limit=2")).await;
+    res3.assert_status_ok();
+    let body3: Value = res3.json();
+    assert_eq!(body3["payments"].as_array().unwrap().len(), 1);
+    assert!(body3["next_cursor"].is_null(), "last page must have null next_cursor");
+
+    // All 5 IDs are unique across all pages.
+    let ids: Vec<String> = [&body, &body2, &body3]
+        .iter()
+        .flat_map(|b| b["payments"].as_array().unwrap().iter())
+        .map(|p| p["id"].as_str().unwrap().to_string())
+        .collect();
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), 5);
+}
+
+#[tokio::test]
+async fn test_list_cursor_invalid() {
+    let res = test_server().await.get("/payments?cursor=notvalidhex!!").await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn test_unknown_route_returns_json_404() {
     let res = test_server().await.get("/nope").await;
     res.assert_status(StatusCode::NOT_FOUND);
-    assert_eq!(res.json::<Value>()["error"], "not found");
+    let body: Value = res.json();
+    assert_eq!(body["error"], "not found");
+    assert_eq!(body["code"], "not_found");
+    res.assert_contains_header("x-request-id");
 }
 
 #[tokio::test]
 async fn test_list_webhooks_not_found() {
     let res = test_server().await.get("/payments/nonexistent/webhooks").await;
     res.assert_status(StatusCode::NOT_FOUND);
-    assert_eq!(res.json::<Value>()["error"], "payment not found");
+    let body: Value = res.json();
+    assert_eq!(body["error"], "payment not found");
+    assert_eq!(body["code"], "payment_not_found");
 }
 
 #[tokio::test]
@@ -210,7 +274,7 @@ async fn test_list_webhooks_empty() {
 
 #[tokio::test]
 async fn test_redeliver_webhook_not_found() {
-    let res = test_server().await.get("/payments/nonexistent/webhooks/xyz/redeliver").await;
+    let res = test_server().await.post("/payments/nonexistent/webhooks/xyz/redeliver").await;
     res.assert_status(StatusCode::NOT_FOUND);
 }
 
@@ -228,21 +292,20 @@ async fn test_redeliver_delivery_not_found() {
 
 #[tokio::test]
 async fn test_webhook_delivery_isolation() {
-    let server = test_server().await;
-    
+    let (server, pool) = test_server_with_pool().await;
+
     // Create two payments
     let id1 = server.post("/payments")
         .json(&json!({ "amount": "5", "asset": "XLM" }))
         .await
         .json::<Value>()["id"].as_str().unwrap().to_string();
-    
+
     let id2 = server.post("/payments")
         .json(&json!({ "amount": "10", "asset": "USDC" }))
         .await
         .json::<Value>()["id"].as_str().unwrap().to_string();
-    
+
     // Manually insert a delivery for payment 1
-    let pool = server.state::<Arc<AppState>>().pool.clone();
     stellargate::db::save_webhook_delivery(
         &pool,
         "delivery-1",

@@ -8,7 +8,10 @@ use axum::{
 use serde_json::json;
 use std::sync::Arc;
 use tower_http::{
-    cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLayer,
+    cors::CorsLayer,
+    limit::RequestBodyLimitLayer,
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    trace::TraceLayer,
 };
 
 mod payments;
@@ -26,7 +29,9 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/payments/:id/webhooks", get(payments::list_webhooks))
         .route("/payments/:id/webhooks/:delivery_id/redeliver", post(payments::redeliver_webhook))
         .fallback(not_found)
+        .layer(PropagateRequestIdLayer::x_request_id())
         .layer(TraceLayer::new_for_http())
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .layer(cors)
         .with_state(state)
@@ -73,6 +78,6 @@ async fn health() -> impl IntoResponse {
 async fn not_found() -> impl IntoResponse {
     (
         StatusCode::NOT_FOUND,
-        Json(json!({ "error": "not found" })),
+        Json(json!({ "error": "not found", "code": "not_found" })),
     )
 }

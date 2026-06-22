@@ -49,6 +49,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)")
         .execute(pool)
         .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_payments_created_id ON payments(created_at DESC, id DESC)",
+    )
+    .execute(pool)
+    .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS webhook_deliveries (
@@ -183,7 +188,7 @@ pub async fn list_payments(
         let rows = sqlx::query(
             "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at
-             FROM payments WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+             FROM payments WHERE status = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
         )
         .bind(s)
         .bind(limit)
@@ -201,7 +206,7 @@ pub async fn list_payments(
         let rows = sqlx::query(
             "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at
-             FROM payments ORDER BY created_at DESC LIMIT ? OFFSET ?",
+             FROM payments ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
         )
         .bind(limit)
         .bind(offset)
@@ -218,13 +223,75 @@ pub async fn list_payments(
     Ok((rows.iter().map(row_to_payment).collect(), total))
 }
 
+pub async fn list_payments_keyset(
+    pool: &Db,
+    status: Option<&str>,
+    limit: i64,
+    cursor: Option<(&str, &str)>,
+) -> Result<Vec<Payment>> {
+    let rows = match (status, cursor) {
+        (None, None) => sqlx::query(
+            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+                    webhook_url, tx_hash, paid_amount, created_at, updated_at
+             FROM payments ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await?,
+
+        (None, Some((ts, cid))) => sqlx::query(
+            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+                    webhook_url, tx_hash, paid_amount, created_at, updated_at
+             FROM payments
+             WHERE (created_at < ? OR (created_at = ? AND id < ?))
+             ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(ts)
+        .bind(ts)
+        .bind(cid)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?,
+
+        (Some(s), None) => sqlx::query(
+            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+                    webhook_url, tx_hash, paid_amount, created_at, updated_at
+             FROM payments WHERE status = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(s)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?,
+
+        (Some(s), Some((ts, cid))) => sqlx::query(
+            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+                    webhook_url, tx_hash, paid_amount, created_at, updated_at
+             FROM payments
+             WHERE status = ? AND (created_at < ? OR (created_at = ? AND id < ?))
+             ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(s)
+        .bind(ts)
+        .bind(ts)
+        .bind(cid)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?,
+    };
+
+    Ok(rows.iter().map(row_to_payment).collect())
+}
+
 /// All payments still awaiting confirmation, oldest first. Used by the Horizon
 /// poller to decide which memos to watch for on-chain.
+///
+/// Includes both `pending` (no payment yet) and `underpaid` (partial payment
+/// received, awaiting a top-up to reach the full amount).
 pub async fn list_pending(pool: &Db) -> Result<Vec<Payment>> {
     let rows = sqlx::query(
         "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                 webhook_url, tx_hash, paid_amount, created_at, updated_at
-         FROM payments WHERE status = 'pending' ORDER BY created_at ASC",
+         FROM payments WHERE status IN ('pending', 'underpaid') ORDER BY created_at ASC",
     )
     .fetch_all(pool)
     .await?;
