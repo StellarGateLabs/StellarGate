@@ -7,8 +7,8 @@ use std::sync::Arc;
 use stellargate::{api, config::Config, db, AppState};
 use time::format_description::well_known::Rfc3339;
 
-fn make_config() -> Config {
-    Config {
+async fn test_server_with_pool() -> (TestServer, db::Db) {
+    let cfg = Config {
         port: 0,
         database_url: "sqlite::memory:".into(),
         network: "testnet".into(),
@@ -39,6 +39,10 @@ async fn test_server_with_pool() -> (TestServer, db::Db) {
     let http = reqwest::Client::new();
     let server = TestServer::new(api::router(Arc::new(AppState { pool: pool.clone(), config: cfg, http }))).unwrap();
     (server, pool)
+}
+
+async fn test_server() -> TestServer {
+    test_server_with_pool().await.0
 }
 
 #[tokio::test]
@@ -191,6 +195,50 @@ async fn test_list_invalid_status() {
 }
 
 #[tokio::test]
+async fn test_list_cursor_pagination() {
+    let server = test_server().await;
+    for amt in ["1", "2", "3", "4", "5"] {
+        server.post("/payments").json(&json!({ "amount": amt, "asset": "XLM" })).await;
+    }
+
+    // Page 1 via offset path — also returns next_cursor for migration.
+    let res = server.get("/payments?limit=2").await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+    assert_eq!(body["payments"].as_array().unwrap().len(), 2);
+    let cursor = body["next_cursor"].as_str().expect("next_cursor must be present on a full page");
+
+    // Page 2 via keyset cursor.
+    let res2 = server.get(&format!("/payments?cursor={cursor}&limit=2")).await;
+    res2.assert_status_ok();
+    let body2: Value = res2.json();
+    assert_eq!(body2["payments"].as_array().unwrap().len(), 2);
+    let cursor2 = body2["next_cursor"].as_str().expect("next_cursor must be present on a full page");
+
+    // Page 3 — last page, fewer items than limit.
+    let res3 = server.get(&format!("/payments?cursor={cursor2}&limit=2")).await;
+    res3.assert_status_ok();
+    let body3: Value = res3.json();
+    assert_eq!(body3["payments"].as_array().unwrap().len(), 1);
+    assert!(body3["next_cursor"].is_null(), "last page must have null next_cursor");
+
+    // All 5 IDs are unique across all pages.
+    let ids: Vec<String> = [&body, &body2, &body3]
+        .iter()
+        .flat_map(|b| b["payments"].as_array().unwrap().iter())
+        .map(|p| p["id"].as_str().unwrap().to_string())
+        .collect();
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), 5);
+}
+
+#[tokio::test]
+async fn test_list_cursor_invalid() {
+    let res = test_server().await.get("/payments?cursor=notvalidhex!!").await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn test_unknown_route_returns_json_404() {
     let res = test_server().await.get("/nope").await;
     res.assert_status(StatusCode::NOT_FOUND);
@@ -245,18 +293,18 @@ async fn test_redeliver_delivery_not_found() {
 #[tokio::test]
 async fn test_webhook_delivery_isolation() {
     let (server, pool) = test_server_with_pool().await;
-    
+
     // Create two payments
     let id1 = server.post("/payments")
         .json(&json!({ "amount": "5", "asset": "XLM" }))
         .await
         .json::<Value>()["id"].as_str().unwrap().to_string();
-    
+
     let id2 = server.post("/payments")
         .json(&json!({ "amount": "10", "asset": "USDC" }))
         .await
         .json::<Value>()["id"].as_str().unwrap().to_string();
-    
+
     // Manually insert a delivery for payment 1
     stellargate::db::save_webhook_delivery(
         &pool,
