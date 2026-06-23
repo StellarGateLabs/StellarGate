@@ -381,6 +381,9 @@ function verify(rawBody, headers, secret, toleranceSec = 300) {
 ## Project Structure
 
 ```
+migrations/
+└── 0001_initial_schema.sql   # Versioned schema applied automatically on startup
+
 src/
 ├── main.rs          # Entry point, server startup, listener/poller spawn, graceful shutdown
 ├── lib.rs           # Shared state and module exports
@@ -398,6 +401,18 @@ src/
 tests/
 └── api_tests.rs     # Integration tests
 ```
+
+## Database Migrations
+
+Schema is managed with [`sqlx::migrate!`](https://docs.rs/sqlx/latest/sqlx/macro.migrate.html). Migrations live in `migrations/` as numbered SQL files and are applied automatically on startup — both a fresh database and an existing one converge to the same schema.
+
+**Adding a migration:**
+
+1. Create `migrations/<next_number>_<short_description>.sql` (e.g. `0002_add_refunds_table.sql`).
+2. Write your `ALTER TABLE` / `CREATE TABLE` SQL in the file.
+3. Run `cargo test` — the test suite boots against an in-memory database and will apply all migrations, catching syntax errors early.
+
+sqlx records applied migrations in a `_sqlx_migrations` table so each file is run exactly once.
 
 ## Contributing
 
