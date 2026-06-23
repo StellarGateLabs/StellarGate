@@ -67,9 +67,9 @@ cp .env.example .env
 | `DATABASE_URL` | sqlx connection string | `sqlite:stellargate.db` |
 | `STELLAR_NETWORK` | `testnet` or `public` | `testnet` |
 | `STELLAR_HORIZON_URL` | Horizon endpoint | testnet |
-| `STELLAR_GATEWAY_PUBLIC` | Your gateway wallet public key | — |
+| `STELLAR_GATEWAY_PUBLIC` | Your gateway wallet public key (`G...`). Validated as a Stellar strkey at startup; an invalid value aborts boot. | — |
 | `STELLAR_GATEWAY_SECRET` | Your gateway wallet secret key | — |
-| `ACCEPTED_ASSETS` | Comma-separated assets to accept. Format: `CODE` for native (e.g. `XLM`) or `CODE:ISSUER` for non-native (e.g. `USDC:GISSUER`). Adding an asset is config-only — no code changes needed. | `XLM,USDC:<testnet-issuer>` |
+| `ACCEPTED_ASSETS` | Comma-separated assets to accept. Format: `CODE` for native (e.g. `XLM`) or `CODE:ISSUER` for non-native (e.g. `USDC:GISSUER`). Adding an asset is config-only — no code changes needed. Each `ISSUER` is validated as a Stellar strkey at startup. | `XLM,USDC:<testnet-issuer>` |
 | `STELLAR_LISTENER_MODE` | `stream` (SSE + poller reconciler) or `poll` (interval only) | `stream` |
 | `POLL_INTERVAL_SECS` | How often the Horizon poller reconciles | `10` |
 | `PAYMENT_TTL_SECS` | How long a payment intent stays `pending` before it is expired (from `created_at`) | `3600` |
@@ -387,6 +387,7 @@ src/
 ├── config.rs        # Environment configuration
 ├── db.rs            # Database queries (SQLite)
 ├── money.rs         # Stroops-based amount parsing/validation
+├── strkey.rs        # Stellar address (strkey) validation
 ├── horizon.rs       # Horizon polling listener + payment verification
 ├── expiry.rs        # Background sweeper that expires overdue pending intents
 ├── webhook.rs       # HMAC-SHA256 signed webhook dispatch
