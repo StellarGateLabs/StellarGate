@@ -3,7 +3,11 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use stellargate::{api, config::{Config, ListenerMode}, db, expiry, horizon, AppState};
+use stellargate::{
+    api,
+    config::{Config, ListenerMode},
+    db, expiry, horizon, AppState,
+};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -47,9 +51,12 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("StellarGate API listening on {addr}");
 
-    axum::serve(listener, api::router(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        api::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     info!("shutdown complete");
     Ok(())

@@ -58,18 +58,19 @@ impl AcceptedAsset {
 
     pub fn default_list() -> Vec<Self> {
         vec![
-            AcceptedAsset { code: "XLM".into(), issuer: None },
+            AcceptedAsset {
+                code: "XLM".into(),
+                issuer: None,
+            },
             AcceptedAsset {
                 code: "USDC".into(),
-                issuer: Some(
-                    "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
-                ),
+                issuer: Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into()),
             },
         ]
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     pub port: u16,
     pub database_url: String,
@@ -84,6 +85,8 @@ pub struct Config {
     pub webhook_retry_attempts: u32,
     pub webhook_retry_delay_ms: u64,
     pub poll_interval_secs: u64,
+    /// Rate limit for POST /payments, counted per client key.
+    pub rate_limit_requests_per_sec: u32,
     /// How long a payment intent stays `pending` before the expiry sweeper
     /// transitions it to `expired`. Counted from the intent's `created_at`.
     pub payment_ttl_secs: u64,
@@ -114,6 +117,7 @@ impl Config {
             webhook_retry_attempts: parse_env("WEBHOOK_RETRY_ATTEMPTS", 3),
             webhook_retry_delay_ms: parse_env("WEBHOOK_RETRY_DELAY_MS", 5000),
             poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10),
+            rate_limit_requests_per_sec: parse_env("RATE_LIMIT_REQUESTS_PER_SEC", 10),
             payment_ttl_secs: parse_env("PAYMENT_TTL_SECS", 3600),
             cors_allowed_origins: std::env::var("CORS_ALLOWED_ORIGINS")
                 .unwrap_or_default()
@@ -149,6 +153,10 @@ impl std::fmt::Debug for Config {
             .field("webhook_retry_attempts", &self.webhook_retry_attempts)
             .field("webhook_retry_delay_ms", &self.webhook_retry_delay_ms)
             .field("poll_interval_secs", &self.poll_interval_secs)
+            .field(
+                "rate_limit_requests_per_sec",
+                &self.rate_limit_requests_per_sec,
+            )
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("listener_mode", &self.listener_mode)
             .finish()
@@ -173,23 +181,51 @@ mod tests {
             webhook_retry_attempts: 3,
             webhook_retry_delay_ms: 5000,
             poll_interval_secs: 10,
+            rate_limit_requests_per_sec: 10,
             payment_ttl_secs: 3600,
             cors_allowed_origins: vec![],
             listener_mode: ListenerMode::Stream,
         };
         let output = format!("{cfg:?}");
-        assert!(!output.contains("super-secret-key"), "gateway_secret must not appear in Debug output");
-        assert!(!output.contains("webhook-hmac-secret"), "webhook_secret must not appear in Debug output");
-        assert!(output.contains("***"), "redacted marker must appear in Debug output");
+        assert!(
+            !output.contains("super-secret-key"),
+            "gateway_secret must not appear in Debug output"
+        );
+        assert!(
+            !output.contains("webhook-hmac-secret"),
+            "webhook_secret must not appear in Debug output"
+        );
+        assert!(
+            output.contains("***"),
+            "redacted marker must appear in Debug output"
+        );
     }
 
     #[test]
     fn parse_accepted_assets_from_env_string() {
         let assets = AcceptedAsset::parse_list("XLM,USDC:GISSUER,EURC:GISSUER2");
         assert_eq!(assets.len(), 3);
-        assert_eq!(assets[0], AcceptedAsset { code: "XLM".into(), issuer: None });
-        assert_eq!(assets[1], AcceptedAsset { code: "USDC".into(), issuer: Some("GISSUER".into()) });
-        assert_eq!(assets[2], AcceptedAsset { code: "EURC".into(), issuer: Some("GISSUER2".into()) });
+        assert_eq!(
+            assets[0],
+            AcceptedAsset {
+                code: "XLM".into(),
+                issuer: None
+            }
+        );
+        assert_eq!(
+            assets[1],
+            AcceptedAsset {
+                code: "USDC".into(),
+                issuer: Some("GISSUER".into())
+            }
+        );
+        assert_eq!(
+            assets[2],
+            AcceptedAsset {
+                code: "EURC".into(),
+                issuer: Some("GISSUER2".into())
+            }
+        );
     }
 }
 
