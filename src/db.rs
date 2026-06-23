@@ -691,7 +691,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(find_pending_by_memo(&pool, "MEMOX").await.unwrap().is_none());
+        assert!(find_pending_by_memo(&pool, "MEMOX")
+            .await
+            .unwrap()
+            .is_none());
 
         let expired = expire_overdue(&pool).await.unwrap();
         assert_eq!(expired.len(), 1);

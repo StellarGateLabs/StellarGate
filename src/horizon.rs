@@ -346,9 +346,26 @@ async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow
         .and_then(money::parse_stroops)
         .unwrap_or(0);
 
-    match verify(&payment, hp, &state.config.accepted_assets, already_paid_stroops) {
-        Some(Verdict::Completed { tx_hash, paid_amount }) => {
-            settle(state, &payment, "completed", &tx_hash, &paid_amount, "payment.completed", None).await;
+    match verify(
+        &payment,
+        hp,
+        &state.config.accepted_assets,
+        already_paid_stroops,
+    ) {
+        Some(Verdict::Completed {
+            tx_hash,
+            paid_amount,
+        }) => {
+            settle(
+                state,
+                &payment,
+                "completed",
+                &tx_hash,
+                &paid_amount,
+                "payment.completed",
+                None,
+            )
+            .await;
             Ok(true)
         }
         Some(Verdict::Overpaid {
@@ -428,7 +445,6 @@ async fn settle(
     // (recording here is non-blocking from reconciliation's point of view).
     webhook::dispatch(state, &settled, event, delta).await;
 }
-
 
 /// Background loop that polls Horizon on the configured interval until the
 /// process shuts down. Idles (without polling) while no gateway is configured.

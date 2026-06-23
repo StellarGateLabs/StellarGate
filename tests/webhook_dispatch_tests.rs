@@ -89,7 +89,17 @@ async fn dispatch_delivers_successfully_with_valid_signature() {
     let received = server.received_requests().await.unwrap();
     assert_eq!(received.len(), 1);
     let req = &received[0];
-    let expected_sig = webhook::sign(&state.config.webhook_secret, &req.body);
+    // The signature now covers "{timestamp}.{body}", so verify using the
+    // timestamp the request advertises in its header.
+    let timestamp: i64 = req
+        .headers
+        .get("X-StellarGate-Timestamp")
+        .expect("timestamp header must be present")
+        .to_str()
+        .unwrap()
+        .parse()
+        .expect("timestamp header must be an integer");
+    let expected_sig = webhook::sign(&state.config.webhook_secret, timestamp, &req.body);
     assert_eq!(
         req.headers
             .get("X-StellarGate-Signature")

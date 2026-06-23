@@ -29,7 +29,7 @@ This project is under active development. The following is implemented:
 - [x] Input validation (asset, amount as exact stroops, webhook URL)
 - [x] Transaction listener (Horizon SSE streaming + interval polling)
 - [x] Payment verification (memo + asset + amount)
-- [x] Webhook dispatch (HMAC-SHA256 signed, with retries)
+- [x] Webhook dispatch (timestamped HMAC-SHA256 signature, replay-resistant, with retries)
 - [x] Multi-merchant support (`merchant_id` per payment)
 - [x] Pending-intent expiry (configurable TTL + `payment.expired` webhook)
 - [ ] Horizon streaming (currently polled on an interval)
@@ -337,7 +337,46 @@ verification failed), and `payment.expired` (the intent's TTL elapsed before
 payment arrived). The `event` field carries the type; `status` carries the
 matching payment status.
 
-Webhooks are signed with `X-StellarGate-Signature` (HMAC-SHA256) so you can verify authenticity.
+### Verifying webhooks
+
+Every webhook request carries two headers:
+
+| Header | Value |
+|---|---|
+| `X-StellarGate-Timestamp` | Unix time (seconds) at which the event was signed |
+| `X-StellarGate-Signature` | Hex HMAC-SHA256 of `"{timestamp}.{raw_body}"`, keyed with your `WEBHOOK_SECRET` |
+
+The signature covers the timestamp as well as the body (Stripe-style), so a
+captured request cannot be replayed indefinitely. To verify:
+
+1. Read `X-StellarGate-Timestamp` (`t`) and `X-StellarGate-Signature` (`sig`).
+2. Reject the request if `t` is too old: `abs(now - t) > tolerance`. A
+   **5-minute** tolerance is recommended — large enough for clock skew and
+   network delay, small enough to bound the replay window.
+3. Concatenate `"{t}.{raw_body}"` using the **exact bytes** received (verify
+   before any JSON re-encoding, which would change the bytes).
+4. Compute `HMAC_SHA256(WEBHOOK_SECRET, "{t}.{raw_body}")` and hex-encode it.
+5. Compare it to `sig` with a **constant-time** equality check. Reject on
+   mismatch.
+
+Example (Node.js):
+
+```js
+const crypto = require("crypto");
+
+function verify(rawBody, headers, secret, toleranceSec = 300) {
+  const t = Number(headers["x-stellargate-timestamp"]);
+  const sig = headers["x-stellargate-signature"];
+  if (!Number.isFinite(t) || Math.abs(Date.now() / 1000 - t) > toleranceSec) {
+    return false; // stale or missing timestamp — reject
+  }
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(`${t}.${rawBody}`)
+    .digest("hex");
+  return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+}
+```
 
 ## Project Structure
 

@@ -9,6 +9,7 @@ use stellargate::{
     config::{Config, ListenerMode},
     db, expiry, horizon, AppState,
 };
+use tokio::sync::watch;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -60,10 +61,24 @@ async fn main() -> Result<()> {
 
     axum::serve(
         listener,
-        api::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        api::router(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
+
+    // Signal background tasks and wait (bounded) for them to finish.
+    let _ = shutdown_tx.send(true);
+    let timeout = Duration::from_secs(30);
+    let bg = async {
+        let _ = poller_handle.await;
+        let _ = sweeper_handle.await;
+        if let Some(h) = stream_handle {
+            let _ = h.await;
+        }
+    };
+    if tokio::time::timeout(timeout, bg).await.is_err() {
+        info!("background tasks did not finish within 30s; forcing exit");
+    }
 
     info!("shutdown complete");
     Ok(())

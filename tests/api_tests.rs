@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use stellargate::{
     api,
-    config::{AcceptedAsset, Config, ListenerMode},
+    config::{Config, ListenerMode},
     db, AppState,
 };
 use time::format_description::well_known::Rfc3339;
@@ -25,12 +25,11 @@ fn make_config() -> Config {
         webhook_retry_delay_ms: 0,
         poll_interval_secs: 10,
         payment_ttl_secs: 3600,
-        // High enough that ordinary tests never trip the limiter; the rate-limit
-        // test below overrides this with a low value.
+        // High enough that these tests never trip the limiter; dedicated
+        // rate-limit coverage lives in tests/rate_limit_tests.rs.
         rate_limit_requests_per_sec: 1000,
         cors_allowed_origins: vec![],
         listener_mode: ListenerMode::Poll,
-        rate_limit_requests_per_sec: 1000,
     }
 }
 
@@ -75,28 +74,6 @@ async fn test_ready_ok_with_live_db() {
     let res = test_server().await.get("/ready").await;
     res.assert_status_ok();
     assert_eq!(res.json::<serde_json::Value>()["status"], "ok");
-}
-
-#[tokio::test]
-async fn test_rate_limit_exceeded_returns_429() {
-    let mut cfg = make_config();
-    cfg.rate_limit_requests_per_sec = 1;
-    let (server, _pool) = server_with_config(cfg).await;
-
-    // The first request consumes the single per-second token.
-    let first = server
-        .post("/payments")
-        .json(&json!({ "amount": "1", "asset": "XLM" }))
-        .await;
-    first.assert_status(StatusCode::CREATED);
-
-    // A second immediate request exceeds the quota and is rejected.
-    let second = server
-        .post("/payments")
-        .json(&json!({ "amount": "1", "asset": "XLM" }))
-        .await;
-    second.assert_status(StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(second.json::<Value>()["code"], "rate_limit_exceeded");
 }
 
 #[tokio::test]
