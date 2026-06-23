@@ -99,7 +99,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        Ok(Self {
+        let config = Self {
             port: parse_env("PORT", 3000),
             database_url: env_or("DATABASE_URL", "sqlite:stellargate.db"),
             network: env_or("STELLAR_NETWORK", "testnet"),
@@ -130,13 +130,42 @@ impl Config {
             listener_mode: ListenerMode::parse(
                 &std::env::var("STELLAR_LISTENER_MODE").unwrap_or_default(),
             ),
-        })
+        };
+        config.validate_addresses()?;
+        Ok(config)
     }
 
     /// True once a real gateway wallet has been configured. Until then the
     /// Horizon poller stays idle rather than scanning the placeholder account.
     pub fn gateway_configured(&self) -> bool {
         !self.gateway_public.is_empty() && self.gateway_public != "UNCONFIGURED"
+    }
+
+    /// Reject configured Stellar addresses — the gateway account and any asset
+    /// issuers — that are not valid strkeys, so a typo fails fast at boot rather
+    /// than silently producing unpayable intents. The unconfigured placeholder
+    /// is left alone; the poller stays idle until a real key is provided.
+    fn validate_addresses(&self) -> Result<()> {
+        if self.gateway_configured() {
+            crate::strkey::validate_account_id(&self.gateway_public).map_err(|e| {
+                anyhow::anyhow!(
+                    "STELLAR_GATEWAY_PUBLIC ({}) is not a valid Stellar account address: {e}",
+                    self.gateway_public
+                )
+            })?;
+        }
+        for asset in &self.accepted_assets {
+            if let Some(issuer) = &asset.issuer {
+                crate::strkey::validate_account_id(issuer).map_err(|e| {
+                    anyhow::anyhow!(
+                        "issuer for asset {} ({}) is not a valid Stellar account address: {e}",
+                        asset.code,
+                        issuer
+                    )
+                })?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -247,5 +276,58 @@ mod tests {
                 issuer: Some("GISSUER2".into())
             }
         );
+    }
+
+    fn sample_config() -> Config {
+        Config {
+            port: 3000,
+            database_url: "sqlite::memory:".into(),
+            network: "testnet".into(),
+            horizon_url: "https://horizon-testnet.stellar.org".into(),
+            gateway_public: "UNCONFIGURED".into(),
+            gateway_secret: String::new(),
+            accepted_assets: AcceptedAsset::default_list(),
+            webhook_secret: String::new(),
+            webhook_retry_attempts: 3,
+            webhook_retry_delay_ms: 5000,
+            poll_interval_secs: 10,
+            payment_ttl_secs: 3600,
+            rate_limit_requests_per_sec: 10,
+            cors_allowed_origins: vec![],
+            listener_mode: ListenerMode::Stream,
+        }
+    }
+
+    #[test]
+    fn validate_addresses_passes_for_unconfigured_gateway_and_default_issuer() {
+        // The placeholder gateway is skipped; the default USDC issuer is valid.
+        assert!(sample_config().validate_addresses().is_ok());
+    }
+
+    #[test]
+    fn validate_addresses_accepts_a_real_gateway_key() {
+        let mut cfg = sample_config();
+        cfg.gateway_public = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into();
+        assert!(cfg.validate_addresses().is_ok());
+    }
+
+    #[test]
+    fn validate_addresses_rejects_a_corrupted_gateway_key() {
+        let mut cfg = sample_config();
+        // A valid key with one character flipped — a realistic typo.
+        cfg.gateway_public = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLB5".into();
+        let err = cfg.validate_addresses().unwrap_err().to_string();
+        assert!(err.contains("STELLAR_GATEWAY_PUBLIC"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_addresses_rejects_an_invalid_issuer() {
+        let mut cfg = sample_config();
+        cfg.accepted_assets = vec![AcceptedAsset {
+            code: "USDC".into(),
+            issuer: Some("GNOTAREALISSUER".into()),
+        }];
+        let err = cfg.validate_addresses().unwrap_err().to_string();
+        assert!(err.contains("USDC"), "got: {err}");
     }
 }
