@@ -91,6 +91,13 @@ pub struct Config {
     /// Maximum number of requests per second allowed per client IP before the
     /// rate-limit middleware responds with `429 Too Many Requests`.
     pub rate_limit_requests_per_sec: u32,
+    /// Maximum number of SQLite connections in the pool.
+    /// WAL mode allows one writer + many readers, so keeping this modest avoids
+    /// contention. Defaults to 10.
+    pub db_pool_max_connections: u32,
+    /// How long (ms) SQLite waits for a lock before returning SQLITE_BUSY.
+    /// Must be > 0 to avoid immediate lock errors under concurrent writes.
+    pub db_busy_timeout_ms: u64,
     /// Comma-separated list of allowed CORS origins, e.g. `https://app.example.com`.
     /// Required when `STELLAR_NETWORK=public`; optional (falls back to permissive) on testnet.
     pub cors_allowed_origins: Vec<String>,
@@ -120,6 +127,8 @@ impl Config {
             poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10),
             payment_ttl_secs: parse_env("PAYMENT_TTL_SECS", 3600),
             rate_limit_requests_per_sec: parse_env("RATE_LIMIT_REQUESTS_PER_SEC", 10),
+            db_pool_max_connections: parse_env("DB_POOL_MAX_CONNECTIONS", 10),
+            db_busy_timeout_ms: parse_env("DB_BUSY_TIMEOUT_MS", 5000),
             cors_allowed_origins: std::env::var("CORS_ALLOWED_ORIGINS")
                 .unwrap_or_default()
                 .split(',')
@@ -188,6 +197,8 @@ impl std::fmt::Debug for Config {
                 "rate_limit_requests_per_sec",
                 &self.rate_limit_requests_per_sec,
             )
+            .field("db_pool_max_connections", &self.db_pool_max_connections)
+            .field("db_busy_timeout_ms", &self.db_busy_timeout_ms)
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("listener_mode", &self.listener_mode)
             .finish()
@@ -233,6 +244,8 @@ mod tests {
             poll_interval_secs: 10,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 10,
+            db_pool_max_connections: 10,
+            db_busy_timeout_ms: 5000,
             cors_allowed_origins: vec![],
             listener_mode: ListenerMode::Stream,
         };
@@ -293,6 +306,8 @@ mod tests {
             poll_interval_secs: 10,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 10,
+            db_pool_max_connections: 10,
+            db_busy_timeout_ms: 5000,
             cors_allowed_origins: vec![],
             listener_mode: ListenerMode::Stream,
         }

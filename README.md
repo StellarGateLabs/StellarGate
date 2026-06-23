@@ -78,6 +78,8 @@ cp .env.example .env
 | `WEBHOOK_RETRY_DELAY_MS` | Delay between webhook retries | `5000` |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated allowed CORS origins (e.g. `https://app.example.com`). Required on `public` network; omitting on testnet falls back to permissive with a warning. | _(unset — permissive on testnet)_ |
 | `RATE_LIMIT_REQUESTS_PER_SEC` | Rate limit for `POST /payments` (requests per second per IP) | `10` |
+| `DB_POOL_MAX_CONNECTIONS` | SQLite connection pool size. WAL mode allows one writer + many concurrent readers. | `10` |
+| `DB_BUSY_TIMEOUT_MS` | How long (ms) SQLite waits to acquire a write lock before returning an error. Must be `> 0` under concurrent load. | `5000` |
 
 > `DATABASE_URL` is a sqlx connection string (`sqlite:stellargate.db`), not a
 > file path. The Horizon poller stays idle until `STELLAR_GATEWAY_PUBLIC` is set.
@@ -381,6 +383,9 @@ function verify(rawBody, headers, secret, toleranceSec = 300) {
 ## Project Structure
 
 ```
+migrations/
+└── 0001_initial_schema.sql   # Versioned schema applied automatically on startup
+
 src/
 ├── main.rs          # Entry point, server startup, listener/poller spawn, graceful shutdown
 ├── lib.rs           # Shared state and module exports
@@ -398,6 +403,18 @@ src/
 tests/
 └── api_tests.rs     # Integration tests
 ```
+
+## Database Migrations
+
+Schema is managed with [`sqlx::migrate!`](https://docs.rs/sqlx/latest/sqlx/macro.migrate.html). Migrations live in `migrations/` as numbered SQL files and are applied automatically on startup — both a fresh database and an existing one converge to the same schema.
+
+**Adding a migration:**
+
+1. Create `migrations/<next_number>_<short_description>.sql` (e.g. `0002_add_refunds_table.sql`).
+2. Write your `ALTER TABLE` / `CREATE TABLE` SQL in the file.
+3. Run `cargo test` — the test suite boots against an in-memory database and will apply all migrations, catching syntax errors early.
+
+sqlx records applied migrations in a `_sqlx_migrations` table so each file is run exactly once.
 
 ## Contributing
 
