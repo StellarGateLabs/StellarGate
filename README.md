@@ -78,6 +78,8 @@ cp .env.example .env
 | `WEBHOOK_RETRY_DELAY_MS` | Delay between webhook retries | `5000` |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated allowed CORS origins (e.g. `https://app.example.com`). Required on `public` network; omitting on testnet falls back to permissive with a warning. | _(unset — permissive on testnet)_ |
 | `RATE_LIMIT_REQUESTS_PER_SEC` | Rate limit for `POST /payments` (requests per second per IP) | `10` |
+| `DB_POOL_MAX_CONNECTIONS` | SQLite connection pool size. WAL mode allows one writer + many concurrent readers. | `10` |
+| `DB_BUSY_TIMEOUT_MS` | How long (ms) SQLite waits to acquire a write lock before returning an error. Must be `> 0` under concurrent load. | `5000` |
 
 > `DATABASE_URL` is a sqlx connection string (`sqlite:stellargate.db`), not a
 > file path. The Horizon poller stays idle until `STELLAR_GATEWAY_PUBLIC` is set.

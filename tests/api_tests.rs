@@ -28,6 +28,8 @@ fn make_config() -> Config {
         // High enough that these tests never trip the limiter; dedicated
         // rate-limit coverage lives in tests/rate_limit_tests.rs.
         rate_limit_requests_per_sec: 1000,
+        db_pool_max_connections: 10,
+        db_busy_timeout_ms: 5000,
         cors_allowed_origins: vec![],
         listener_mode: ListenerMode::Poll,
     }

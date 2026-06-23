@@ -33,6 +33,8 @@ fn make_config(rate_limit_requests_per_sec: u32) -> Config {
         poll_interval_secs: 10,
         payment_ttl_secs: 3600,
         rate_limit_requests_per_sec,
+        db_pool_max_connections: 10,
+        db_busy_timeout_ms: 5000,
         cors_allowed_origins: vec![],
         listener_mode: ListenerMode::Poll,
     }

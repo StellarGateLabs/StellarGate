@@ -32,6 +32,8 @@ fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
         cors_allowed_origins: vec![],
         listener_mode: ListenerMode::Poll,
         rate_limit_requests_per_sec: 1000,
+        db_pool_max_connections: 10,
+        db_busy_timeout_ms: 5000,
     }
 }
 

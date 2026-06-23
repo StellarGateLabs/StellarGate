@@ -1,5 +1,5 @@
 use anyhow::Result;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -23,7 +23,14 @@ async fn main() -> Result<()> {
     let cfg = Config::from_env()?;
 
     let pool = SqlitePoolOptions::new()
-        .connect_with(SqliteConnectOptions::from_str(&cfg.database_url)?.create_if_missing(true))
+        .max_connections(cfg.db_pool_max_connections)
+        .connect_with(
+            SqliteConnectOptions::from_str(&cfg.database_url)?
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal)
+                .synchronous(SqliteSynchronous::Normal)
+                .busy_timeout(Duration::from_millis(cfg.db_busy_timeout_ms)),
+        )
         .await?;
     db::migrate(&pool).await?;
 
