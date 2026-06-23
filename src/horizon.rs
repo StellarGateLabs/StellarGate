@@ -33,6 +33,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 /// Key under which the last fully-processed Horizon paging token is stored in
@@ -91,18 +92,42 @@ struct Embedded {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// Cumulative paid amount equals the requested amount exactly.
-    Completed { tx_hash: String, paid_amount: String },
+    Completed {
+        tx_hash: String,
+        paid_amount: String,
+    },
     /// Cumulative paid amount exceeds the requested amount.
     /// The intent is fulfilled; `delta` is the excess the merchant should refund.
-    Overpaid { tx_hash: String, paid_amount: String },
+    Overpaid {
+        tx_hash: String,
+        paid_amount: String,
+    },
     /// Cumulative paid amount is still below the requested amount.
     /// The intent remains open; `delta` is the shortfall still owed.
-    Underpaid { tx_hash: String, paid_amount: String },
+    Underpaid {
+        tx_hash: String,
+        paid_amount: String,
+    },
 }
 
 impl HorizonPayment {
+    /// The transaction's memo, but only when Horizon reports it as `memo_type:
+    /// "text"`.
+    ///
+    /// We generate text memos exclusively (see [`crate::api::payments`]).
+    /// Stellar transactions can instead carry a `memo_id` (u64) or
+    /// `memo_hash`/`memo_return` (32-byte) memo, and Horizon still populates
+    /// the JSON `memo` field for those — as a decimal string or base64,
+    /// respectively. A `memo_id` consisting only of digits could coincide
+    /// with one of our hex memos as plain text, so the type must be checked;
+    /// otherwise an unrelated `memo_id` payment could be mistaken for one of
+    /// ours.
     fn memo(&self) -> Option<&str> {
-        self.transaction.as_ref().and_then(|t| t.memo.as_deref())
+        let t = self.transaction.as_ref()?;
+        if t.memo_type.as_deref() != Some("text") {
+            return None;
+        }
+        t.memo.as_deref()
     }
 }
 
@@ -154,9 +179,18 @@ pub fn verify(
 
     use std::cmp::Ordering;
     match total_paid.cmp(&expected) {
-        Ordering::Equal => Some(Verdict::Completed { tx_hash, paid_amount }),
-        Ordering::Greater => Some(Verdict::Overpaid { tx_hash, paid_amount }),
-        Ordering::Less => Some(Verdict::Underpaid { tx_hash, paid_amount }),
+        Ordering::Equal => Some(Verdict::Completed {
+            tx_hash,
+            paid_amount,
+        }),
+        Ordering::Greater => Some(Verdict::Overpaid {
+            tx_hash,
+            paid_amount,
+        }),
+        Ordering::Less => Some(Verdict::Underpaid {
+            tx_hash,
+            paid_amount,
+        }),
     }
 }
 
@@ -222,7 +256,12 @@ async fn starting_cursor(state: &Arc<AppState>) -> anyhow::Result<String> {
         .json()
         .await?;
 
-    match page.embedded.records.first().and_then(|p| p.paging_token.clone()) {
+    match page
+        .embedded
+        .records
+        .first()
+        .and_then(|p| p.paging_token.clone())
+    {
         Some(token) => {
             // Persist immediately so a crash before the first page still leaves
             // us baselined rather than replaying history next time.
@@ -312,17 +351,32 @@ async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow
             settle(state, &payment, "completed", &tx_hash, &paid_amount, "payment.completed", None).await;
             Ok(true)
         }
-        Some(Verdict::Overpaid { tx_hash, paid_amount }) => {
+        Some(Verdict::Overpaid {
+            tx_hash,
+            paid_amount,
+        }) => {
             let delta = delta_str(&paid_amount, &payment.amount);
             info!(
                 payment_id = %payment.id,
                 excess = %delta.as_deref().unwrap_or("?"),
                 "overpayment — intent completed, excess should be refunded"
             );
-            settle(state, &payment, "completed", &tx_hash, &paid_amount, "payment.overpaid", delta.as_deref()).await;
+            settle(
+                state,
+                &payment,
+                "completed",
+                &tx_hash,
+                &paid_amount,
+                "payment.overpaid",
+                delta.as_deref(),
+            )
+            .await;
             Ok(true)
         }
-        Some(Verdict::Underpaid { tx_hash, paid_amount }) => {
+        Some(Verdict::Underpaid {
+            tx_hash,
+            paid_amount,
+        }) => {
             let delta = delta_str(&payment.amount, &paid_amount);
             warn!(
                 payment_id = %payment.id,
@@ -331,7 +385,16 @@ async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow
                 remaining = %delta.as_deref().unwrap_or("?"),
                 "underpayment — intent remains open for a top-up"
             );
-            settle(state, &payment, "underpaid", &tx_hash, &paid_amount, "payment.underpaid", delta.as_deref()).await;
+            settle(
+                state,
+                &payment,
+                "underpaid",
+                &tx_hash,
+                &paid_amount,
+                "payment.underpaid",
+                delta.as_deref(),
+            )
+            .await;
             Ok(true)
         }
         None => Ok(false),
@@ -361,12 +424,15 @@ async fn settle(
     settled.status = status.to_string();
     settled.tx_hash = Some(tx_hash.to_string());
     settled.paid_amount = Some(paid_amount.to_string());
+    // Webhook delivery is handled asynchronously by the webhook subsystem
+    // (recording here is non-blocking from reconciliation's point of view).
     webhook::dispatch(state, &settled, event, delta).await;
 }
 
+
 /// Background loop that polls Horizon on the configured interval until the
 /// process shuts down. Idles (without polling) while no gateway is configured.
-pub async fn run_poller(state: Arc<AppState>) {
+pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     if !state.config.gateway_configured() {
         warn!("STELLAR_GATEWAY_PUBLIC is unconfigured; Horizon poller disabled");
         return;
@@ -380,7 +446,13 @@ pub async fn run_poller(state: Arc<AppState>) {
     );
 
     loop {
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown.changed() => {
+                info!("Horizon poller shutting down");
+                return;
+            }
+        }
         match poll_once(&state).await {
             Ok(0) => debug!("poll: nothing to settle"),
             Ok(n) => info!(settled = n, "poll cycle settled payments"),
@@ -428,7 +500,7 @@ fn parse_sse_block(block: &str) -> SseEvent {
 /// automatically with exponential backoff, resuming from the last seen cursor
 /// so no payments are missed across a dropped connection. Idles (without
 /// connecting) while no gateway is configured.
-pub async fn run_stream_listener(state: Arc<AppState>) {
+pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     if !state.config.gateway_configured() {
         warn!("STELLAR_GATEWAY_PUBLIC is unconfigured; Horizon stream listener disabled");
         return;
@@ -458,18 +530,30 @@ pub async fn run_stream_listener(state: Arc<AppState>) {
 
     loop {
         let cursor_before = cursor.clone();
-        match stream_once(&state, &client, &mut cursor).await {
-            Ok(()) => debug!("Horizon stream closed by server; reconnecting"),
-            Err(e) => warn!(error = %e, "Horizon stream dropped; reconnecting"),
+        tokio::select! {
+            result = stream_once(&state, &client, &mut cursor) => {
+                match result {
+                    Ok(()) => debug!("Horizon stream closed by server; reconnecting"),
+                    Err(e) => warn!(error = %e, "Horizon stream dropped; reconnecting"),
+                }
+            }
+            _ = shutdown.changed() => {
+                info!("Horizon stream listener shutting down");
+                return;
+            }
         }
 
-        // Reset backoff whenever the connection made progress (advanced the
-        // cursor), so a long-lived stream that drops once reconnects promptly.
         if cursor != cursor_before {
             backoff = base_backoff;
         }
 
-        tokio::time::sleep(backoff).await;
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            _ = shutdown.changed() => {
+                info!("Horizon stream listener shutting down");
+                return;
+            }
+        }
         backoff = (backoff * 2).min(max_backoff);
     }
 }
@@ -676,6 +760,25 @@ mod tests {
     fn wrong_memo_is_ignored() {
         let p = pending("XLM", "10");
         let hp = native_payment("10", "OTHER", "GGATEWAY");
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+    }
+
+    /// A `memo_id`/`memo_hash`/`memo_return` transaction that happens to
+    /// render the same characters as one of our hex memos must never be
+    /// mistaken for a match — only `memo_type: "text"` counts.
+    #[test]
+    fn non_text_memo_type_is_ignored_even_if_value_matches() {
+        let p = pending("XLM", "10");
+        let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
+        hp.transaction.as_mut().unwrap().memo_type = Some("id".into());
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+    }
+
+    #[test]
+    fn missing_memo_type_is_ignored() {
+        let p = pending("XLM", "10");
+        let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
+        hp.transaction.as_mut().unwrap().memo_type = None;
         assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
     }
 
