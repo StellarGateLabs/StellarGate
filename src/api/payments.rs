@@ -383,15 +383,18 @@ pub async fn redeliver_webhook(
         ));
     }
 
-    // Re-send using the original signed payload
+    // Re-send the original payload, re-signed with a fresh timestamp so the
+    // receiver's replay-tolerance window is measured from this redelivery.
     let payload_bytes = delivery.payload.as_bytes();
-    let signature = crate::webhook::sign(&state.config.webhook_secret, payload_bytes);
+    let timestamp = crate::webhook::current_timestamp();
+    let signature = crate::webhook::sign(&state.config.webhook_secret, timestamp, payload_bytes);
 
     let result = state
         .http
         .post(&delivery.url)
         .header("Content-Type", "application/json")
         .header("X-StellarGate-Signature", &signature)
+        .header("X-StellarGate-Timestamp", timestamp.to_string())
         .header("X-StellarGate-Event", "payment.completed")
         .body(delivery.payload.clone())
         .send()
