@@ -594,7 +594,7 @@ fn row_to_webhook_delivery(row: &sqlx::sqlite::SqliteRow) -> WebhookDelivery {
         status: row.get("status"),
         attempts: row.get("attempts"),
         last_attempt: row.get("last_attempt"),
-        created_at: row.get("created_at"),
+        created_at: normalize_ts(&row.get::<String, _>("created_at")),
     }
 }
 
