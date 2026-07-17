@@ -562,10 +562,22 @@ async fn test_unknown_route_returns_json_404() {
 }
 
 #[tokio::test]
-async fn test_list_webhooks_not_found() {
+async fn test_list_webhooks_unauthenticated_returns_401() {
     let res = test_server()
         .await
         .get("/payments/nonexistent/webhooks")
+        .await;
+    res.assert_status(StatusCode::UNAUTHORIZED);
+    assert_eq!(res.json::<Value>()["code"], "unauthorized");
+}
+
+#[tokio::test]
+async fn test_list_webhooks_not_found() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .get("/payments/nonexistent/webhooks")
+        .add_header("Authorization", format!("Bearer {key}"))
         .await;
     res.assert_status(StatusCode::NOT_FOUND);
     let body: Value = res.json();
@@ -577,9 +589,10 @@ async fn test_list_webhooks_not_found() {
 async fn test_list_webhooks_empty() {
     let server = test_server().await;
     let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
     let id = server
         .post("/payments")
-        .add_header("Authorization", format!("Bearer {key}"))
+        .add_header("Authorization", auth.clone())
         .json(&json!({ "amount": "5", "asset": "XLM" }))
         .await
         .json::<Value>()["id"]
@@ -587,11 +600,51 @@ async fn test_list_webhooks_empty() {
         .unwrap()
         .to_string();
 
-    let res = server.get(&format!("/payments/{id}/webhooks")).await;
+    let res = server
+        .get(&format!("/payments/{id}/webhooks"))
+        .add_header("Authorization", auth)
+        .await;
     res.assert_status_ok();
     let body: Value = res.json();
     assert_eq!(body["payment_id"], id);
     assert_eq!(body["deliveries"].as_array().unwrap().len(), 0);
+}
+
+/// A merchant cannot read another merchant's webhook deliveries — the payment
+/// id alone must not be enough, and the response must not distinguish "not
+/// yours" from "doesn't exist".
+#[tokio::test]
+async fn test_list_webhooks_rejects_other_merchants_payment() {
+    let (server, pool) = test_server_with_pool().await;
+
+    let owner_key = provision_merchant(&server).await;
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {owner_key}"))
+        .json(&json!({ "amount": "5", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    stellargate::db::save_webhook_delivery(
+        &pool,
+        "delivery-owned",
+        &id,
+        "https://example.com/webhook",
+        r#"{"event":"payment.completed"}"#,
+    )
+    .await
+    .unwrap();
+
+    let other_key = provision_merchant(&server).await;
+    let res = server
+        .get(&format!("/payments/{id}/webhooks"))
+        .add_header("Authorization", format!("Bearer {other_key}"))
+        .await;
+    res.assert_status(StatusCode::NOT_FOUND);
+    assert_eq!(res.json::<Value>()["code"], "payment_not_found");
 }
 
 #[tokio::test]
@@ -642,7 +695,7 @@ async fn test_webhook_delivery_isolation() {
 
     let id2 = server
         .post("/payments")
-        .add_header("Authorization", auth)
+        .add_header("Authorization", auth.clone())
         .json(&json!({ "amount": "10", "asset": "USDC" }))
         .await
         .json::<Value>()["id"]
@@ -662,7 +715,10 @@ async fn test_webhook_delivery_isolation() {
     .unwrap();
 
     // List webhooks for payment 1 should find it
-    let res1 = server.get(&format!("/payments/{id1}/webhooks")).await;
+    let res1 = server
+        .get(&format!("/payments/{id1}/webhooks"))
+        .add_header("Authorization", auth.clone())
+        .await;
     res1.assert_status_ok();
     assert_eq!(
         res1.json::<Value>()["deliveries"].as_array().unwrap().len(),
@@ -670,7 +726,10 @@ async fn test_webhook_delivery_isolation() {
     );
 
     // List webhooks for payment 2 should be empty
-    let res2 = server.get(&format!("/payments/{id2}/webhooks")).await;
+    let res2 = server
+        .get(&format!("/payments/{id2}/webhooks"))
+        .add_header("Authorization", auth)
+        .await;
     res2.assert_status_ok();
     assert_eq!(
         res2.json::<Value>()["deliveries"].as_array().unwrap().len(),

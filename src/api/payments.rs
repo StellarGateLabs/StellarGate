@@ -349,11 +349,15 @@ fn to_json(p: &db::Payment) -> Value {
 
 pub async fn list_webhooks(
     State(state): State<Arc<AppState>>,
+    Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
     Path(payment_id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    // Verify payment exists
+    // Verify payment exists and belongs to the caller. A payment owned by
+    // another merchant reports the same 404 as a missing one, so this can't
+    // be used to enumerate which payment ids exist for other tenants.
     let payment = db::get_payment(&state.pool, &payment_id)
         .await?
+        .filter(|p| p.merchant_id == merchant_id)
         .ok_or_else(|| {
             AppError::new(
                 StatusCode::NOT_FOUND,

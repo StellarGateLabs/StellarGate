@@ -54,11 +54,13 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         // Merchant provisioning — returns a one-time plaintext API key.
         .route("/merchants", post(provision_merchant))
         .nest("/payments", {
-            // Auth middleware only on the write + list routes; the per-payment
-            // status and webhook endpoints stay public (anyone with the id can
-            // poll or inspect).
+            // Auth middleware on the write + list routes and the webhook
+            // delivery listing (it exposes merchant-scoped data); the
+            // per-payment status and redeliver endpoints stay public (anyone
+            // with the id can poll or inspect).
             let authed = axum::Router::new()
                 .route("/", post(payments::create).get(payments::list))
+                .route("/:id/webhooks", get(payments::list_webhooks))
                 .route_layer(middleware::from_fn_with_state(
                     state.clone(),
                     auth_middleware,
@@ -67,17 +69,10 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             axum::Router::new()
                 .merge(authed)
                 .route("/:id", get(payments::get_by_id))
-                .route("/:id/webhooks", get(payments::list_webhooks))
                 .route(
                     "/:id/webhooks/:delivery_id/redeliver",
                     post(payments::redeliver_webhook),
                 )
-                .layer(middleware::from_fn(
-                    move |ConnectInfo(addr): ConnectInfo<SocketAddr>, req: Request, next: Next| {
-                        rate_limit_middleware(addr, rate_limit_rps, req, next)
-                    },
-                ))
-                .layer(tower_http::util::ConnectInfoLayer::new())
         })
         .fallback(not_found)
         .layer(PropagateRequestIdLayer::x_request_id())
