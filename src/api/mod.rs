@@ -72,12 +72,6 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
                     "/:id/webhooks/:delivery_id/redeliver",
                     post(payments::redeliver_webhook),
                 )
-                .layer(middleware::from_fn(
-                    move |ConnectInfo(addr): ConnectInfo<SocketAddr>, req: Request, next: Next| {
-                        rate_limit_middleware(addr, rate_limit_rps, req, next)
-                    },
-                ))
-                .layer(tower_http::util::ConnectInfoLayer::new())
         })
         .fallback(not_found)
         .layer(PropagateRequestIdLayer::x_request_id())

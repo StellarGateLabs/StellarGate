@@ -106,13 +106,23 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
+        let database_url =
+            std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:stellargate.db".to_string());
+        let network = std::env::var("STELLAR_NETWORK").unwrap_or_else(|_| "testnet".to_string());
+        let horizon_url = std::env::var("STELLAR_HORIZON_URL")
+            .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".to_string());
+        let gateway_public =
+            std::env::var("STELLAR_GATEWAY_PUBLIC").unwrap_or_else(|_| "UNCONFIGURED".to_string());
+        let gateway_secret = std::env::var("STELLAR_GATEWAY_SECRET").unwrap_or_default();
+        let webhook_secret = Self::validate_webhook_secret(std::env::var("WEBHOOK_SECRET"))?;
+
         let config = Self {
             port: parse_env("PORT", 3000),
-            database_url: env_or("DATABASE_URL", "sqlite:stellargate.db"),
-            network: env_or("STELLAR_NETWORK", "testnet"),
-            horizon_url: env_or("STELLAR_HORIZON_URL", "https://horizon-testnet.stellar.org"),
-            gateway_public: env_or("STELLAR_GATEWAY_PUBLIC", "UNCONFIGURED"),
-            gateway_secret: env_or("STELLAR_GATEWAY_SECRET", ""),
+            database_url,
+            network,
+            horizon_url,
+            gateway_public,
+            gateway_secret,
             accepted_assets: {
                 let raw = std::env::var("ACCEPTED_ASSETS").unwrap_or_default();
                 if raw.is_empty() {
@@ -121,7 +131,7 @@ impl Config {
                     AcceptedAsset::parse_list(&raw)
                 }
             },
-            webhook_secret: env_or("WEBHOOK_SECRET", "default-secret"),
+            webhook_secret,
             webhook_retry_attempts: parse_env("WEBHOOK_RETRY_ATTEMPTS", 3),
             webhook_retry_delay_ms: parse_env("WEBHOOK_RETRY_DELAY_MS", 5000),
             poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10),
@@ -176,6 +186,39 @@ impl Config {
         }
         Ok(())
     }
+
+    fn validate_webhook_secret(raw_secret: Result<String, std::env::VarError>) -> Result<String> {
+        let secret = match raw_secret {
+            Ok(s) => s,
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "WEBHOOK_SECRET environment variable is missing"
+                ))
+            }
+        };
+
+        if secret.is_empty() {
+            return Err(anyhow::anyhow!("WEBHOOK_SECRET cannot be empty"));
+        }
+        if secret.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_SECRET cannot contain only whitespace"
+            ));
+        }
+        if secret == "default-secret" {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_SECRET cannot equal \"default-secret\""
+            ));
+        }
+        if secret.len() < 32 {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_SECRET must be at least 32 characters long (got {})",
+                secret.len()
+            ));
+        }
+
+        Ok(secret)
+    }
 }
 
 impl std::fmt::Debug for Config {
@@ -203,10 +246,6 @@ impl std::fmt::Debug for Config {
             .field("listener_mode", &self.listener_mode)
             .finish()
     }
-}
-
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
 /// Parse an env var into `T`, falling back to `default` (and warning) when the
@@ -344,5 +383,147 @@ mod tests {
         }];
         let err = cfg.validate_addresses().unwrap_err().to_string();
         assert!(err.contains("USDC"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_webhook_secret_missing() {
+        let err = Config::validate_webhook_secret(Err(std::env::VarError::NotPresent))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("environment variable is missing"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_webhook_secret_empty() {
+        let err = Config::validate_webhook_secret(Ok("".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_webhook_secret_whitespace() {
+        let err = Config::validate_webhook_secret(Ok("   ".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot contain only whitespace"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_webhook_secret_default() {
+        let err = Config::validate_webhook_secret(Ok("default-secret".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot equal \"default-secret\""),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_webhook_secret_short() {
+        let err = Config::validate_webhook_secret(Ok("too-short".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("must be at least 32 characters long"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_webhook_secret_valid() {
+        let secret = "a-very-long-and-secure-webhook-signing-secret-32-chars";
+        let res = Config::validate_webhook_secret(Ok(secret.into())).unwrap();
+        assert_eq!(res, secret);
+    }
+
+    fn run_with_env<F>(env_vars: &[(&str, Option<&str>)], f: F)
+    where
+        F: FnOnce(),
+    {
+        use std::sync::OnceLock;
+        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        let _guard = LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+
+        // Backup current env values
+        let backups: Vec<(String, Option<String>)> = env_vars
+            .iter()
+            .map(|(key, _)| (key.to_string(), std::env::var(key).ok()))
+            .collect();
+
+        // Set new values
+        for &(key, val) in env_vars {
+            if let Some(v) = val {
+                std::env::set_var(key, v);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+
+        // Run the test logic
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+
+        // Restore backups
+        for (key, val) in backups {
+            if let Some(v) = val {
+                std::env::set_var(key, v);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+
+        if let Err(err) = res {
+            std::panic::resume_unwind(err);
+        }
+    }
+
+    #[test]
+    fn startup_fails_in_production_if_webhook_secret_missing() {
+        run_with_env(
+            &[
+                ("STELLAR_NETWORK", Some("public")),
+                ("WEBHOOK_SECRET", None),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("WEBHOOK_SECRET environment variable is missing"),
+                    "got: {err}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn startup_succeeds_with_valid_configuration() {
+        run_with_env(
+            &[
+                ("STELLAR_NETWORK", Some("public")),
+                (
+                    "WEBHOOK_SECRET",
+                    Some("a-very-long-and-secure-webhook-signing-secret-32-chars"),
+                ),
+                ("DATABASE_URL", Some("sqlite::memory:")),
+                (
+                    "STELLAR_GATEWAY_PUBLIC",
+                    Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"),
+                ),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.network, "public");
+                assert_eq!(
+                    cfg.webhook_secret,
+                    "a-very-long-and-secure-webhook-signing-secret-32-chars"
+                );
+            },
+        );
     }
 }
