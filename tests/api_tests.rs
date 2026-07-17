@@ -25,15 +25,19 @@ fn make_config() -> Config {
         webhook_retry_delay_ms: 0,
         poll_interval_secs: 10,
         payment_ttl_secs: 3600,
-        // High enough that these tests never trip the limiter; dedicated
-        // rate-limit coverage lives in tests/rate_limit_tests.rs.
+        /* High enough that these tests never trip the limiter; dedicated
+        rate-limit coverage lives in tests/rate_limit_tests.rs. */
         rate_limit_requests_per_sec: 1000,
         db_pool_max_connections: 10,
         db_busy_timeout_ms: 5000,
         cors_allowed_origins: vec![],
         listener_mode: ListenerMode::Poll,
+        admin_provisioning_secret: TEST_ADMIN_SECRET.into(),
     }
 }
+
+/// Shared admin secret used by tests to provision merchants.
+const TEST_ADMIN_SECRET: &str = "test-admin-secret";
 
 async fn test_server_with_pool() -> (TestServer, db::Db) {
     server_with_config(make_config()).await
@@ -66,9 +70,41 @@ async fn test_server() -> TestServer {
 
 /// Provision a merchant via POST /merchants and return the API key.
 async fn provision_merchant(server: &TestServer) -> String {
-    let res = server.post("/merchants").await;
+    let res = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
     res.assert_status(StatusCode::CREATED);
     res.json::<Value>()["api_key"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn test_provision_merchant_without_admin_secret_is_rejected() {
+    let server = test_server().await;
+    let res = server.post("/merchants").await;
+    res.assert_status(StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_provision_merchant_with_wrong_admin_secret_is_rejected() {
+    let server = test_server().await;
+    let res = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", "not-the-right-secret")
+        .await;
+    res.assert_status(StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_provision_merchant_disabled_when_secret_unconfigured() {
+    let mut cfg = make_config();
+    cfg.admin_provisioning_secret = String::new();
+    let (server, _pool) = server_with_config(cfg).await;
+    let res = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", "")
+        .await;
+    res.assert_status(StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

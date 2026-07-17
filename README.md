@@ -77,9 +77,10 @@ cp .env.example .env
 | `WEBHOOK_RETRY_ATTEMPTS` | Webhook delivery attempts | `3` |
 | `WEBHOOK_RETRY_DELAY_MS` | Delay between webhook retries | `5000` |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated allowed CORS origins (e.g. `https://app.example.com`). Required on `public` network; omitting on testnet falls back to permissive with a warning. | _(unset — permissive on testnet)_ |
-| `RATE_LIMIT_REQUESTS_PER_SEC` | Rate limit for `POST /payments` (requests per second per IP) | `10` |
+| `RATE_LIMIT_REQUESTS_PER_SEC` | Rate limit for `POST /payments` and `POST /merchants` (requests per second per IP, tracked independently per route) | `10` |
 | `DB_POOL_MAX_CONNECTIONS` | SQLite connection pool size. WAL mode allows one writer + many concurrent readers. | `10` |
 | `DB_BUSY_TIMEOUT_MS` | How long (ms) SQLite waits to acquire a write lock before returning an error. Must be `> 0` under concurrent load. | `5000` |
+| `ADMIN_PROVISIONING_SECRET` | Shared secret required via the `X-Admin-Secret` header to call `POST /merchants`. Unset disables provisioning entirely (every request gets `401`). | _(unset — provisioning disabled)_ |
 
 > `DATABASE_URL` is a sqlx connection string (`sqlite:stellargate.db`), not a
 > file path. The Horizon poller stays idle until `STELLAR_GATEWAY_PUBLIC` is set.
@@ -128,6 +129,36 @@ Tests cover amount/stroops handling, Horizon payment verification, webhook
 signing, and the HTTP API (create, fetch, list/filter, validation).
 
 ## API Reference
+
+### `POST /merchants`
+
+Provision a new merchant and return its API key. This is an **admin-only**
+route: set `ADMIN_PROVISIONING_SECRET` and send it via the `X-Admin-Secret`
+header, or the endpoint always returns `401`. There is no self-service
+sign-up — provisioning is intended to be run by whoever operates the gateway
+(e.g. an internal admin tool or a one-off `curl` from a trusted machine), not
+exposed to end users.
+
+**Request**
+
+```bash
+curl -X POST http://localhost:3000/merchants \
+  -H "X-Admin-Secret: $ADMIN_PROVISIONING_SECRET"
+```
+
+**Response** `201 Created`
+```json
+{
+  "merchant_id": "a1b2c3d4-...",
+  "api_key": "e5f6...-...-..."
+}
+```
+
+> `api_key` is returned once, in plaintext, and never shown again — store it
+> securely. Use it as the `Authorization: Bearer <api_key>` header on
+> `POST /payments` and `GET /payments`.
+
+---
 
 ### `POST /payments`
 
