@@ -591,6 +591,7 @@ async fn test_redeliver_rejects_ssrf_target_even_for_a_stored_delivery() {
         &id,
         "http://127.0.0.1:9/hook",
         r#"{"event":"payment.completed"}"#,
+        "payment.completed",
     )
     .await
     .unwrap();
@@ -816,6 +817,7 @@ async fn test_list_webhooks_rejects_other_merchants_payment() {
         &id,
         "https://example.com/webhook",
         r#"{"event":"payment.completed"}"#,
+        "payment.completed",
     )
     .await
     .unwrap();
@@ -896,6 +898,7 @@ async fn test_redeliver_rejects_other_merchants_payment() {
         &id,
         "https://example.com/webhook",
         r#"{"event":"payment.completed"}"#,
+        "payment.completed",
     )
     .await
     .unwrap();
@@ -907,6 +910,115 @@ async fn test_redeliver_rejects_other_merchants_payment() {
         .await;
     res.assert_status(StatusCode::NOT_FOUND);
     assert_eq!(res.json::<Value>()["code"], "payment_not_found");
+}
+
+/// A redelivered webhook must carry the event the payload actually describes.
+/// Hard-coding `payment.completed` here would tell a receiver that routes on
+/// `X-StellarGate-Event` the opposite of what the body says.
+#[tokio::test]
+async fn test_redeliver_echoes_the_original_event_type() {
+    let mock = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/hook"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    // The mock listens on loopback, which the SSRF guard blocks by default.
+    let mut cfg = make_config();
+    cfg.webhook_allow_private_targets = true;
+    let (server, pool) = server_with_config(cfg).await;
+    let key = provision_merchant(&server).await;
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "5", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    stellargate::db::save_webhook_delivery(
+        &pool,
+        "delivery-underpaid",
+        &id,
+        &format!("{}/hook", mock.uri()),
+        r#"{"event":"payment.underpaid","status":"underpaid"}"#,
+        "payment.underpaid",
+    )
+    .await
+    .unwrap();
+
+    let res = server
+        .post(&format!(
+            "/payments/{id}/webhooks/delivery-underpaid/redeliver"
+        ))
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    res.assert_status_ok();
+
+    let received = mock.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(
+        received[0].headers.get("X-StellarGate-Event").unwrap(),
+        "payment.underpaid",
+        "redelivered header must match the event the payload carries"
+    );
+}
+
+/// Deliveries written before `event_type` existed have a NULL column, so the
+/// event has to come from the stored payload rather than a hard-coded default.
+#[tokio::test]
+async fn test_redeliver_falls_back_to_payload_event_for_legacy_rows() {
+    let mock = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/hook"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let mut cfg = make_config();
+    cfg.webhook_allow_private_targets = true;
+    let (server, pool) = server_with_config(cfg).await;
+    let key = provision_merchant(&server).await;
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "5", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Insert directly, leaving event_type NULL the way a pre-migration row is.
+    sqlx::query(
+        "INSERT INTO webhook_deliveries (id, payment_id, url, payload) VALUES (?, ?, ?, ?)",
+    )
+    .bind("delivery-legacy")
+    .bind(&id)
+    .bind(format!("{}/hook", mock.uri()))
+    .bind(r#"{"event":"payment.overpaid","status":"completed"}"#)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let res = server
+        .post(&format!(
+            "/payments/{id}/webhooks/delivery-legacy/redeliver"
+        ))
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    res.assert_status_ok();
+
+    let received = mock.received_requests().await.unwrap();
+    assert_eq!(
+        received[0].headers.get("X-StellarGate-Event").unwrap(),
+        "payment.overpaid"
+    );
 }
 
 #[tokio::test]
@@ -943,6 +1055,7 @@ async fn test_webhook_delivery_isolation() {
         &id1,
         "https://example.com/webhook",
         r#"{"event":"payment.completed"}"#,
+        "payment.completed",
     )
     .await
     .unwrap();

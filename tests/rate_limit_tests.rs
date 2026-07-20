@@ -121,6 +121,7 @@ async fn test_redeliver_rate_limit_exceeded_returns_429() {
         &id,
         "http://127.0.0.1:1/hook",
         r#"{"event":"payment.completed"}"#,
+        "payment.completed",
     )
     .await
     .unwrap();

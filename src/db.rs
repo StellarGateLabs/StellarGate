@@ -87,6 +87,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             payment_id TEXT NOT NULL,
             url TEXT NOT NULL,
             payload TEXT NOT NULL,
+            event_type TEXT,
             status TEXT NOT NULL DEFAULT 'pending',
             attempts INTEGER NOT NULL DEFAULT 0,
             last_attempt TEXT,
@@ -95,6 +96,22 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     )
     .execute(pool)
     .await?;
+
+    /* Bring pre-existing delivery tables up to schema. `event_type` records
+    which event the payload represents so a redelivery can echo the original
+    `X-StellarGate-Event` header instead of guessing. Rows written before this
+    column existed stay NULL; readers fall back to the `event` field inside the
+    stored payload. */
+    let has_event_type: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'event_type'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_event_type == 0 {
+        sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN event_type TEXT")
+            .execute(pool)
+            .await?;
+    }
 
     /* Durable key/value state — used by the Horizon poller to persist its
     paging cursor so it resumes exactly where it left off across restarts. */
@@ -537,20 +554,25 @@ pub async fn memo_exists(pool: &Db, memo: &str) -> Result<bool> {
     Ok(count > 0)
 }
 
+/// Record an outbound webhook delivery. `event_type` is the event name the
+/// payload carries (e.g. `payment.underpaid`); it is persisted so a later
+/// redelivery can reproduce the original `X-StellarGate-Event` header.
 pub async fn save_webhook_delivery(
     pool: &Db,
     id: &str,
     payment_id: &str,
     url: &str,
     payload: &str,
+    event_type: &str,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO webhook_deliveries (id, payment_id, url, payload) VALUES (?, ?, ?, ?)",
+        "INSERT INTO webhook_deliveries (id, payment_id, url, payload, event_type) VALUES (?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(payment_id)
     .bind(url)
     .bind(payload)
+    .bind(event_type)
     .execute(pool)
     .await?;
     Ok(())
@@ -579,10 +601,34 @@ pub struct WebhookDelivery {
     pub payment_id: String,
     pub url: String,
     pub payload: String,
+    /// The event this payload represents. `None` only for rows written before
+    /// the column existed — use [`WebhookDelivery::event`] to read it.
+    pub event_type: Option<String>,
     pub status: String,
     pub attempts: i64,
     pub last_attempt: Option<String>,
     pub created_at: String,
+}
+
+/// Event name used when a legacy row has no `event_type` and its payload can't
+/// be parsed. Every payload this gateway has ever written carries an `event`
+/// field, so this is a last resort rather than an expected path.
+const FALLBACK_EVENT: &str = "payment.completed";
+
+impl WebhookDelivery {
+    /// The event name to report for this delivery, falling back to the `event`
+    /// field of the stored payload for rows written before `event_type`
+    /// existed. Used to reproduce the original `X-StellarGate-Event` header on
+    /// redelivery so the header can never contradict the body.
+    pub fn event(&self) -> String {
+        if let Some(event) = &self.event_type {
+            return event.clone();
+        }
+        serde_json::from_str::<serde_json::Value>(&self.payload)
+            .ok()
+            .and_then(|v| v.get("event")?.as_str().map(str::to_string))
+            .unwrap_or_else(|| FALLBACK_EVENT.to_string())
+    }
 }
 
 fn row_to_webhook_delivery(row: &sqlx::sqlite::SqliteRow) -> WebhookDelivery {
@@ -591,6 +637,7 @@ fn row_to_webhook_delivery(row: &sqlx::sqlite::SqliteRow) -> WebhookDelivery {
         payment_id: row.get("payment_id"),
         url: row.get("url"),
         payload: row.get("payload"),
+        event_type: row.get("event_type"),
         status: row.get("status"),
         attempts: row.get("attempts"),
         last_attempt: row.get("last_attempt"),
@@ -601,7 +648,7 @@ fn row_to_webhook_delivery(row: &sqlx::sqlite::SqliteRow) -> WebhookDelivery {
 /// Get all webhook deliveries for a payment, ordered by created_at descending.
 pub async fn list_webhook_deliveries(pool: &Db, payment_id: &str) -> Result<Vec<WebhookDelivery>> {
     let rows = sqlx::query(
-        "SELECT id, payment_id, url, payload, status, attempts, last_attempt, created_at
+        "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
          FROM webhook_deliveries WHERE payment_id = ? ORDER BY created_at DESC",
     )
     .bind(payment_id)
@@ -614,7 +661,7 @@ pub async fn list_webhook_deliveries(pool: &Db, payment_id: &str) -> Result<Vec<
 /// Get a specific webhook delivery by id.
 pub async fn get_webhook_delivery(pool: &Db, id: &str) -> Result<Option<WebhookDelivery>> {
     let row = sqlx::query(
-        "SELECT id, payment_id, url, payload, status, attempts, last_attempt, created_at
+        "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
          FROM webhook_deliveries WHERE id = ?",
     )
     .bind(id)

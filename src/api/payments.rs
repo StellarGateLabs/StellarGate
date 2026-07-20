@@ -399,6 +399,7 @@ pub async fn list_webhooks(
         "deliveries": deliveries.iter().map(|d| json!({
             "id": d.id,
             "url": d.url,
+            "event": d.event(),
             "status": d.status,
             "attempts": d.attempts,
             "last_attempt": d.last_attempt,
@@ -458,17 +459,21 @@ pub async fn redeliver_webhook(
         })?;
 
     /* Re-send the original payload, re-signed with a fresh timestamp so the
-    receiver's replay-tolerance window is measured from this redelivery. */
+    receiver's replay-tolerance window is measured from this redelivery. The
+    event header comes from the stored delivery rather than being hard-coded:
+    a receiver that routes on `X-StellarGate-Event` must see the same event the
+    body carries, whether that was completed, overpaid, underpaid, or expired. */
     let payload_bytes = delivery.payload.as_bytes();
     let timestamp = crate::webhook::current_timestamp();
     let signature = crate::webhook::sign(&state.config.webhook_secret, timestamp, payload_bytes);
+    let event = delivery.event();
 
     let result = client
         .post(&delivery.url)
         .header("Content-Type", "application/json")
         .header("X-StellarGate-Signature", &signature)
         .header("X-StellarGate-Timestamp", timestamp.to_string())
-        .header("X-StellarGate-Event", "payment.completed")
+        .header("X-StellarGate-Event", &event)
         .body(delivery.payload.clone())
         .send()
         .await;

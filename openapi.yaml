@@ -290,7 +290,7 @@ components:
 
     WebhookDelivery:
       type: object
-      required: [id, url, status, attempts, created_at]
+      required: [id, url, event, status, attempts, created_at]
       properties:
         id:
           type: string
@@ -298,6 +298,12 @@ components:
         url:
           type: string
           format: uri
+        event:
+          type: string
+          description: >-
+            The event this delivery carries. Redelivery reuses it as the
+            X-StellarGate-Event header, so it always matches the payload.
+          example: payment.underpaid
         status:
           type: string
           enum: [pending, delivered, failed]

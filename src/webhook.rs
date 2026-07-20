@@ -99,6 +99,7 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
         &payment.id,
         &url,
         &String::from_utf8_lossy(&body),
+        event,
     )
     .await
     {
