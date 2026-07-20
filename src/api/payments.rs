@@ -127,10 +127,21 @@ pub async fn create(
         ));
     }
     if let Some(url) = &body.webhook_url {
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
+        let parsed_url = reqwest::Url::parse(url).map_err(|_| {
+            AppError::bad_request("invalid_webhook_url", "webhook_url is not a valid URL")
+        })?;
+
+        if state.config.network == "public" {
+            if parsed_url.scheme() != "https" {
+                return Err(AppError::bad_request(
+                    "invalid_webhook_url",
+                    "webhook_url must be an HTTPS URL on public network",
+                ));
+            }
+        } else if parsed_url.scheme() != "https" && parsed_url.scheme() != "http" {
             return Err(AppError::bad_request(
                 "invalid_webhook_url",
-                "webhook_url must be an http(s) URL",
+                "webhook_url must be an HTTP or HTTPS URL",
             ));
         }
     }

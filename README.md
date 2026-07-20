@@ -148,7 +148,7 @@ Create a new payment intent.
 | `amount` | string | ✅ | Any positive number |
 | `asset` | string | ✅ | `XLM` or `USDC` |
 | `merchant_id` | string | ❌ | Any string |
-| `webhook_url` | string | ❌ | Valid HTTPS URL |
+| `webhook_url` | string | ❌ | Valid HTTPS URL (HTTP permitted only in testnet/development) |
 
 **Headers**
 

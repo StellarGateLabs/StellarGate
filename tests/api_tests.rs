@@ -410,13 +410,89 @@ async fn test_asset_is_case_insensitive() {
 }
 
 #[tokio::test]
-async fn test_reject_bad_webhook_url() {
+async fn test_webhook_url_https_accepted_on_testnet() {
     let server = test_server().await;
     let key = provision_merchant(&server).await;
     let res = server
         .post("/payments")
         .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({ "amount": "1", "asset": "XLM", "webhook_url": "ftp://x" }))
+        .json(
+            &json!({ "amount": "1", "asset": "XLM", "webhook_url": "https://example.com/webhook" }),
+        )
+        .await;
+    res.assert_status(StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn test_webhook_url_http_accepted_on_testnet() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(
+            &json!({ "amount": "1", "asset": "XLM", "webhook_url": "http://example.com/webhook" }),
+        )
+        .await;
+    res.assert_status(StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn test_webhook_url_http_rejected_on_public_network() {
+    let mut cfg = make_config();
+    cfg.network = "public".into();
+    let (server, _db) = server_with_config(cfg).await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(
+            &json!({ "amount": "1", "asset": "XLM", "webhook_url": "http://example.com/webhook" }),
+        )
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    let body: Value = res.json();
+    assert_eq!(body["code"], "invalid_webhook_url");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("must be an HTTPS URL on public network"));
+}
+
+#[tokio::test]
+async fn test_webhook_url_https_accepted_on_public_network() {
+    let mut cfg = make_config();
+    cfg.network = "public".into();
+    let (server, _db) = server_with_config(cfg).await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(
+            &json!({ "amount": "1", "asset": "XLM", "webhook_url": "https://example.com/webhook" }),
+        )
+        .await;
+    res.assert_status(StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn test_webhook_url_invalid_rejected() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+
+    // ftp scheme
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "1", "asset": "XLM", "webhook_url": "ftp://example.com" }))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+
+    // malformed string
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "1", "asset": "XLM", "webhook_url": "not-a-url" }))
         .await;
     res.assert_status(StatusCode::BAD_REQUEST);
 }
