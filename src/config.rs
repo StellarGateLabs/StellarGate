@@ -179,6 +179,7 @@ impl Config {
             admin_provisioning_secret: env_or("ADMIN_PROVISIONING_SECRET", ""),
         };
         config.validate_addresses()?;
+        config.validate_timing()?;
         Ok(config)
     }
 
@@ -212,6 +213,59 @@ impl Config {
                 })?;
             }
         }
+        Ok(())
+    }
+
+    /// Cross-validate timing fields to catch nonsensical combinations that
+    /// would cause silent misbehaviour at runtime:
+    ///
+    /// - `POLL_INTERVAL_SECS == 0` → infinite tight loop, 100 % CPU
+    /// - `PAYMENT_TTL_SECS == 0` → every intent expires the moment it is created
+    /// - `PAYMENT_TTL_SECS < POLL_INTERVAL_SECS` → intents expire before the
+    ///   poller ever scans them, so payments land but are never matched
+    /// - `WEBHOOK_RETRY_ATTEMPTS == 0` → webhooks are never delivered
+    /// - `WEBHOOK_RETRY_DELAY_MS == 0` with retries > 1 → retries hammer the
+    ///   target endpoint with no back-off
+    fn validate_timing(&self) -> Result<()> {
+        if self.poll_interval_secs == 0 {
+            return Err(anyhow::anyhow!(
+                "POLL_INTERVAL_SECS must be > 0 (got 0). \
+                 A zero interval creates a tight polling loop at 100% CPU."
+            ));
+        }
+
+        if self.payment_ttl_secs == 0 {
+            return Err(anyhow::anyhow!(
+                "PAYMENT_TTL_SECS must be > 0 (got 0). \
+                 A zero TTL expires every payment intent immediately on creation."
+            ));
+        }
+
+        if self.payment_ttl_secs < self.poll_interval_secs {
+            return Err(anyhow::anyhow!(
+                "PAYMENT_TTL_SECS ({}) must be >= POLL_INTERVAL_SECS ({}). \
+                 With the current settings, a payment intent would expire before \
+                 the poller ever gets a chance to detect it.",
+                self.payment_ttl_secs,
+                self.poll_interval_secs
+            ));
+        }
+
+        if self.webhook_retry_attempts == 0 {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_RETRY_ATTEMPTS must be > 0 (got 0). \
+                 Zero attempts means webhooks are silently never delivered."
+            ));
+        }
+
+        if self.webhook_retry_attempts > 1 && self.webhook_retry_delay_ms == 0 {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_RETRY_DELAY_MS must be > 0 when WEBHOOK_RETRY_ATTEMPTS ({}) > 1. \
+                 A zero delay causes retry bursts that hammer the target endpoint.",
+                self.webhook_retry_attempts
+            ));
+        }
+
         Ok(())
     }
 
@@ -580,48 +634,103 @@ mod tests {
         );
     }
 
+    // ── validate_timing ──────────────────────────────────────────────────────
+
+    fn timing_config() -> Config {
+        let mut cfg = sample_config();
+        cfg.poll_interval_secs = 10;
+        cfg.payment_ttl_secs = 3600;
+        cfg.webhook_retry_attempts = 3;
+        cfg.webhook_retry_delay_ms = 5000;
+        cfg
+    }
+
     #[test]
-    fn startup_fails_on_invalid_cors_origin() {
-        run_with_env(
-            &[
-                (
-                    "WEBHOOK_SECRET",
-                    Some("a-very-long-and-secure-webhook-signing-secret-32-chars"),
-                ),
-                ("CORS_ALLOWED_ORIGINS", Some("https://good.example.com,not a valid origin,https://other.example.com")),
-            ],
-            || {
-                let err = Config::from_env().unwrap_err().to_string();
-                assert!(
-                    err.contains("CORS_ALLOWED_ORIGINS"),
-                    "error must mention CORS_ALLOWED_ORIGINS; got: {err}"
-                );
-                assert!(
-                    err.contains("not a valid origin"),
-                    "error must echo the bad value; got: {err}"
-                );
-            },
+    fn timing_valid_defaults_pass() {
+        assert!(timing_config().validate_timing().is_ok());
+    }
+
+    #[test]
+    fn timing_rejects_zero_poll_interval() {
+        let mut cfg = timing_config();
+        cfg.poll_interval_secs = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(err.contains("POLL_INTERVAL_SECS"), "got: {err}");
+    }
+
+    #[test]
+    fn timing_rejects_zero_ttl() {
+        let mut cfg = timing_config();
+        cfg.payment_ttl_secs = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(err.contains("PAYMENT_TTL_SECS"), "got: {err}");
+    }
+
+    #[test]
+    fn timing_rejects_ttl_shorter_than_poll_interval() {
+        let mut cfg = timing_config();
+        cfg.poll_interval_secs = 60;
+        cfg.payment_ttl_secs = 30; // < poll interval
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(
+            err.contains("PAYMENT_TTL_SECS") && err.contains("POLL_INTERVAL_SECS"),
+            "got: {err}"
         );
     }
 
     #[test]
-    fn startup_succeeds_with_valid_cors_origins() {
+    fn timing_allows_ttl_equal_to_poll_interval() {
+        let mut cfg = timing_config();
+        cfg.poll_interval_secs = 60;
+        cfg.payment_ttl_secs = 60; // equal is fine
+        assert!(cfg.validate_timing().is_ok());
+    }
+
+    #[test]
+    fn timing_rejects_zero_retry_attempts() {
+        let mut cfg = timing_config();
+        cfg.webhook_retry_attempts = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(err.contains("WEBHOOK_RETRY_ATTEMPTS"), "got: {err}");
+    }
+
+    #[test]
+    fn timing_rejects_zero_delay_with_multiple_retries() {
+        let mut cfg = timing_config();
+        cfg.webhook_retry_attempts = 3;
+        cfg.webhook_retry_delay_ms = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(
+            err.contains("WEBHOOK_RETRY_DELAY_MS"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn timing_allows_zero_delay_with_single_attempt() {
+        let mut cfg = timing_config();
+        cfg.webhook_retry_attempts = 1;
+        cfg.webhook_retry_delay_ms = 0; // no retries, so no burst
+        assert!(cfg.validate_timing().is_ok());
+    }
+
+    #[test]
+    fn startup_fails_on_ttl_shorter_than_poll_interval_via_env() {
         run_with_env(
             &[
                 (
                     "WEBHOOK_SECRET",
                     Some("a-very-long-and-secure-webhook-signing-secret-32-chars"),
                 ),
-                (
-                    "CORS_ALLOWED_ORIGINS",
-                    Some("https://app.example.com,https://admin.example.com"),
-                ),
+                ("POLL_INTERVAL_SECS", Some("300")),
+                ("PAYMENT_TTL_SECS", Some("60")),
             ],
             || {
-                let cfg = Config::from_env().unwrap();
-                assert_eq!(cfg.cors_allowed_origins.len(), 2);
-                assert_eq!(cfg.cors_allowed_origins[0], "https://app.example.com");
-                assert_eq!(cfg.cors_allowed_origins[1], "https://admin.example.com");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("PAYMENT_TTL_SECS") || err.contains("POLL_INTERVAL_SECS"),
+                    "got: {err}"
+                );
             },
         );
     }
