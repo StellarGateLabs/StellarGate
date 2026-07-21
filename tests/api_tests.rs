@@ -23,6 +23,7 @@ fn make_config() -> Config {
         webhook_secret: String::new(),
         webhook_retry_attempts: 1,
         webhook_retry_delay_ms: 0,
+        webhook_timeout_secs: 10,
         poll_interval_secs: 10,
         payment_ttl_secs: 3600,
         /* High enough that these tests never trip the limiter; dedicated
@@ -59,6 +60,7 @@ async fn server_with_config(cfg: Config) -> (TestServer, db::Db) {
         pool: pool.clone(),
         config: cfg,
         http,
+        webhook_http: reqwest::Client::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
     let server = TestServer::new(router).unwrap();

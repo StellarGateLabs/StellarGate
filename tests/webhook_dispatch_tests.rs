@@ -27,6 +27,7 @@ fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
         webhook_secret: webhook_secret.into(),
         webhook_retry_attempts: retry_attempts,
         webhook_retry_delay_ms: 0,
+        webhook_timeout_secs: 10,
         poll_interval_secs: 10,
         payment_ttl_secs: 3600,
         cors_allowed_origins: vec![],
@@ -55,6 +56,7 @@ async fn setup_state(cfg: Config) -> AppState {
         pool,
         config: cfg,
         http: reqwest::Client::new(),
+        webhook_http: reqwest::Client::new(),
     }
 }
 

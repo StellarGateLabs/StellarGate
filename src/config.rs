@@ -84,6 +84,12 @@ pub struct Config {
     pub webhook_secret: String,
     pub webhook_retry_attempts: u32,
     pub webhook_retry_delay_ms: u64,
+    /// Per-attempt timeout for outbound webhook POSTs, in seconds. Each
+    /// delivery attempt is bounded independently, so a slow receiver can't
+    /// hold up the retry loop (or the reconciler) for more than this value.
+    /// Defaults to 10 seconds — short enough to keep retries responsive while
+    /// giving receivers a fair window to process the request.
+    pub webhook_timeout_secs: u64,
     pub poll_interval_secs: u64,
     /// How long a payment intent stays `pending` before the expiry sweeper
     /// transitions it to `expired`. Counted from the intent's `created_at`.
@@ -316,6 +322,7 @@ impl std::fmt::Debug for Config {
             .field("webhook_secret", &"***")
             .field("webhook_retry_attempts", &self.webhook_retry_attempts)
             .field("webhook_retry_delay_ms", &self.webhook_retry_delay_ms)
+            .field("webhook_timeout_secs", &self.webhook_timeout_secs)
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("payment_ttl_secs", &self.payment_ttl_secs)
             .field(
@@ -379,6 +386,7 @@ mod tests {
             webhook_secret: "webhook-hmac-secret".into(),
             webhook_retry_attempts: 3,
             webhook_retry_delay_ms: 5000,
+            webhook_timeout_secs: 10,
             poll_interval_secs: 10,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 10,
@@ -447,6 +455,7 @@ mod tests {
             webhook_secret: String::new(),
             webhook_retry_attempts: 3,
             webhook_retry_delay_ms: 5000,
+            webhook_timeout_secs: 10,
             poll_interval_secs: 10,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 10,

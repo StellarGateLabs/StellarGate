@@ -39,10 +39,20 @@ async fn main() -> Result<()> {
         .user_agent(concat!("StellarGate/", env!("CARGO_PKG_VERSION")))
         .build()?;
 
+    // Dedicated client for outbound webhook POSTs. A shorter, independent
+    // timeout prevents a slow receiver from blocking the reconciler for the
+    // full 30 s shared-client window (which — with retries — becomes
+    // attempts × 30 s of settlement-blocking latency).
+    let webhook_http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(cfg.webhook_timeout_secs))
+        .user_agent(concat!("StellarGate/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+
     let state = Arc::new(AppState {
         pool,
         config: cfg.clone(),
         http,
+        webhook_http,
     });
 
     // Broadcast shutdown to all background tasks.

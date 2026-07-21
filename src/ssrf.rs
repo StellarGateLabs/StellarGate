@@ -66,9 +66,13 @@ pub async fn validate(url: &str, allow_private: bool) -> Result<SafeTarget> {
 /// Build a client that connects to `target.addr` for `target.host` regardless
 /// of what a later DNS lookup for that host would return, so the connection
 /// actually made is the one already validated by `validate`.
-pub fn pinned_client(target: &SafeTarget) -> reqwest::Result<reqwest::Client> {
+///
+/// `timeout` is applied per-attempt. Pass `Duration::from_secs(10)` (the
+/// default `WEBHOOK_TIMEOUT_SECS`) for webhook delivery; use a longer value
+/// for the Horizon general client if needed.
+pub fn pinned_client(target: &SafeTarget, timeout: Duration) -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(timeout)
         .user_agent(concat!("StellarGate/", env!("CARGO_PKG_VERSION")))
         .resolve(&target.host, target.addr)
         .build()
