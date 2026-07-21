@@ -33,23 +33,14 @@ allow = [
     "Apache-2.0 WITH LLVM-exception", # compiler-builtins and related LLVM crates
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "ISC",                             # used by some cryptography crates (ring deps)
     "Unicode-DFS-2016",                # unicode-ident, icu_* and related crates
     "Unicode-3.0",                     # newer unicode-ident / icu_* releases
-    "CC0-1.0",                         # public-domain data crates
     "Zlib",                            # miniz_oxide and compression crates
     "OpenSSL",                         # openssl-sys transitive dep via native-tls
 ]
 
 # Crates that either bundle their own license text or use a non-SPDX
 # expression that cargo-deny cannot auto-classify. Add with justification.
-#
-# ring uses a BoringSSL-derived license not expressible in SPDX; if it is
-# pulled in transitively (e.g. via rustls), it is acceptable for a payments
-# service. See https://github.com/briansmith/ring/blob/main/LICENSE
-[[licenses.exceptions]]
-allow = ["LicenseRef-ring"]
-name = "ring"
 
 # ── Bans ──────────────────────────────────────────────────────────────────────
 [bans]

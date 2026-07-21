@@ -76,6 +76,7 @@ cp .env.example .env
 | `WEBHOOK_SECRET` | HMAC signing secret for webhooks | — |
 | `WEBHOOK_RETRY_ATTEMPTS` | Webhook delivery attempts | `3` |
 | `WEBHOOK_RETRY_DELAY_MS` | Delay between webhook retries | `5000` |
+| `WEBHOOK_TIMEOUT_SECS` | Per-attempt timeout (seconds) for outbound webhook POSTs. Each retry is bounded independently; a slow receiver cannot block the reconciler for longer than this value × retries. | `10` |
 | `WEBHOOK_ALLOW_PRIVATE_TARGETS` | Bypasses the SSRF guard's loopback/link-local/private/reserved IP check on `webhook_url` (still requires http(s) and a resolvable host). For local development and tests only — never enable in production. | `false` |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated allowed CORS origins (e.g. `https://app.example.com`). Required on `public` network; omitting on testnet falls back to permissive with a warning. | _(unset — permissive on testnet)_ |
 | `RATE_LIMIT_REQUESTS_PER_SEC` | Rate limit for `POST /payments` and `POST /merchants` (requests per second per IP, tracked independently per route) | `10` |

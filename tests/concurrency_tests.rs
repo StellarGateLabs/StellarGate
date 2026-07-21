@@ -77,6 +77,7 @@ fn make_state(pool: db::Db, _webhook_url: Option<String>) -> Arc<AppState> {
             webhook_secret: "a-very-long-and-secure-webhook-signing-secret-32-chars".into(),
             webhook_retry_attempts: 1,
             webhook_retry_delay_ms: 0,
+            webhook_timeout_secs: 10,
             poll_interval_secs: 10,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 10000,
@@ -89,6 +90,7 @@ fn make_state(pool: db::Db, _webhook_url: Option<String>) -> Arc<AppState> {
             admin_provisioning_secret: String::new(),
         },
         http: reqwest::Client::new(),
+        webhook_http: reqwest::Client::new(),
     })
 }
 

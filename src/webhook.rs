@@ -159,11 +159,16 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
 }
 
 /// Resolve and SSRF-check `url`, returning a client pinned to the validated
-/// address. Honors `webhook_allow_private_targets` for local dev/tests that
-/// intentionally target a loopback mock server.
+/// address. The client is built with the configured `WEBHOOK_TIMEOUT_SECS`
+/// timeout so that each delivery attempt is independently bounded. Honors
+/// `webhook_allow_private_targets` for local dev/tests that intentionally
+/// target a loopback mock server.
 pub(crate) async fn safe_client(state: &AppState, url: &str) -> anyhow::Result<reqwest::Client> {
     let target = crate::ssrf::validate(url, state.config.webhook_allow_private_targets).await?;
-    Ok(crate::ssrf::pinned_client(&target)?)
+    Ok(crate::ssrf::pinned_client(
+        &target,
+        Duration::from_secs(state.config.webhook_timeout_secs),
+    )?)
 }
 
 #[cfg(test)]

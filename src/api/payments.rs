@@ -187,7 +187,8 @@ pub async fn create(
             .bind(&merchant_id)
             .bind(key)
             .execute(&state.pool)
-            .await?;
+            .await
+            .map_err(anyhow::Error::from)?;
         }
     }
 
