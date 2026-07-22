@@ -25,6 +25,17 @@
 //! (shown in the `delta` field of the `payment.underpaid` event) in one
 //! transaction.
 //!
+//! ## Finality
+//!
+//! A payment only settles an intent when its joined transaction reports
+//! `successful: true`. Matching on type/destination/memo/asset/amount is not
+//! sufficient for money movement — a failed, replaced, or reorg-orphaned
+//! transaction can carry all the right fields yet move no funds. We therefore
+//! require the `successful` flag explicitly (records are always fetched with
+//! `join=transactions`, so it is present) rather than relying on the implicit
+//! and undocumented behaviour that Horizon's payments-for-account endpoint
+//! tends to surface only successful operations.
+//!
 //! The matching logic in [`verify`] is pure and unit-tested; the networked
 //! functions wrap it with I/O.
 
@@ -75,6 +86,12 @@ pub struct TransactionRef {
     pub memo: Option<String>,
     #[serde(default)]
     pub memo_type: Option<String>,
+    /// Whether the enclosing transaction succeeded on-chain. Horizon populates
+    /// this on every transaction record; we treat a missing value as *not*
+    /// known-successful and refuse to settle against it (see
+    /// [`HorizonPayment::is_successful`]).
+    #[serde(default)]
+    pub successful: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,6 +146,20 @@ impl HorizonPayment {
         }
         t.memo.as_deref()
     }
+
+    /// Whether the transaction that carried this payment is known to have
+    /// succeeded on-chain.
+    ///
+    /// Horizon's payments-for-account endpoint generally returns operations
+    /// from successful transactions, but that is an implementation detail we
+    /// must not rely on for money movement: a failed, replaced, or
+    /// reorg-orphaned transaction must never settle an intent. We therefore
+    /// require the joined transaction to explicitly report `successful: true`.
+    /// A missing flag (e.g. a record fetched without `join=transactions`, or a
+    /// future/altered payload) is treated as not-successful and rejected.
+    fn is_successful(&self) -> bool {
+        self.transaction.as_ref().and_then(|t| t.successful) == Some(true)
+    }
 }
 
 /// Decide whether a Horizon payment satisfies a pending intent.
@@ -151,6 +182,14 @@ pub fn verify(
         return None;
     }
     if hp.memo() != Some(payment.memo.as_str()) {
+        return None;
+    }
+    /* Only settle against a transaction Horizon reports as successful. Matching
+    on type/destination/memo/asset/amount is not enough for money movement: a
+    failed or reorg-orphaned transaction can carry all the right fields yet
+    never have moved funds. See [`HorizonPayment::is_successful`] for the
+    finality assumptions this encodes. */
+    if !hp.is_successful() {
         return None;
     }
 
@@ -708,6 +747,7 @@ mod tests {
             transaction: Some(TransactionRef {
                 memo: Some(memo.into()),
                 memo_type: Some("text".into()),
+                successful: Some(true),
             }),
             paging_token: Some("1".into()),
         }
@@ -858,6 +898,7 @@ mod tests {
             transaction: Some(TransactionRef {
                 memo: Some("MEMO1234".into()),
                 memo_type: Some("text".into()),
+                successful: Some(true),
             }),
             paging_token: Some("1".into()),
         };
@@ -881,6 +922,7 @@ mod tests {
             transaction: Some(TransactionRef {
                 memo: Some("MEMO1234".into()),
                 memo_type: Some("text".into()),
+                successful: Some(true),
             }),
             paging_token: Some("1".into()),
         };
@@ -895,6 +937,32 @@ mod tests {
         let p = pending("XLM", "10");
         let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
         hp.kind = "create_account".into();
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+    }
+
+    /// A transaction Horizon reports as `successful: false` must never settle an
+    /// intent, even when type/destination/memo/asset/amount all match.
+    #[test]
+    fn failed_transaction_is_ignored() {
+        let p = pending("XLM", "10");
+        let mut hp = native_payment("10.0000000", "MEMO1234", "GGATEWAY");
+        hp.transaction.as_mut().unwrap().successful = Some(false);
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+        // Sanity: the same record with `successful: true` would have completed.
+        hp.transaction.as_mut().unwrap().successful = Some(true);
+        assert!(matches!(
+            verify(&p, &hp, &test_assets(), 0),
+            Some(Verdict::Completed { .. })
+        ));
+    }
+
+    /// A record whose joined transaction omits the `successful` flag is treated
+    /// as not-known-successful and rejected — we never settle on an absent flag.
+    #[test]
+    fn missing_successful_flag_is_ignored() {
+        let p = pending("XLM", "10");
+        let mut hp = native_payment("10.0000000", "MEMO1234", "GGATEWAY");
+        hp.transaction.as_mut().unwrap().successful = None;
         assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
     }
 
@@ -934,7 +1002,7 @@ mod tests {
             "asset_type": "native",
             "to": "GGATEWAY",
             "transaction_hash": "abc",
-            "transaction": { "memo": "MEMO1234", "memo_type": "text" }
+            "transaction": { "memo": "MEMO1234", "memo_type": "text", "successful": true }
         }"#;
         let hp: HorizonPayment = serde_json::from_str(data).unwrap();
         let p = pending("XLM", "10.00");

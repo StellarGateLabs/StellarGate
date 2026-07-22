@@ -287,6 +287,7 @@ fn make_horizon_payment(tx_hash: &str) -> HorizonPayment {
         transaction: Some(TransactionRef {
             memo: Some("MEMOTEST".into()),
             memo_type: Some("text".into()),
+            successful: Some(true),
         }),
         paging_token: Some("1".into()),
     }
