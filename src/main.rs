@@ -12,7 +12,7 @@ use stellargate::{
     webhook, AppState,
 };
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -41,10 +41,6 @@ async fn main() -> Result<()> {
         .user_agent(concat!("StellarGate/", env!("CARGO_PKG_VERSION")))
         .build()?;
 
-    // Dedicated client for outbound webhook POSTs. A shorter, independent
-    // timeout prevents a slow receiver from blocking the reconciler for the
-    // full 30 s shared-client window (which — with retries — becomes
-    // attempts × 30 s of settlement-blocking latency).
     let webhook_http = reqwest::Client::builder()
         .timeout(Duration::from_secs(cfg.webhook_timeout_secs))
         .user_agent(concat!("StellarGate/", env!("CARGO_PKG_VERSION")))
@@ -58,20 +54,13 @@ async fn main() -> Result<()> {
         webhook_metrics: WebhookMetrics::new(),
     });
 
-    /* Verify the gateway account can actually receive every accepted asset.
-    A missing trustline mints unpayable intents, so surface it loudly at boot
-    rather than letting payments silently bounce on-chain. Best-effort: a
-    Horizon hiccup (or a not-yet-funded account) must not block startup. */
     if cfg.gateway_configured() {
         match horizon::check_trustlines(&state).await {
             Ok(missing) if missing.is_empty() => {
                 info!("gateway trustlines verified for all accepted assets");
             }
             Ok(missing) => {
-                info!(
-                    missing = ?missing,
-                    "startup trustline check found accepted assets with no trustline"
-                );
+                info!(missing = ?missing, "startup trustline check found accepted assets with no trustline");
             }
             Err(e) => {
                 tracing::warn!(error = %e, "could not verify gateway trustlines at startup");
@@ -79,27 +68,60 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Broadcast shutdown to all background tasks.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    /* Detect on-chain payments. In stream mode the SSE listener settles intents
-    in near real time while the poller runs alongside as a reconciler; in
-    poll mode only the interval poller runs. */
+    // Each background task is wrapped so task_started/task_stopped keep the
+    // healthy gauge accurate. Panics are caught at join time and recorded via
+    // task_failed so the failure counter (and its alert) fires.
     let stream_handle = if cfg.listener_mode == ListenerMode::Stream {
-        Some(tokio::spawn(horizon::run_stream_listener(
-            state.clone(),
-            shutdown_rx.clone(),
-        )))
+        let th = state.task_health.clone();
+        th.task_started();
+        let s = state.clone();
+        let rx = shutdown_rx.clone();
+        Some(tokio::spawn(async move {
+            horizon::run_stream_listener(s, rx).await;
+            th.task_stopped();
+        }))
     } else {
         None
     };
-    let poller_handle = tokio::spawn(horizon::run_poller(state.clone(), shutdown_rx.clone()));
-    let sweeper_handle = tokio::spawn(expiry::run_sweeper(state.clone(), shutdown_rx.clone()));
-    let redrive_handle = tokio::spawn(webhook::run_redrive_worker(state.clone(), shutdown_rx));
+
+    let poller_handle = {
+        let th = state.task_health.clone();
+        th.task_started();
+        let s = state.clone();
+        let rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            horizon::run_poller(s, rx).await;
+            th.task_stopped();
+        })
+    };
+    let sweeper_handle = {
+        let th = state.task_health.clone();
+        th.task_started();
+        let s = state.clone();
+        let rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            expiry::run_sweeper(s, rx).await;
+            th.task_stopped();
+        })
+    };
+    let redrive_handle = {
+        let th = state.task_health.clone();
+        th.task_started();
+        let s = state.clone();
+        tokio::spawn(async move {
+            webhook::run_redrive_worker(s, shutdown_rx).await;
+            th.task_stopped();
+        })
+    };
 
     let addr = format!("0.0.0.0:{}", cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("StellarGate API listening on {addr}");
+
+    // Clone before state is moved into the router.
+    let task_health = state.task_health.clone();
 
     axum::serve(
         listener,
@@ -108,15 +130,26 @@ async fn main() -> Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
 
-    // Signal background tasks and wait (bounded) for them to finish.
     let _ = shutdown_tx.send(true);
     let timeout = Duration::from_secs(30);
-    let bg = async {
-        let _ = poller_handle.await;
-        let _ = sweeper_handle.await;
-        let _ = redrive_handle.await;
+    let bg = async move {
+        // A JoinError means the task panicked — record it so the healthy gauge
+        // and failure counter both reflect the crash and can fire an alert.
+        macro_rules! join_task {
+            ($handle:expr) => {
+                if let Err(e) = $handle.await {
+                    if e.is_panic() {
+                        warn!("background task panicked");
+                        task_health.task_failed();
+                    }
+                }
+            };
+        }
+        join_task!(poller_handle);
+        join_task!(sweeper_handle);
+        join_task!(redrive_handle);
         if let Some(h) = stream_handle {
-            let _ = h.await;
+            join_task!(h);
         }
     };
     if tokio::time::timeout(timeout, bg).await.is_err() {
@@ -127,8 +160,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Resolves when the process receives Ctrl-C (or SIGTERM on Unix), letting axum
-/// drain in-flight requests before exiting.
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()

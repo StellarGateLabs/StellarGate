@@ -150,9 +150,6 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
             .header("Content-Type", "application/json")
             .header("X-StellarGate-Signature", &signature)
             .header("X-StellarGate-Timestamp", timestamp.to_string())
-            // Convenience header — mirrors the `event` field already present in
-            // the signed body. NOT covered by the HMAC; receivers must route on
-            // the authenticated body field, not this header.
             .header("X-StellarGate-Event", event)
             .body(body.clone())
             .send()
@@ -172,17 +169,11 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
                 .await;
                 return;
             }
-            Ok(resp) => {
-                warn!(payment_id = %payment.id, status = %resp.status(), attempt, "webhook rejected");
-            }
-            Err(e) => {
-                warn!(payment_id = %payment.id, error = %e, attempt, "webhook request failed");
-            }
+            Ok(resp) => { warn!(payment_id = %payment.id, status = %resp.status(), attempt, "webhook rejected"); }
+            Err(e) => { warn!(payment_id = %payment.id, error = %e, attempt, "webhook request failed"); }
         }
 
-        if attempt < attempts {
-            tokio::time::sleep(delay).await;
-        }
+        if attempt < attempts { tokio::time::sleep(delay).await; }
     }
 
     warn!(payment_id = %payment.id, %url, "webhook delivery exhausted all retries");
@@ -307,9 +298,7 @@ async fn redrive_one(state: &Arc<AppState>, delivery: db::WebhookDelivery) {
                 state.webhook_metrics.record_failed();
                 state.webhook_metrics.record_latency_ms(start.elapsed().as_millis() as u64);
                 "failed"
-            } else {
-                "pending"
-            }
+            } else { "pending" }
         }
         Err(e) => {
             warn!(delivery_id = %delivery.id, error = %e, %attempt, "redrive attempt failed");
@@ -317,9 +306,7 @@ async fn redrive_one(state: &Arc<AppState>, delivery: db::WebhookDelivery) {
                 state.webhook_metrics.record_failed();
                 state.webhook_metrics.record_latency_ms(start.elapsed().as_millis() as u64);
                 "failed"
-            } else {
-                "pending"
-            }
+            } else { "pending" }
         }
     };
 
