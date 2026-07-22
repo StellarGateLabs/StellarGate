@@ -19,11 +19,13 @@
 //! Any subsequent on-chain payment to the same address and memo is silently
 //! ignored — it will not trigger an additional webhook.
 //!
-//! Only a single follow-up (top-up) payment is supported per underpaid intent:
-//! `tx_hash` records the most recent processed transaction. If more than one
-//! partial payment is needed, the user should send the full remaining balance
-//! (shown in the `delta` field of the `payment.underpaid` event) in one
-//! transaction.
+//! Multiple follow-up (top-up) payments are supported per underpaid intent.
+//! Every processed transaction is recorded in the `processed_transactions`
+//! join table, and the cumulative received amount is the SUM over that set, so
+//! re-seeing a transaction (on a later poll cycle, over the stream, or from a
+//! concurrent reconciler) never double-counts and the ledger is independent of
+//! the order records arrive in. The payment row's `tx_hash` still records the
+//! most recent processed transaction for display.
 //!
 //! ## Finality
 //!
@@ -233,15 +235,6 @@ pub fn verify(
     }
 }
 
-/// Compute the absolute difference between two amount strings as a display
-/// string. Returns `None` if either value fails to parse (should never happen
-/// for amounts we wrote ourselves).
-fn delta_str(a: &str, b: &str) -> Option<String> {
-    let va = money::parse_stroops(a)?;
-    let vb = money::parse_stroops(b)?;
-    Some(money::stroops_to_string((va - vb).abs()))
-}
-
 /// Fetch the most recent payments into `account` from Horizon, newest first,
 /// with their transactions joined so memos are available.
 pub async fn fetch_recent_payments(
@@ -374,90 +367,85 @@ pub async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> an
         None => return Ok(false),
     };
 
-    /* Skip transactions already recorded for this intent. This prevents
-    double-counting the original underpayment tx on subsequent poll cycles. */
     let hp_hash = hp.transaction_hash.as_deref().unwrap_or("");
-    if payment.tx_hash.as_deref() == Some(hp_hash) {
-        return Ok(false);
-    }
 
-    // For underpaid intents, carry forward what has already been received.
-    let already_paid_stroops = payment
-        .paid_amount
-        .as_deref()
-        .and_then(money::parse_stroops)
-        .unwrap_or(0);
+    /* The authoritative received-amount ledger is the SUM over every
+    transaction already recorded for this intent — not the single most-recent
+    `tx_hash`. Read it before recording this transaction so `verify` sees the
+    prior total. */
+    let already_paid_stroops = db::sum_processed_stroops(&state.pool, &payment.id).await?;
 
-    match verify(
+    /* Gate on a real, matching, on-chain payment before recording anything, so
+    unrelated traffic never pollutes the ledger. `verify` returns `None` for
+    anything that does not satisfy this intent (wrong type/destination/memo/
+    asset, or an unparseable amount). */
+    if verify(
         &payment,
         hp,
         &state.config.accepted_assets,
         already_paid_stroops,
-    ) {
-        Some(Verdict::Completed {
-            tx_hash,
-            paid_amount,
-        }) => {
-            let did_settle = settle(
-                state,
-                &payment,
-                "completed",
-                &tx_hash,
-                &paid_amount,
-                "payment.completed",
-                None,
-            )
-            .await;
-            Ok(did_settle)
-        }
-        Some(Verdict::Overpaid {
-            tx_hash,
-            paid_amount,
-        }) => {
-            let delta = delta_str(&paid_amount, &payment.amount);
+    )
+    .is_none()
+    {
+        return Ok(false);
+    }
+
+    /* Record this transaction idempotently. If it was already credited — seen
+    on an earlier poll cycle, redelivered over the stream, or racing a
+    concurrent reconciler — the insert is a no-op and we must not settle again.
+    This makes re-processing any past transaction a no-op regardless of the
+    order records arrive in (issue #119). */
+    let new_stroops = hp
+        .amount
+        .as_deref()
+        .and_then(money::parse_stroops)
+        .unwrap_or(0);
+    if !db::record_processed_tx(&state.pool, &payment.id, hp_hash, new_stroops).await? {
+        return Ok(false);
+    }
+
+    /* Re-sum over the recorded set (now including this transaction) so the
+    persisted `paid_amount` always reflects every processed transaction. */
+    let total_stroops = db::sum_processed_stroops(&state.pool, &payment.id).await?;
+    let expected_stroops = money::parse_stroops(&payment.amount).unwrap_or(0);
+    let paid_amount = money::stroops_to_string(total_stroops);
+
+    use std::cmp::Ordering;
+    let (status, event, delta) = match total_stroops.cmp(&expected_stroops) {
+        Ordering::Equal => ("completed", "payment.completed", None),
+        Ordering::Greater => {
+            let excess = money::stroops_to_string(total_stroops - expected_stroops);
             info!(
                 payment_id = %payment.id,
-                excess = %delta.as_deref().unwrap_or("?"),
+                excess = %excess,
                 "overpayment — intent completed, excess should be refunded"
             );
-            let did_settle = settle(
-                state,
-                &payment,
-                "completed",
-                &tx_hash,
-                &paid_amount,
-                "payment.overpaid",
-                delta.as_deref(),
-            )
-            .await;
-            Ok(did_settle)
+            ("completed", "payment.overpaid", Some(excess))
         }
-        Some(Verdict::Underpaid {
-            tx_hash,
-            paid_amount,
-        }) => {
-            let delta = delta_str(&payment.amount, &paid_amount);
+        Ordering::Less => {
+            let remaining = money::stroops_to_string(expected_stroops - total_stroops);
             warn!(
                 payment_id = %payment.id,
                 expected = %payment.amount,
                 paid = %paid_amount,
-                remaining = %delta.as_deref().unwrap_or("?"),
+                remaining = %remaining,
                 "underpayment — intent remains open for a top-up"
             );
-            let did_settle = settle(
-                state,
-                &payment,
-                "underpaid",
-                &tx_hash,
-                &paid_amount,
-                "payment.underpaid",
-                delta.as_deref(),
-            )
-            .await;
-            Ok(did_settle)
+            ("underpaid", "payment.underpaid", Some(remaining))
         }
-        None => Ok(false),
-    }
+    };
+
+    let did_settle = settle(
+        state,
+        &payment,
+        status,
+        hp_hash,
+        &paid_amount,
+        event,
+        delta.as_deref(),
+    )
+    .await;
+    Ok(did_settle)
 }
 
 /// Persist a terminal or intermediate status for `payment` and fire its webhook.

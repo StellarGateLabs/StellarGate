@@ -154,6 +154,52 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .execute(pool)
     .await?;
 
+    /* Every on-chain transaction we credit to an intent, one row per
+    (payment_id, tx_hash). The cumulative received amount for an intent is the
+    SUM of `amount_stroops` over its rows, so re-seeing a transaction (on a
+    later poll cycle, over the stream, or from a concurrent reconciler) is an
+    idempotent no-op instead of a double-credit. `amount_stroops` is the
+    integer stroop value so SUM is exact. */
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS processed_transactions (
+            payment_id TEXT NOT NULL,
+            tx_hash TEXT NOT NULL,
+            amount_stroops INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            PRIMARY KEY (payment_id, tx_hash)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    /* Backfill from legacy rows that recorded only the most-recent `tx_hash`
+    and a cumulative `paid_amount`, so upgrading preserves the received-amount
+    ledger for intents that are still in flight. Idempotent via ON CONFLICT, so
+    it is safe to run on every startup. */
+    let legacy = sqlx::query(
+        "SELECT id, tx_hash, paid_amount FROM payments
+         WHERE tx_hash IS NOT NULL AND tx_hash <> '' AND paid_amount IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    for row in &legacy {
+        let id: String = row.get("id");
+        let tx_hash: String = row.get("tx_hash");
+        let paid_amount: String = row.get("paid_amount");
+        if let Some(stroops) = crate::money::parse_stroops(&paid_amount) {
+            sqlx::query(
+                "INSERT INTO processed_transactions (payment_id, tx_hash, amount_stroops)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(payment_id, tx_hash) DO NOTHING",
+            )
+            .bind(&id)
+            .bind(&tx_hash)
+            .bind(stroops)
+            .execute(pool)
+            .await?;
+        }
+    }
+
     /* Normalise legacy rows that were written by the old datetime('now') default,
     which produced "YYYY-MM-DD HH:MM:SS" (space, no Z). Safe to run on every
     startup — the WHERE clause skips rows that are already RFC 3339. */
@@ -531,6 +577,47 @@ pub async fn update_payment_status(
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
+}
+
+/// Record that transaction `tx_hash`, worth `amount_stroops`, has been credited
+/// to intent `payment_id`. Returns `true` when this is the first time the
+/// transaction was recorded for the intent, and `false` when it was already
+/// present (a re-seen record on a later poll cycle, over the stream, or from a
+/// concurrent reconciler).
+///
+/// The `(payment_id, tx_hash)` primary key plus `ON CONFLICT DO NOTHING` makes
+/// this the atomic dedup point: SQLite serialises writers, so exactly one of
+/// two racing inserts for the same transaction observes `rows_affected() == 1`.
+pub async fn record_processed_tx(
+    pool: &Db,
+    payment_id: &str,
+    tx_hash: &str,
+    amount_stroops: i64,
+) -> Result<bool> {
+    let result = sqlx::query(
+        "INSERT INTO processed_transactions (payment_id, tx_hash, amount_stroops)
+         VALUES (?, ?, ?)
+         ON CONFLICT(payment_id, tx_hash) DO NOTHING",
+    )
+    .bind(payment_id)
+    .bind(tx_hash)
+    .bind(amount_stroops)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Sum of every transaction recorded against `payment_id`, in stroops. This is
+/// the authoritative received-amount ledger for an intent — independent of how
+/// many transactions arrived, or the order they were seen in.
+pub async fn sum_processed_stroops(pool: &Db, payment_id: &str) -> Result<i64> {
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(amount_stroops), 0) FROM processed_transactions WHERE payment_id = ?",
+    )
+    .bind(payment_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(total)
 }
 
 /// Read a value from the durable key/value state table, if present.
@@ -935,6 +1022,70 @@ mod tests {
             ids,
             vec!["eligible"],
             "only the pending row under the attempt cap must be redrivable"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_processed_tx_is_idempotent_and_sums_over_the_set() {
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("p", "MEMOTX", 3600))
+            .await
+            .unwrap();
+
+        // First time a transaction is seen it is recorded and counted.
+        assert!(record_processed_tx(&pool, "p", "TX_A", 40_000_000)
+            .await
+            .unwrap());
+        assert_eq!(sum_processed_stroops(&pool, "p").await.unwrap(), 40_000_000);
+
+        // Re-seeing the same transaction is a no-op — no double credit.
+        assert!(!record_processed_tx(&pool, "p", "TX_A", 40_000_000)
+            .await
+            .unwrap());
+        assert_eq!(sum_processed_stroops(&pool, "p").await.unwrap(), 40_000_000);
+
+        // A distinct transaction adds to the running total.
+        assert!(record_processed_tx(&pool, "p", "TX_B", 30_000_000)
+            .await
+            .unwrap());
+        assert_eq!(sum_processed_stroops(&pool, "p").await.unwrap(), 70_000_000);
+
+        // Re-seeing an *earlier* transaction after a later one is still a no-op,
+        // regardless of order (issue #119).
+        assert!(!record_processed_tx(&pool, "p", "TX_A", 40_000_000)
+            .await
+            .unwrap());
+        assert_eq!(sum_processed_stroops(&pool, "p").await.unwrap(), 70_000_000);
+
+        // Rows are scoped per intent.
+        assert_eq!(sum_processed_stroops(&pool, "other").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn migrate_backfills_processed_transactions_from_legacy_rows() {
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("legacy", "MEMOLEG", 3600))
+            .await
+            .unwrap();
+        // Simulate a pre-#119 underpaid intent: only the latest tx_hash and the
+        // cumulative paid_amount were persisted.
+        update_payment_status(&pool, "legacy", "underpaid", "TX_OLD", "3")
+            .await
+            .unwrap();
+        // The join table is empty until a backfill runs.
+        assert_eq!(sum_processed_stroops(&pool, "legacy").await.unwrap(), 0);
+
+        // A subsequent migrate() (as on the next startup) backfills the ledger.
+        migrate(&pool).await.unwrap();
+        assert_eq!(
+            sum_processed_stroops(&pool, "legacy").await.unwrap(),
+            30_000_000
+        );
+        // And it is idempotent across restarts.
+        migrate(&pool).await.unwrap();
+        assert_eq!(
+            sum_processed_stroops(&pool, "legacy").await.unwrap(),
+            30_000_000
         );
     }
 
