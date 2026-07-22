@@ -111,6 +111,8 @@ mod tests {
             config: cfg,
             http: reqwest::Client::new(),
             webhook_http: reqwest::Client::new(),
+            webhook_metrics: crate::metrics::WebhookMetrics::new(),
+            task_health: crate::metrics::TaskHealth::new(),
         }
     }
 

@@ -54,6 +54,8 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/", get(|| async { "StellarGate API v0.1.0" }))
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/metrics", get(metrics_handler))
+        .route("/deps", get(deps_health))
         /* Merchant provisioning — returns a one-time plaintext API key. Gated
         behind ADMIN_PROVISIONING_SECRET so it can't be used to mint
         unlimited credentials anonymously. */
@@ -313,15 +315,96 @@ async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
 
+/// Readiness probe — returns 200 only when both the database AND Horizon are
+/// reachable. A pod that cannot reach Horizon cannot detect on-chain payments;
+/// routing traffic to it is worse than routing it elsewhere (issue #172).
+///
+/// Uses a 3-second timeout on the Horizon check so a slow node never hangs
+/// the probe. The check is skipped when no gateway is configured
+/// (STELLAR_GATEWAY_PUBLIC=UNCONFIGURED) since without a gateway there is no
+/// on-chain work to do.
 async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match db::ping(&state.pool).await {
-        Ok(()) => (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response(),
-        Err(_) => (
+    // 1. Database must respond.
+    if db::ping(&state.pool).await.is_err() {
+        return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "status": "unavailable" })),
+            Json(json!({ "status": "unavailable", "reason": "database unreachable" })),
         )
-            .into_response(),
+            .into_response();
     }
+
+    // 2. Horizon must respond (only when a gateway wallet is configured).
+    if state.config.gateway_configured() {
+        if let Err(reason) = check_horizon_ready(&state).await {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "status": "unavailable", "reason": reason })),
+            )
+                .into_response();
+        }
+    }
+
+    (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response()
+}
+
+/// Probe Horizon with a hard 3-second timeout.
+/// Returns Ok(()) when reachable (any non-5xx response), or an error string.
+async fn check_horizon_ready(state: &Arc<AppState>) -> Result<(), String> {
+    let url = state.config.horizon_url.trim_end_matches('/').to_string();
+    let result = tokio::time::timeout(
+        Duration::from_millis(3_000),
+        state.http.get(&url).header("Accept", "application/json").send(),
+    )
+    .await;
+    match result {
+        Ok(Ok(resp)) if resp.status().as_u16() < 500 => Ok(()),
+        Ok(Ok(resp)) => Err(format!("Horizon returned {}", resp.status())),
+        Ok(Err(e))   => Err(format!("Horizon unreachable: {e}")),
+        Err(_)       => Err("Horizon health check timed out".to_string()),
+    }
+}
+
+/// `GET /deps` — detailed dependency and task-health breakdown.
+/// Returns 503 when any dependency is unavailable or any task has failed.
+async fn deps_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let db_ok = db::ping(&state.pool).await.is_ok();
+    let horizon_status = if state.config.gateway_configured() {
+        match check_horizon_ready(&state).await {
+            Ok(())  => "ok",
+            Err(_)  => "unavailable",
+        }
+    } else {
+        "unconfigured"
+    };
+    let task_failures = state.task_health.failure_count();
+    let healthy_tasks = state.task_health.healthy_count();
+    let overall_ok = db_ok && horizon_status != "unavailable" && task_failures == 0;
+
+    (
+        if overall_ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE },
+        Json(json!({
+            "status": if overall_ok { "ok" } else { "degraded" },
+            "dependencies": {
+                "database": if db_ok { "ok" } else { "unavailable" },
+                "horizon": horizon_status,
+            },
+            "background_tasks": {
+                "healthy": healthy_tasks,
+                "failures": task_failures,
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /metrics` — Prometheus plain-text metrics snapshot.
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let body = crate::metrics::render(&state.webhook_metrics, &state.task_health);
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"))],
+        body,
+    )
 }
 
 async fn not_found() -> impl IntoResponse {

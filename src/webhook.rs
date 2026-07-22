@@ -25,7 +25,7 @@ use hmac::{Hmac, Mac};
 use serde_json::json;
 use sha2::Sha256;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{watch, Semaphore};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -137,16 +137,16 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
 
     let attempts = state.config.webhook_retry_attempts.max(1);
     let delay = Duration::from_millis(state.config.webhook_retry_delay_ms);
+    let start = Instant::now();
 
     for attempt in 1..=attempts {
+        if attempt > 1 { state.webhook_metrics.record_retry(); }
+
         let result = client
             .post(&url)
             .header("Content-Type", "application/json")
             .header("X-StellarGate-Signature", &signature)
             .header("X-StellarGate-Timestamp", timestamp.to_string())
-            // Convenience header — mirrors the `event` field already present in
-            // the signed body. NOT covered by the HMAC; receivers must route on
-            // the authenticated body field, not this header.
             .header("X-StellarGate-Event", event)
             .body(body.clone())
             .send()
@@ -155,29 +155,20 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
         match result {
             Ok(resp) if resp.status().is_success() => {
                 info!(payment_id = %payment.id, %url, attempt, "webhook delivered");
-                let _ = db::update_webhook_delivery(
-                    &state.pool,
-                    &delivery_id,
-                    "delivered",
-                    attempt as i64,
-                )
-                .await;
+                state.webhook_metrics.record_delivered();
+                state.webhook_metrics.record_latency_ms(start.elapsed().as_millis() as u64);
+                let _ = db::update_webhook_delivery(&state.pool, &delivery_id, "delivered", attempt as i64).await;
                 return;
             }
-            Ok(resp) => {
-                warn!(payment_id = %payment.id, status = %resp.status(), attempt, "webhook rejected");
-            }
-            Err(e) => {
-                warn!(payment_id = %payment.id, error = %e, attempt, "webhook request failed");
-            }
+            Ok(resp) => { warn!(payment_id = %payment.id, status = %resp.status(), attempt, "webhook rejected"); }
+            Err(e)   => { warn!(payment_id = %payment.id, error = %e, attempt, "webhook request failed"); }
         }
-
-        if attempt < attempts {
-            tokio::time::sleep(delay).await;
-        }
+        if attempt < attempts { tokio::time::sleep(delay).await; }
     }
 
     warn!(payment_id = %payment.id, %url, "webhook delivery exhausted all retries");
+    state.webhook_metrics.record_failed();
+    state.webhook_metrics.record_latency_ms(start.elapsed().as_millis() as u64);
     let _ = db::update_webhook_delivery(&state.pool, &delivery_id, "failed", attempts as i64).await;
 }
 
@@ -269,6 +260,8 @@ async fn redrive_one(state: &Arc<AppState>, delivery: db::WebhookDelivery) {
     let body = delivery.payload.as_bytes();
     let timestamp = current_timestamp();
     let signature = sign(&state.config.webhook_secret, timestamp, body);
+    let start = Instant::now();
+    state.webhook_metrics.record_retry();
 
     let result = client
         .post(&delivery.url)
@@ -283,23 +276,25 @@ async fn redrive_one(state: &Arc<AppState>, delivery: db::WebhookDelivery) {
     let outcome = match result {
         Ok(resp) if resp.status().is_success() => {
             info!(delivery_id = %delivery.id, %attempt, "webhook redriven successfully");
+            state.webhook_metrics.record_delivered();
+            state.webhook_metrics.record_latency_ms(start.elapsed().as_millis() as u64);
             "delivered"
         }
         Ok(resp) => {
             warn!(delivery_id = %delivery.id, status = %resp.status(), %attempt, "redrive attempt rejected");
             if attempt >= state.config.webhook_redrive_max_attempts as i64 {
+                state.webhook_metrics.record_failed();
+                state.webhook_metrics.record_latency_ms(start.elapsed().as_millis() as u64);
                 "failed"
-            } else {
-                "pending"
-            }
+            } else { "pending" }
         }
         Err(e) => {
             warn!(delivery_id = %delivery.id, error = %e, %attempt, "redrive attempt failed");
             if attempt >= state.config.webhook_redrive_max_attempts as i64 {
+                state.webhook_metrics.record_failed();
+                state.webhook_metrics.record_latency_ms(start.elapsed().as_millis() as u64);
                 "failed"
-            } else {
-                "pending"
-            }
+            } else { "pending" }
         }
     };
 

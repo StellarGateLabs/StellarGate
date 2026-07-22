@@ -17,7 +17,7 @@ fn make_config() -> Config {
         database_url: "sqlite::memory:".into(),
         network: "testnet".into(),
         horizon_url: String::new(),
-        gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
+        gateway_public: "UNCONFIGURED".into(),
         gateway_secret: String::new(),
         accepted_assets: stellargate::config::AcceptedAsset::default_list(),
         webhook_secret: String::new(),
@@ -66,6 +66,8 @@ async fn server_with_config(cfg: Config) -> (TestServer, db::Db) {
         config: cfg,
         http,
         webhook_http: reqwest::Client::new(),
+        webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
+        task_health: stellargate::metrics::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
     let server = TestServer::new(router).unwrap();
