@@ -455,13 +455,15 @@ async fn test_asset_is_case_insensitive() {
 
 #[tokio::test]
 async fn test_webhook_url_https_accepted_on_testnet() {
-    let server = test_server().await;
+    let mut cfg = make_config();
+    cfg.webhook_allow_private_targets = true;
+    let (server, _db) = server_with_config(cfg).await;
     let key = provision_merchant(&server).await;
     let res = server
         .post("/payments")
         .add_header("Authorization", format!("Bearer {key}"))
         .json(
-            &json!({ "amount": "1", "asset": "XLM", "webhook_url": "https://example.com/webhook" }),
+            &json!({ "amount": "1", "asset": "XLM", "webhook_url": "https://127.0.0.1:9/webhook" }),
         )
         .await;
     res.assert_status(StatusCode::CREATED);
@@ -469,13 +471,15 @@ async fn test_webhook_url_https_accepted_on_testnet() {
 
 #[tokio::test]
 async fn test_webhook_url_http_accepted_on_testnet() {
-    let server = test_server().await;
+    let mut cfg = make_config();
+    cfg.webhook_allow_private_targets = true;
+    let (server, _db) = server_with_config(cfg).await;
     let key = provision_merchant(&server).await;
     let res = server
         .post("/payments")
         .add_header("Authorization", format!("Bearer {key}"))
         .json(
-            &json!({ "amount": "1", "asset": "XLM", "webhook_url": "http://example.com/webhook" }),
+            &json!({ "amount": "1", "asset": "XLM", "webhook_url": "http://127.0.0.1:9/webhook" }),
         )
         .await;
     res.assert_status(StatusCode::CREATED);
@@ -485,13 +489,14 @@ async fn test_webhook_url_http_accepted_on_testnet() {
 async fn test_webhook_url_http_rejected_on_public_network() {
     let mut cfg = make_config();
     cfg.network = "public".into();
+    cfg.webhook_allow_private_targets = true;
     let (server, _db) = server_with_config(cfg).await;
     let key = provision_merchant(&server).await;
     let res = server
         .post("/payments")
         .add_header("Authorization", format!("Bearer {key}"))
         .json(
-            &json!({ "amount": "1", "asset": "XLM", "webhook_url": "http://example.com/webhook" }),
+            &json!({ "amount": "1", "asset": "XLM", "webhook_url": "http://127.0.0.1:9/webhook" }),
         )
         .await;
     res.assert_status(StatusCode::BAD_REQUEST);
@@ -507,13 +512,14 @@ async fn test_webhook_url_http_rejected_on_public_network() {
 async fn test_webhook_url_https_accepted_on_public_network() {
     let mut cfg = make_config();
     cfg.network = "public".into();
+    cfg.webhook_allow_private_targets = true;
     let (server, _db) = server_with_config(cfg).await;
     let key = provision_merchant(&server).await;
     let res = server
         .post("/payments")
         .add_header("Authorization", format!("Bearer {key}"))
         .json(
-            &json!({ "amount": "1", "asset": "XLM", "webhook_url": "https://example.com/webhook" }),
+            &json!({ "amount": "1", "asset": "XLM", "webhook_url": "https://127.0.0.1:9/webhook" }),
         )
         .await;
     res.assert_status(StatusCode::CREATED);
