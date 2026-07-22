@@ -2,7 +2,12 @@
 name = "stellargate"
 version = "0.1.0"
 edition = "2021"
+
+description = "A Rust toolkit for building on the Stellar blockchain"
+repository = "https://github.com/StellarGateLabs/StellarGate"
 license = "MIT"
+keywords = ["stellar","blockchain","sdk","rpc"]
+categories = ["network-programming", "command-line-utilities"]
 # Application binary, not a library published to crates.io. `publish = false`
 # lets cargo-deny skip it under `[licenses].private` rather than flagging the
 # (intentionally unlicensed) workspace crate itself.
