@@ -302,6 +302,7 @@ fn payment_with(tx_hash: &str, amount: &str) -> HorizonPayment {
         transaction: Some(TransactionRef {
             memo: Some("ABCD1234".into()),
             memo_type: Some("text".into()),
+            successful: Some(true),
         }),
         paging_token: Some("1".into()),
     }
