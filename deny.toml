@@ -3,58 +3,73 @@
 
 # ── Advisories ────────────────────────────────────────────────────────────────
 # Mirrors the RustSec advisory database. cargo-deny fetches it automatically.
+# Schema version 2: vulnerabilities, unsound and yanked crates are denied by
+# default, so only the scope/ignore knobs need to be set explicitly.
 [advisories]
-# Treat any unignored vulnerability as a hard error.
-vulnerability = "deny"
-# Unmaintained crates are a supply-chain risk for a payments service.
-unmaintained = "deny"
-# Yanked versions should not be in a locked dependency tree.
-yanked = "deny"
-# Crates flagged for unsound usage patterns.
-unsound = "deny"
-# Notice-level advisories are informational; warn rather than fail.
-notice = "warn"
+version = 2
+# Check every crate in the tree (not just the workspace) for unmaintained
+# advisories — a supply-chain risk for a payments service.
+unmaintained = "all"
+# Advisories that are acknowledged and accepted, with justification.
+#
+# Every entry here is a temporary exception, not a permanent waiver. Each must
+# carry a removal condition and a review date, and is re-examined on the
+# schedule below (see also the weekly `cargo audit` cron in
+# .github/workflows/supply-chain.yml). Remove an entry as soon as its removal
+# condition is met.
+ignore = [
+    # RUSTSEC-2023-0071 — Marvin timing side-channel in `rsa`.
+    #
+    # Why ignored: `rsa` is pulled in only through sqlx's MySQL backend
+    # (`sqlx-mysql`), which we do not enable — we depend on `sqlx` with the
+    # `sqlite` feature only, so the vulnerable code is never compiled or
+    # executed. It appears in Cargo.lock (and is therefore flagged by the
+    # advisory scanners, which read the lockfile) purely as an optional,
+    # unbuilt transitive dependency.
+    #
+    # Removal condition — drop this ignore as soon as ANY of these holds:
+    #   1. A fixed `rsa` release is published (track RustSec advisory
+    #      RUSTSEC-2023-0071 and https://github.com/RustCrypto/RSA/issues/19).
+    #   2. `rsa` leaves the dependency tree entirely (e.g. sqlx removes the
+    #      transitive path, or we drop the MySQL backend from resolution).
+    #   3. StellarGate begins enabling sqlx's MySQL backend — in which case the
+    #      code IS reachable and this must become a real fix, not an ignore.
+    #
+    # Review by: 2026-10-22 (quarterly). Tracking issue: StellarGateLabs#154.
+    # Keep in sync with the `--ignore` flag in supply-chain.yml.
+    { id = "RUSTSEC-2023-0071", reason = "rsa reachable only via sqlx's unenabled MySQL backend; no fixed release yet. Remove when fixed/removed upstream. Review by 2026-10-22. See StellarGateLabs#154." },
+]
 
 # ── Licenses ──────────────────────────────────────────────────────────────────
+# Schema version 2: any crate whose license is not in `allow` (or covered by an
+# exception) is denied.
 [licenses]
-# Reject any crate whose license is not in the allow list below.
-unlicensed = "deny"
-# Crates that declare multiple licenses (e.g. MIT OR Apache-2.0) are allowed
-# as long as at least one option is in the list.
-allow-osi-fsf-free = "neither"
-
+version = 2
+# Skip the workspace's own unpublished crate (`publish = false`), which is
+# intentionally unlicensed; only third-party dependencies are license-checked.
+private = { ignore = true }
 allow = [
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception", # compiler-builtins and related LLVM crates
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "ISC",                             # used by some cryptography crates (ring deps)
     "Unicode-DFS-2016",                # unicode-ident, icu_* and related crates
-    "CC0-1.0",                         # public-domain data crates
+    "Unicode-3.0",                     # newer unicode-ident / icu_* releases
     "Zlib",                            # miniz_oxide and compression crates
     "OpenSSL",                         # openssl-sys transitive dep via native-tls
 ]
 
 # Crates that either bundle their own license text or use a non-SPDX
 # expression that cargo-deny cannot auto-classify. Add with justification.
-#
-# ring uses a BoringSSL-derived license not expressible in SPDX; if it is
-# pulled in transitively (e.g. via rustls), it is acceptable for a payments
-# service. See https://github.com/briansmith/ring/blob/main/LICENSE
-[[licenses.exceptions]]
-allow = ["LicenseRef-ring"]
-name = "ring"
 
 # ── Bans ──────────────────────────────────────────────────────────────────────
 [bans]
 # Warn when the same crate is resolved at multiple versions. Duplicates bloat
 # the binary and can mask version-sensitive security fixes.
 multiple-versions = "warn"
-# Deny crates that are known wildcards in the ecosystem.
+# Wildcard ("*") version requirements are allowed for now.
 wildcards = "allow"
-# Deny git-source dependencies not from crates.io (prevents shadow deps).
-allow-build-scripts = true
 
 # ── Sources ───────────────────────────────────────────────────────────────────
 [sources]

@@ -66,8 +66,12 @@ The original `payload` is stored and re-sent as-is during redeliver. This means:
 ### 4. Error Messages
 All error responses use the standard `{ "error": "message" }` format for consistency with existing endpoints.
 
-### 5. Merchant Scoping (Future)
-The isolation test validates that deliveries are properly scoped to payments. Once auth lands (#9), add merchant_id checks to prevent cross-tenant access. The structure is ready for this.
+### 5. Merchant Scoping
+`GET /payments/:id/webhooks` requires the merchant bearer token and asserts
+`payment.merchant_id == authenticated_merchant`, reporting the same 404 as a
+missing payment when a different merchant's payment id is requested — this
+prevents both cross-tenant reads and enumeration of other merchants' payment
+ids via this endpoint.
 
 ## Testing Strategy
 

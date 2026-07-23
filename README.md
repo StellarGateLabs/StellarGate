@@ -29,7 +29,7 @@ This project is under active development. The following is implemented:
 - [x] Input validation (asset, amount as exact stroops, webhook URL)
 - [x] Transaction listener (Horizon SSE streaming + interval polling)
 - [x] Payment verification (memo + asset + amount)
-- [x] Webhook dispatch (HMAC-SHA256 signed, with retries)
+- [x] Webhook dispatch (timestamped HMAC-SHA256 signature, replay-resistant, with retries)
 - [x] Multi-merchant support (`merchant_id` per payment)
 - [x] Pending-intent expiry (configurable TTL + `payment.expired` webhook)
 - [ ] Horizon streaming (currently polled on an interval)
@@ -67,17 +67,27 @@ cp .env.example .env
 | `DATABASE_URL` | sqlx connection string | `sqlite:stellargate.db` |
 | `STELLAR_NETWORK` | `testnet` or `public` | `testnet` |
 | `STELLAR_HORIZON_URL` | Horizon endpoint | testnet |
-| `STELLAR_GATEWAY_PUBLIC` | Your gateway wallet public key | — |
+| `STELLAR_GATEWAY_PUBLIC` | Your gateway wallet public key (`G...`). Validated as a Stellar strkey at startup; an invalid value aborts boot. | — |
 | `STELLAR_GATEWAY_SECRET` | Your gateway wallet secret key | — |
-| `USDC_ISSUER` | USDC issuer address | testnet issuer |
+| `ACCEPTED_ASSETS` | Comma-separated assets to accept. Format: `CODE` for native (e.g. `XLM`) or `CODE:ISSUER` for non-native (e.g. `USDC:GISSUER`). Adding an asset is config-only — no code changes needed. Each `ISSUER` is validated as a Stellar strkey at startup. | `XLM,USDC:<testnet-issuer>` |
 | `STELLAR_LISTENER_MODE` | `stream` (SSE + poller reconciler) or `poll` (interval only) | `stream` |
 | `POLL_INTERVAL_SECS` | How often the Horizon poller reconciles | `10` |
 | `PAYMENT_TTL_SECS` | How long a payment intent stays `pending` before it is expired (from `created_at`) | `3600` |
 | `WEBHOOK_SECRET` | HMAC signing secret for webhooks | — |
 | `WEBHOOK_RETRY_ATTEMPTS` | Webhook delivery attempts | `3` |
 | `WEBHOOK_RETRY_DELAY_MS` | Delay between webhook retries | `5000` |
+| `WEBHOOK_TIMEOUT_SECS` | Per-attempt timeout (seconds) for outbound webhook POSTs. Each retry is bounded independently; a slow receiver cannot block the reconciler for longer than this value × retries. | `10` |
+| `WEBHOOK_REDRIVE_INTERVAL_SECS` | How often the background redrive worker scans for stuck webhook deliveries (rows left `pending`/`failed` by a process that exited mid-delivery). Its first pass runs immediately on startup, so a restart redrives without waiting a full interval. | `30` |
+| `WEBHOOK_REDRIVE_CONCURRENCY` | Maximum redrive HTTP attempts in flight at once. | `4` |
+| `WEBHOOK_REDRIVE_MAX_ATTEMPTS` | Total attempts (inline + redrive) before a delivery is left `failed` permanently. | `8` |
+| `WEBHOOK_REDRIVE_GRACE_SECS` | How long (seconds) a delivery must sit idle since its last attempt before the redrive worker will touch it, so it never races a still-in-flight inline delivery for the same row. | `60` |
+| `WEBHOOK_ALLOW_PRIVATE_TARGETS` | Bypasses the SSRF guard's loopback/link-local/private/reserved IP check on `webhook_url` (still requires http(s) and a resolvable host). For local development and tests only — never enable in production. | `false` |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated allowed CORS origins (e.g. `https://app.example.com`). Required on `public` network; omitting on testnet falls back to permissive with a warning. | _(unset — permissive on testnet)_ |
-| `RATE_LIMIT_REQUESTS_PER_SEC` | Rate limit for `POST /payments` (requests per second per IP) | `10` |
+| `RATE_LIMIT_REQUESTS_PER_SEC` | Rate limit for `POST /payments` and `POST /merchants` (requests per second per IP, tracked independently per route) | `10` |
+| `REQUEST_TIMEOUT_SECS` | Per-request timeout for the whole API. A request without a response within this window is aborted with `408 Request Timeout`. | `30` |
+| `DB_POOL_MAX_CONNECTIONS` | SQLite connection pool size. WAL mode allows one writer + many concurrent readers. | `10` |
+| `DB_BUSY_TIMEOUT_MS` | How long (ms) SQLite waits to acquire a write lock before returning an error. Must be `> 0` under concurrent load. | `5000` |
+| `ADMIN_PROVISIONING_SECRET` | Shared secret required via the `X-Admin-Secret` header to call `POST /merchants`. Unset disables provisioning entirely (every request gets `401`). | _(unset — provisioning disabled)_ |
 
 > `DATABASE_URL` is a sqlx connection string (`sqlite:stellargate.db`), not a
 > file path. The Horizon poller stays idle until `STELLAR_GATEWAY_PUBLIC` is set.
@@ -127,6 +137,36 @@ signing, and the HTTP API (create, fetch, list/filter, validation).
 
 ## API Reference
 
+### `POST /merchants`
+
+Provision a new merchant and return its API key. This is an **admin-only**
+route: set `ADMIN_PROVISIONING_SECRET` and send it via the `X-Admin-Secret`
+header, or the endpoint always returns `401`. There is no self-service
+sign-up — provisioning is intended to be run by whoever operates the gateway
+(e.g. an internal admin tool or a one-off `curl` from a trusted machine), not
+exposed to end users.
+
+**Request**
+
+```bash
+curl -X POST http://localhost:3000/merchants \
+  -H "X-Admin-Secret: $ADMIN_PROVISIONING_SECRET"
+```
+
+**Response** `201 Created`
+```json
+{
+  "merchant_id": "a1b2c3d4-...",
+  "api_key": "e5f6...-...-..."
+}
+```
+
+> `api_key` is returned once, in plaintext, and never shown again — store it
+> securely. Use it as the `Authorization: Bearer <api_key>` header on
+> `POST /payments` and `GET /payments`.
+
+---
+
 ### `POST /payments`
 
 Create a new payment intent.
@@ -146,9 +186,22 @@ Create a new payment intent.
 | `amount` | string | ✅ | Any positive number |
 | `asset` | string | ✅ | `XLM` or `USDC` |
 | `merchant_id` | string | ❌ | Any string |
-| `webhook_url` | string | ❌ | Valid HTTPS URL |
+| `webhook_url` | string | ❌ | Valid HTTPS URL (HTTP permitted only in testnet/development) |
 
-**Response** `201 Created`
+> `webhook_url` is checked against an SSRF guard: its host is resolved and
+> rejected if it's loopback, link-local (including the cloud metadata address
+> `169.254.169.254`), private, or otherwise reserved. The same check runs
+> again on every redelivery (`POST /payments/:id/webhooks/:delivery_id/redeliver`)
+> against the exact address resolved, not a second DNS lookup, so a
+> DNS-rebinding attempt after the initial check can't reach an internal host.
+
+**Headers**
+
+| Header | Required | Description |
+|---|---|---|
+| `Idempotency-Key` | ❌ | Opaque client-chosen key for safe retries. Reusing a key (scoped per `merchant_id`) returns the original payment with `200 OK` instead of minting a duplicate intent. |
+
+**Response** `201 Created` (or `200 OK` when an `Idempotency-Key` matches a prior request)
 ```json
 {
   "id": "a1b2c3d4-...",
@@ -194,7 +247,7 @@ Fetch the current status of a payment.
 |---|---|
 | `pending` | Awaiting payment |
 | `completed` | Payment confirmed on-chain |
-| `failed` | Partial payment or verification failed |
+| `underpaid` | Less than the requested amount received; stays watchable for a top-up |
 | `expired` | TTL elapsed before payment arrived; no longer watched |
 
 ---
@@ -207,7 +260,7 @@ List payments, newest first.
 
 | Param | Description | Default |
 |---|---|---|
-| `status` | Filter by `pending`, `completed`, `failed`, or `expired` | all |
+| `status` | Filter by `pending`, `completed`, `underpaid`, or `expired` | all |
 | `limit` | Page size (1–100) | `20` |
 | `offset` | Rows to skip | `0` |
 
@@ -225,8 +278,19 @@ List payments, newest first.
 
 ### `GET /health`
 
+Cheap liveness probe. Always returns `200 OK` as long as the process is running.
+
 ```json
 200 OK — { "status": "ok" }
+```
+
+### `GET /ready`
+
+Readiness probe. Runs `SELECT 1` against the database; returns `503` when unreachable.
+
+```json
+200 OK          — { "status": "ok" }
+503 Unavailable — { "status": "unavailable" }
 ```
 
 ## Payment Flow
@@ -315,25 +379,89 @@ Fired when a payment is received but falls short of the requested amount. `delta
 }
 ```
 
-Event types: `payment.success` (paid in full), `payment.failed` (underpaid or
-verification failed), and `payment.expired` (the intent's TTL elapsed before
-payment arrived). The `event` field carries the type; `status` carries the
-matching payment status.
+**See [WEBHOOK_REFERENCE.md](WEBHOOK_REFERENCE.md) for the canonical webhook documentation**, including all event types, signature verification, and integration examples.
 
-Webhooks are signed with `X-StellarGate-Signature` (HMAC-SHA256) so you can verify authenticity.
+⚠️ **Event types in code:** `payment.completed` (paid in full), `payment.overpaid` (excess payment), `payment.underpaid` (shortfall remaining), and `payment.expired` (TTL elapsed). The `event` field in the signed body carries the authoritative type.
+
+### Verifying webhooks
+
+Every webhook request carries two headers that together authenticate the event:
+
+| Header | Value |
+|---|---|
+| `X-StellarGate-Timestamp` | Unix time (seconds) at which the event was signed |
+| `X-StellarGate-Signature` | Hex HMAC-SHA256 of `"{timestamp}.{raw_body}"`, keyed with your `WEBHOOK_SECRET` |
+
+A third header, `X-StellarGate-Event`, is included as a routing convenience (e.g. to quickly filter events in a load balancer before parsing JSON). **This header is not part of the signed material** — it mirrors the `event` field in the body but can be altered in transit without invalidating the signature. Always verify the signature first, then read the event type from the signed body.
+
+The signature covers the timestamp as well as the body (Stripe-style), so a
+captured request cannot be replayed indefinitely. To verify:
+
+1. Read `X-StellarGate-Timestamp` (`t`) and `X-StellarGate-Signature` (`sig`).
+2. Reject the request if `t` is too old: `abs(now - t) > tolerance`. A
+   **5-minute** tolerance is recommended — large enough for clock skew and
+   network delay, small enough to bound the replay window.
+3. Concatenate `"{t}.{raw_body}"` using the **exact bytes** received (verify
+   before any JSON re-encoding, which would change the bytes).
+4. Compute `HMAC_SHA256(WEBHOOK_SECRET, "{t}.{raw_body}")` and hex-encode it.
+5. Compare it to `sig` with a **constant-time** equality check. Reject on
+   mismatch.
+6. After the signature passes, read the `event` field from the **body** to
+   determine the event type. Do **not** route on `X-StellarGate-Event` for
+   security-sensitive logic.
+
+Example (Node.js):
+
+```js
+const crypto = require("crypto");
+
+function verify(rawBody, headers, secret, toleranceSec = 300) {
+  const t = Number(headers["x-stellargate-timestamp"]);
+  const sig = headers["x-stellargate-signature"];
+  if (!Number.isFinite(t) || Math.abs(Date.now() / 1000 - t) > toleranceSec) {
+    return false; // stale or missing timestamp — reject
+  }
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(`${t}.${rawBody}`)
+    .digest("hex");
+  return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+}
+
+// Usage: always read the event type from the verified body, never from the header.
+// X-StellarGate-Event is a convenience header only — it is NOT signed.
+function handleWebhook(rawBody, headers, secret) {
+  if (!verify(rawBody, headers, secret)) {
+    throw new Error("invalid signature");
+  }
+  const payload = JSON.parse(rawBody);
+  const event = payload.event; // ← authenticated; safe to route on
+  // const event = headers["x-stellargate-event"]; // ← NOT authenticated; do not use
+  switch (event) {
+    case "payment.completed": /* ... */ break;
+    case "payment.overpaid":  /* ... */ break;
+    case "payment.underpaid": /* ... */ break;
+    case "payment.expired":   /* ... */ break;
+  }
+}
+```
 
 ## Project Structure
 
 ```
+migrations/
+└── 0001_initial_schema.sql   # Versioned schema applied automatically on startup
+
 src/
 ├── main.rs          # Entry point, server startup, listener/poller spawn, graceful shutdown
 ├── lib.rs           # Shared state and module exports
 ├── config.rs        # Environment configuration
 ├── db.rs            # Database queries (SQLite)
 ├── money.rs         # Stroops-based amount parsing/validation
+├── strkey.rs        # Stellar address (strkey) validation
 ├── horizon.rs       # Horizon polling listener + payment verification
 ├── expiry.rs        # Background sweeper that expires overdue pending intents
-├── webhook.rs       # HMAC-SHA256 signed webhook dispatch
+├── webhook.rs       # HMAC-SHA256 signed webhook dispatch + background redrive worker
 └── api/
     ├── mod.rs       # Axum router, layers (CORS/trace/body-limit), 404 fallback
     └── payments.rs  # Payment handlers (create, get, list)
@@ -342,9 +470,21 @@ tests/
 └── api_tests.rs     # Integration tests
 ```
 
+## Database Migrations
+
+Schema is managed with [`sqlx::migrate!`](https://docs.rs/sqlx/latest/sqlx/macro.migrate.html). Migrations live in `migrations/` as numbered SQL files and are applied automatically on startup — both a fresh database and an existing one converge to the same schema.
+
+**Adding a migration:**
+
+1. Create `migrations/<next_number>_<short_description>.sql` (e.g. `0002_add_refunds_table.sql`).
+2. Write your `ALTER TABLE` / `CREATE TABLE` SQL in the file.
+3. Run `cargo test` — the test suite boots against an in-memory database and will apply all migrations, catching syntax errors early.
+
+sqlx records applied migrations in a `_sqlx_migrations` table so each file is run exactly once.
+
 ## Contributing
 
-This project is open to contributors. See the [Wave Program](https://github.com/StellarGateLabs/StellarGate/issues) for scoped issues you can pick up.
+This project is open to contributors. See the [Wave Program](https://github.com/StellarGateLabs/StellarGate/issues) for scoped issues you can pick up, and read [CONTRIBUTING.md](CONTRIBUTING.md) for setup, standards, and the PR process. Participation is governed by our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 **To contribute:**
 
@@ -353,6 +493,8 @@ This project is open to contributors. See the [Wave Program](https://github.com/
 3. Make your changes and add tests
 4. Run `cargo test` — all tests must pass
 5. Open a pull request
+
+Found a security vulnerability? Please report it privately — see [SECURITY.md](SECURITY.md).
 
 ## License
 

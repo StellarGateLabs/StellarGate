@@ -44,10 +44,10 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .execute(pool)
     .await?;
 
-    // Bring pre-existing payment tables up to schema. New databases already have
-    // `expires_at` from the CREATE TABLE above; older ones need it added in
-    // place. SQLite rejects a non-constant DEFAULT on ALTER ... ADD COLUMN, so we
-    // add it nullable and backfill below.
+    /* Bring pre-existing payment tables up to schema. New databases already have
+    `expires_at` from the CREATE TABLE above; older ones need it added in
+    place. SQLite rejects a non-constant DEFAULT on ALTER ... ADD COLUMN, so we
+    add it nullable and backfill below. */
     let has_expires_at: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('payments') WHERE name = 'expires_at'",
     )
@@ -58,9 +58,9 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             .execute(pool)
             .await?;
     }
-    // Backfill any row without an expiry (legacy rows, or rows inserted in the
-    // brief window before the column existed). `created_at + 1h` mirrors the
-    // default TTL; SQLite's date functions accept the stored RFC 3339 `Z` form.
+    /* Backfill any row without an expiry (legacy rows, or rows inserted in the
+    brief window before the column existed). `created_at + 1h` mirrors the
+    default TTL; SQLite's date functions accept the stored RFC 3339 `Z` form. */
     sqlx::query(
         "UPDATE payments
             SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', created_at, '+1 hour')
@@ -87,6 +87,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             payment_id TEXT NOT NULL,
             url TEXT NOT NULL,
             payload TEXT NOT NULL,
+            event_type TEXT,
             status TEXT NOT NULL DEFAULT 'pending',
             attempts INTEGER NOT NULL DEFAULT 0,
             last_attempt TEXT,
@@ -96,8 +97,24 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .execute(pool)
     .await?;
 
-    // Durable key/value state — used by the Horizon poller to persist its
-    // paging cursor so it resumes exactly where it left off across restarts.
+    /* Bring pre-existing delivery tables up to schema. `event_type` records
+    which event the payload represents so a redelivery can echo the original
+    `X-StellarGate-Event` header instead of guessing. Rows written before this
+    column existed stay NULL; readers fall back to the `event` field inside the
+    stored payload. */
+    let has_event_type: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'event_type'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_event_type == 0 {
+        sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN event_type TEXT")
+            .execute(pool)
+            .await?;
+    }
+
+    /* Durable key/value state — used by the Horizon poller to persist its
+    paging cursor so it resumes exactly where it left off across restarts. */
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS kv_state (
             key TEXT PRIMARY KEY,
@@ -108,9 +125,84 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .execute(pool)
     .await?;
 
-    // Normalise legacy rows that were written by the old datetime('now') default,
-    // which produced "YYYY-MM-DD HH:MM:SS" (space, no Z). Safe to run on every
-    // startup — the WHERE clause skips rows that are already RFC 3339.
+    /* Merchants are provisioned via POST /merchants. The raw API key is never
+    stored; only its SHA-256 hex digest is persisted so a DB breach does not
+    expose live credentials. */
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS merchants (
+            id TEXT PRIMARY KEY,
+            api_key_hash TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    /* Idempotency keys for payment creation. A key is unique per merchant and
+    maps to the payment id minted for the first request that used it, so a
+    client retrying after a network blip gets the original payment back
+    instead of a duplicate intent. */
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS idempotency_keys (
+            merchant_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            payment_id TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            PRIMARY KEY (merchant_id, idempotency_key)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    /* Every on-chain transaction we credit to an intent, one row per
+    (payment_id, tx_hash). The cumulative received amount for an intent is the
+    SUM of `amount_stroops` over its rows, so re-seeing a transaction (on a
+    later poll cycle, over the stream, or from a concurrent reconciler) is an
+    idempotent no-op instead of a double-credit. `amount_stroops` is the
+    integer stroop value so SUM is exact. */
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS processed_transactions (
+            payment_id TEXT NOT NULL,
+            tx_hash TEXT NOT NULL,
+            amount_stroops INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            PRIMARY KEY (payment_id, tx_hash)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    /* Backfill from legacy rows that recorded only the most-recent `tx_hash`
+    and a cumulative `paid_amount`, so upgrading preserves the received-amount
+    ledger for intents that are still in flight. Idempotent via ON CONFLICT, so
+    it is safe to run on every startup. */
+    let legacy = sqlx::query(
+        "SELECT id, tx_hash, paid_amount FROM payments
+         WHERE tx_hash IS NOT NULL AND tx_hash <> '' AND paid_amount IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    for row in &legacy {
+        let id: String = row.get("id");
+        let tx_hash: String = row.get("tx_hash");
+        let paid_amount: String = row.get("paid_amount");
+        if let Some(stroops) = crate::money::parse_stroops(&paid_amount) {
+            sqlx::query(
+                "INSERT INTO processed_transactions (payment_id, tx_hash, amount_stroops)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(payment_id, tx_hash) DO NOTHING",
+            )
+            .bind(&id)
+            .bind(&tx_hash)
+            .bind(stroops)
+            .execute(pool)
+            .await?;
+        }
+    }
+
+    /* Normalise legacy rows that were written by the old datetime('now') default,
+    which produced "YYYY-MM-DD HH:MM:SS" (space, no Z). Safe to run on every
+    startup — the WHERE clause skips rows that are already RFC 3339. */
     for tbl_col in [
         ("payments", "created_at"),
         ("payments", "updated_at"),
@@ -178,8 +270,16 @@ pub struct NewPayment<'a> {
 }
 
 pub async fn create_payment(pool: &Db, new: NewPayment<'_>) -> Result<Payment> {
-    // Compute the expiry as `now + ttl_secs` in SQLite so it shares the exact
-    // clock and RFC 3339 format as created_at.
+    /* Canonicalize the amount: parse to stroops, then convert back to the
+    canonical string representation. This ensures "10.00", "10.0", and "10"
+    all serialize identically, eliminating spurious string-based comparisons
+    across create/get/webhook responses. */
+    let stroops = crate::money::parse_stroops(new.amount)
+        .ok_or_else(|| anyhow::anyhow!("Invalid amount"))?;
+    let canonical_amount = crate::money::stroops_to_string(stroops);
+
+    /* Compute the expiry as `now + ttl_secs` in SQLite so it shares the exact
+    clock and RFC 3339 format as created_at. */
     let ttl_modifier = format!("{:+} seconds", new.ttl_secs);
     sqlx::query(
         "INSERT INTO payments (id, merchant_id, destination_address, memo, amount, asset, webhook_url, expires_at)
@@ -189,7 +289,7 @@ pub async fn create_payment(pool: &Db, new: NewPayment<'_>) -> Result<Payment> {
     .bind(new.merchant_id)
     .bind(new.destination_address)
     .bind(new.memo)
-    .bind(new.amount)
+    .bind(&canonical_amount)
     .bind(new.asset)
     .bind(new.webhook_url)
     .bind(&ttl_modifier)
@@ -199,6 +299,50 @@ pub async fn create_payment(pool: &Db, new: NewPayment<'_>) -> Result<Payment> {
     get_payment(pool, new.id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("Payment not found after insert"))
+}
+
+/// Look up the payment id previously minted for `(merchant_id, key)`, if any.
+pub async fn find_payment_id_by_idempotency_key(
+    pool: &Db,
+    merchant_id: &str,
+    key: &str,
+) -> Result<Option<String>> {
+    let id: Option<String> = sqlx::query_scalar(
+        "SELECT payment_id FROM idempotency_keys WHERE merchant_id = ? AND idempotency_key = ?",
+    )
+    .bind(merchant_id)
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Record the payment id minted for `(merchant_id, key)`. If the key already
+/// exists (e.g. a concurrent request won the race), the existing mapping is left
+/// untouched and the winning payment id is returned; otherwise `payment_id` is
+/// stored and returned.
+pub async fn save_idempotency_key(
+    pool: &Db,
+    merchant_id: &str,
+    key: &str,
+    payment_id: &str,
+) -> Result<String> {
+    sqlx::query(
+        "INSERT INTO idempotency_keys (merchant_id, idempotency_key, payment_id)
+         VALUES (?, ?, ?)
+         ON CONFLICT(merchant_id, idempotency_key) DO NOTHING",
+    )
+    .bind(merchant_id)
+    .bind(key)
+    .bind(payment_id)
+    .execute(pool)
+    .await?;
+
+    // Re-read so a concurrent insert that won the race returns the canonical id.
+    let stored = find_payment_id_by_idempotency_key(pool, merchant_id, key)
+        .await?
+        .unwrap_or_else(|| payment_id.to_string());
+    Ok(stored)
 }
 
 pub async fn get_payment(pool: &Db, id: &str) -> Result<Option<Payment>> {
@@ -216,6 +360,7 @@ pub async fn get_payment(pool: &Db, id: &str) -> Result<Option<Payment>> {
 
 pub async fn list_payments(
     pool: &Db,
+    merchant_id: &str,
     status: Option<&str>,
     limit: i64,
     offset: i64,
@@ -224,32 +369,38 @@ pub async fn list_payments(
         let rows = sqlx::query(
             "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-             FROM payments WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+             FROM payments WHERE merchant_id = ? AND status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
         )
+        .bind(merchant_id)
         .bind(s)
         .bind(limit)
         .bind(offset)
         .fetch_all(pool)
         .await?;
 
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE status = ?")
-            .bind(s)
-            .fetch_one(pool)
-            .await?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM payments WHERE merchant_id = ? AND status = ?",
+        )
+        .bind(merchant_id)
+        .bind(s)
+        .fetch_one(pool)
+        .await?;
 
         (rows, total)
     } else {
         let rows = sqlx::query(
             "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-             FROM payments ORDER BY created_at DESC LIMIT ? OFFSET ?",
+             FROM payments WHERE merchant_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
         )
+        .bind(merchant_id)
         .bind(limit)
         .bind(offset)
         .fetch_all(pool)
         .await?;
 
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payments")
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE merchant_id = ?")
+            .bind(merchant_id)
             .fetch_one(pool)
             .await?;
 
@@ -261,73 +412,85 @@ pub async fn list_payments(
 
 pub async fn list_payments_keyset(
     pool: &Db,
+    merchant_id: &str,
     status: Option<&str>,
     limit: i64,
     cursor: Option<(&str, &str)>,
 ) -> Result<Vec<Payment>> {
     let rows = match (status, cursor) {
-        (None, None) => sqlx::query(
-            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+        (None, None) => {
+            sqlx::query(
+                "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-             FROM payments ORDER BY created_at DESC, id DESC LIMIT ?",
-        )
-        .bind(limit)
-        .fetch_all(pool)
-        .await?,
+             FROM payments WHERE merchant_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(merchant_id)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
 
-        (None, Some((ts, cid))) => sqlx::query(
-            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+        (None, Some((ts, cid))) => {
+            sqlx::query(
+                "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments
-             WHERE (created_at < ? OR (created_at = ? AND id < ?))
+             WHERE merchant_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
              ORDER BY created_at DESC, id DESC LIMIT ?",
-        )
-        .bind(ts)
-        .bind(ts)
-        .bind(cid)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?,
+            )
+            .bind(merchant_id)
+            .bind(ts)
+            .bind(ts)
+            .bind(cid)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
 
-        (Some(s), None) => sqlx::query(
-            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+        (Some(s), None) => {
+            sqlx::query(
+                "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-             FROM payments WHERE status = ? ORDER BY created_at DESC, id DESC LIMIT ?",
-        )
-        .bind(s)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?,
+             FROM payments WHERE merchant_id = ? AND status = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(merchant_id)
+            .bind(s)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
 
-        (Some(s), Some((ts, cid))) => sqlx::query(
-            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+        (Some(s), Some((ts, cid))) => {
+            sqlx::query(
+                "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments
-             WHERE status = ? AND (created_at < ? OR (created_at = ? AND id < ?))
+             WHERE merchant_id = ? AND status = ? AND (created_at < ? OR (created_at = ? AND id < ?))
              ORDER BY created_at DESC, id DESC LIMIT ?",
-        )
-        .bind(s)
-        .bind(ts)
-        .bind(ts)
-        .bind(cid)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?,
+            )
+            .bind(merchant_id)
+            .bind(s)
+            .bind(ts)
+            .bind(ts)
+            .bind(cid)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
     };
 
     Ok(rows.iter().map(row_to_payment).collect())
 }
 
-/// All payments still awaiting confirmation, oldest first. Used by the Horizon
-/// poller to decide which memos to watch for on-chain. Rows whose TTL has
-/// elapsed are excluded even if the sweeper hasn't transitioned them yet, so an
-/// overdue intent is never polled.
+/// All payments still awaiting confirmation or top-up, oldest first. Rows whose
+/// TTL has elapsed are excluded even if the sweeper hasn't transitioned them
+/// yet, so an overdue intent is never polled.
 pub async fn list_pending(pool: &Db) -> Result<Vec<Payment>> {
     let rows = sqlx::query(
         "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                 webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
          FROM payments
-         WHERE status = 'pending'
+         WHERE status IN ('pending', 'underpaid')
            AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now')
          ORDER BY created_at ASC",
     )
@@ -337,16 +500,16 @@ pub async fn list_pending(pool: &Db) -> Result<Vec<Payment>> {
     Ok(rows.iter().map(row_to_payment).collect())
 }
 
-/// Transition every `pending` payment whose TTL has elapsed to `expired`,
+/// Transition every watchable payment whose TTL has elapsed to `expired`,
 /// returning the rows that were swept so the caller can fire `payment.expired`
-/// webhooks. Each row is updated with a guard on `status = 'pending'` so a
-/// payment that settles concurrently is left untouched and not double-reported.
+/// webhooks. Each row is updated with a guard on a watchable status so a payment
+/// that settles concurrently is left untouched and not double-reported.
 pub async fn expire_overdue(pool: &Db) -> Result<Vec<Payment>> {
     let overdue = sqlx::query(
         "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                 webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
          FROM payments
-         WHERE status = 'pending'
+         WHERE status IN ('pending', 'underpaid')
            AND expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ','now')
          ORDER BY created_at ASC",
     )
@@ -360,14 +523,14 @@ pub async fn expire_overdue(pool: &Db) -> Result<Vec<Payment>> {
             "UPDATE payments
                 SET status = 'expired',
                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-              WHERE id = ? AND status = 'pending'",
+              WHERE id = ? AND status IN ('pending', 'underpaid')",
         )
         .bind(&payment.id)
         .execute(pool)
         .await?;
 
-        // Only report rows we actually transitioned; a concurrent settlement
-        // may have flipped the status out from under us.
+        /* Only report rows we actually transitioned; a concurrent settlement
+        may have flipped the status out from under us. */
         if result.rows_affected() == 1 {
             payment.status = "expired".to_string();
             expired.push(payment);
@@ -381,7 +544,10 @@ pub async fn find_pending_by_memo(pool: &Db, memo: &str) -> Result<Option<Paymen
     let row = sqlx::query(
         "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                 webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-         FROM payments WHERE memo = ? AND status = 'pending'",
+         FROM payments
+         WHERE memo = ?
+           AND status IN ('pending', 'underpaid')
+           AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now')",
     )
     .bind(memo)
     .fetch_optional(pool)
@@ -390,15 +556,27 @@ pub async fn find_pending_by_memo(pool: &Db, memo: &str) -> Result<Option<Paymen
     Ok(row.as_ref().map(row_to_payment))
 }
 
+/// Transition a payment to a new status, returning `true` when the row was
+/// actually updated.
+///
+/// The `WHERE … AND status IN ('pending', 'underpaid')` guard is the key to
+/// single-settlement under concurrent reconciliation (issue #155): SQLite's
+/// serialized write path ensures that exactly one of two racing UPDATE
+/// statements will match a row still in a watchable state. The loser sees
+/// `rows_affected() == 0` and knows it must skip the webhook.
 pub async fn update_payment_status(
     pool: &Db,
     id: &str,
     status: &str,
     tx_hash: &str,
     paid_amount: &str,
-) -> Result<()> {
-    sqlx::query(
-        "UPDATE payments SET status = ?, tx_hash = ?, paid_amount = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE payments
+            SET status = ?, tx_hash = ?, paid_amount = ?,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+          WHERE id = ?
+            AND status IN ('pending', 'underpaid')",
     )
     .bind(status)
     .bind(tx_hash)
@@ -406,7 +584,48 @@ pub async fn update_payment_status(
     .bind(id)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
+}
+
+/// Record that transaction `tx_hash`, worth `amount_stroops`, has been credited
+/// to intent `payment_id`. Returns `true` when this is the first time the
+/// transaction was recorded for the intent, and `false` when it was already
+/// present (a re-seen record on a later poll cycle, over the stream, or from a
+/// concurrent reconciler).
+///
+/// The `(payment_id, tx_hash)` primary key plus `ON CONFLICT DO NOTHING` makes
+/// this the atomic dedup point: SQLite serialises writers, so exactly one of
+/// two racing inserts for the same transaction observes `rows_affected() == 1`.
+pub async fn record_processed_tx(
+    pool: &Db,
+    payment_id: &str,
+    tx_hash: &str,
+    amount_stroops: i64,
+) -> Result<bool> {
+    let result = sqlx::query(
+        "INSERT INTO processed_transactions (payment_id, tx_hash, amount_stroops)
+         VALUES (?, ?, ?)
+         ON CONFLICT(payment_id, tx_hash) DO NOTHING",
+    )
+    .bind(payment_id)
+    .bind(tx_hash)
+    .bind(amount_stroops)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Sum of every transaction recorded against `payment_id`, in stroops. This is
+/// the authoritative received-amount ledger for an intent — independent of how
+/// many transactions arrived, or the order they were seen in.
+pub async fn sum_processed_stroops(pool: &Db, payment_id: &str) -> Result<i64> {
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(amount_stroops), 0) FROM processed_transactions WHERE payment_id = ?",
+    )
+    .bind(payment_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(total)
 }
 
 /// Read a value from the durable key/value state table, if present.
@@ -442,26 +661,36 @@ pub async fn memo_exists(pool: &Db, memo: &str) -> Result<bool> {
     Ok(count > 0)
 }
 
+/// Record an outbound webhook delivery. `event_type` is the event name the
+/// payload carries (e.g. `payment.underpaid`); it is persisted so a later
+/// redelivery can reproduce the original `X-StellarGate-Event` header.
 pub async fn save_webhook_delivery(
     pool: &Db,
     id: &str,
     payment_id: &str,
     url: &str,
     payload: &str,
+    event_type: &str,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO webhook_deliveries (id, payment_id, url, payload) VALUES (?, ?, ?, ?)",
+        "INSERT INTO webhook_deliveries (id, payment_id, url, payload, event_type) VALUES (?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(payment_id)
     .bind(url)
     .bind(payload)
+    .bind(event_type)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-pub async fn update_webhook_delivery(pool: &Db, id: &str, status: &str, attempts: i64) -> Result<()> {
+pub async fn update_webhook_delivery(
+    pool: &Db,
+    id: &str,
+    status: &str,
+    attempts: i64,
+) -> Result<()> {
     sqlx::query(
         "UPDATE webhook_deliveries SET status = ?, attempts = ?, last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
     )
@@ -479,10 +708,34 @@ pub struct WebhookDelivery {
     pub payment_id: String,
     pub url: String,
     pub payload: String,
+    /// The event this payload represents. `None` only for rows written before
+    /// the column existed — use [`WebhookDelivery::event`] to read it.
+    pub event_type: Option<String>,
     pub status: String,
     pub attempts: i64,
     pub last_attempt: Option<String>,
     pub created_at: String,
+}
+
+/// Event name used when a legacy row has no `event_type` and its payload can't
+/// be parsed. Every payload this gateway has ever written carries an `event`
+/// field, so this is a last resort rather than an expected path.
+const FALLBACK_EVENT: &str = "payment.completed";
+
+impl WebhookDelivery {
+    /// The event name to report for this delivery, falling back to the `event`
+    /// field of the stored payload for rows written before `event_type`
+    /// existed. Used to reproduce the original `X-StellarGate-Event` header on
+    /// redelivery so the header can never contradict the body.
+    pub fn event(&self) -> String {
+        if let Some(event) = &self.event_type {
+            return event.clone();
+        }
+        serde_json::from_str::<serde_json::Value>(&self.payload)
+            .ok()
+            .and_then(|v| v.get("event")?.as_str().map(str::to_string))
+            .unwrap_or_else(|| FALLBACK_EVENT.to_string())
+    }
 }
 
 fn row_to_webhook_delivery(row: &sqlx::sqlite::SqliteRow) -> WebhookDelivery {
@@ -491,17 +744,52 @@ fn row_to_webhook_delivery(row: &sqlx::sqlite::SqliteRow) -> WebhookDelivery {
         payment_id: row.get("payment_id"),
         url: row.get("url"),
         payload: row.get("payload"),
+        event_type: row.get("event_type"),
         status: row.get("status"),
         attempts: row.get("attempts"),
         last_attempt: row.get("last_attempt"),
-        created_at: row.get("created_at"),
+        created_at: normalize_ts(&row.get::<String, _>("created_at")),
     }
+}
+
+/// Deliveries eligible for the background redrive worker: not yet delivered,
+/// under the attempt cap, and idle long enough that no in-flight `dispatch()`
+/// call for the same row can still be running.
+///
+/// A delivery row's status only changes at the *end* of a `dispatch()` call
+/// (success, final failure, or an SSRF rejection); while an attempt is still
+/// in progress the row stays `pending` with no signal that work is under way.
+/// `grace_secs` is the idle window past `last_attempt` (or `created_at` for a
+/// row never attempted) that a row must clear before being considered stuck
+/// rather than merely in flight — callers must size it comfortably above the
+/// worst-case inline delivery time so this worker never races a live
+/// `dispatch()` for the same row.
+pub async fn list_redrivable_deliveries(
+    pool: &Db,
+    max_attempts: i64,
+    grace_secs: i64,
+) -> Result<Vec<WebhookDelivery>> {
+    let grace_modifier = format!("-{grace_secs} seconds");
+    let rows = sqlx::query(
+        "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+         FROM webhook_deliveries
+         WHERE status IN ('pending', 'failed')
+           AND attempts < ?
+           AND COALESCE(last_attempt, created_at) <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)
+         ORDER BY created_at ASC",
+    )
+    .bind(max_attempts)
+    .bind(&grace_modifier)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.iter().map(row_to_webhook_delivery).collect())
 }
 
 /// Get all webhook deliveries for a payment, ordered by created_at descending.
 pub async fn list_webhook_deliveries(pool: &Db, payment_id: &str) -> Result<Vec<WebhookDelivery>> {
     let rows = sqlx::query(
-        "SELECT id, payment_id, url, payload, status, attempts, last_attempt, created_at
+        "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
          FROM webhook_deliveries WHERE payment_id = ? ORDER BY created_at DESC",
     )
     .bind(payment_id)
@@ -514,7 +802,7 @@ pub async fn list_webhook_deliveries(pool: &Db, payment_id: &str) -> Result<Vec<
 /// Get a specific webhook delivery by id.
 pub async fn get_webhook_delivery(pool: &Db, id: &str) -> Result<Option<WebhookDelivery>> {
     let row = sqlx::query(
-        "SELECT id, payment_id, url, payload, status, attempts, last_attempt, created_at
+        "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
          FROM webhook_deliveries WHERE id = ?",
     )
     .bind(id)
@@ -522,6 +810,49 @@ pub async fn get_webhook_delivery(pool: &Db, id: &str) -> Result<Option<WebhookD
     .await?;
 
     Ok(row.as_ref().map(row_to_webhook_delivery))
+}
+
+/// Probe database connectivity. Returns `Ok(())` if the pool can execute a
+/// trivial query, or `Err` if the database is unreachable.
+pub async fn ping(pool: &Db) -> Result<()> {
+    sqlx::query_scalar::<_, i64>("SELECT 1")
+        .fetch_one(pool)
+        .await?;
+    Ok(())
+}
+
+/* ---------------------------------------------------------------------------
+Merchant API-key management
+--------------------------------------------------------------------------- */
+
+/// Hash a raw API key with SHA-256, returning the hex digest.
+/// This is the only representation stored in the database.
+fn hash_api_key(raw: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(raw.as_bytes()))
+}
+
+/// Create a merchant row. Returns the merchant `id` — the raw key must be
+/// shown to the user by the caller and is not recoverable afterward.
+pub async fn create_merchant(pool: &Db, id: &str, raw_key: &str) -> Result<()> {
+    let hash = hash_api_key(raw_key);
+    sqlx::query("INSERT INTO merchants (id, api_key_hash) VALUES (?, ?)")
+        .bind(id)
+        .bind(hash)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Look up a merchant by their raw API key. Returns `None` if the key does
+/// not match any registered merchant.
+pub async fn find_merchant_by_key(pool: &Db, raw_key: &str) -> Result<Option<String>> {
+    let hash = hash_api_key(raw_key);
+    let id: Option<String> = sqlx::query_scalar("SELECT id FROM merchants WHERE api_key_hash = ?")
+        .bind(hash)
+        .fetch_optional(pool)
+        .await?;
+    Ok(id)
 }
 
 #[cfg(test)]
@@ -582,6 +913,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn underpaid_payment_remains_findable_for_topup() {
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("partial", "MEMOP", 3600))
+            .await
+            .unwrap();
+        update_payment_status(&pool, "partial", "underpaid", "TX1", "3")
+            .await
+            .unwrap();
+
+        let found = find_pending_by_memo(&pool, "MEMOP").await.unwrap().unwrap();
+        assert_eq!(found.id, "partial");
+        assert_eq!(found.status, "underpaid");
+        assert_eq!(found.paid_amount.as_deref(), Some("3"));
+    }
+
+    #[tokio::test]
+    async fn overdue_underpaid_payment_expires() {
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("partial-dead", "MEMOX", -10))
+            .await
+            .unwrap();
+        update_payment_status(&pool, "partial-dead", "underpaid", "TX1", "3")
+            .await
+            .unwrap();
+
+        assert!(find_pending_by_memo(&pool, "MEMOX")
+            .await
+            .unwrap()
+            .is_none());
+
+        let expired = expire_overdue(&pool).await.unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].id, "partial-dead");
+        assert_eq!(expired[0].status, "expired");
+    }
+
+    #[tokio::test]
     async fn expire_overdue_transitions_and_is_idempotent() {
         let pool = memory_db().await;
         create_payment(&pool, new_payment("live", "MEMOL", 3600))
@@ -601,9 +969,153 @@ mod tests {
         let fetched = get_payment(&pool, "dead").await.unwrap().unwrap();
         assert_eq!(fetched.status, "expired");
         // The live intent is untouched.
-        assert_eq!(get_payment(&pool, "live").await.unwrap().unwrap().status, "pending");
+        assert_eq!(
+            get_payment(&pool, "live").await.unwrap().unwrap().status,
+            "pending"
+        );
 
         // A second sweep is a no-op — nothing is double-reported.
         assert_eq!(expire_overdue(&pool).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_redrivable_deliveries_excludes_delivered_and_over_cap() {
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("p1", "MEMOR1", 3600))
+            .await
+            .unwrap();
+
+        save_webhook_delivery(
+            &pool,
+            "delivered",
+            "p1",
+            "http://x",
+            "{}",
+            "payment.completed",
+        )
+        .await
+        .unwrap();
+        update_webhook_delivery(&pool, "delivered", "delivered", 1)
+            .await
+            .unwrap();
+
+        save_webhook_delivery(
+            &pool,
+            "over-cap",
+            "p1",
+            "http://x",
+            "{}",
+            "payment.completed",
+        )
+        .await
+        .unwrap();
+        update_webhook_delivery(&pool, "over-cap", "failed", 8)
+            .await
+            .unwrap();
+
+        save_webhook_delivery(
+            &pool,
+            "eligible",
+            "p1",
+            "http://x",
+            "{}",
+            "payment.completed",
+        )
+        .await
+        .unwrap();
+
+        let candidates = list_redrivable_deliveries(&pool, 8, 0).await.unwrap();
+        let ids: Vec<&str> = candidates.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["eligible"],
+            "only the pending row under the attempt cap must be redrivable"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_processed_tx_is_idempotent_and_sums_over_the_set() {
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("p", "MEMOTX", 3600))
+            .await
+            .unwrap();
+
+        // First time a transaction is seen it is recorded and counted.
+        assert!(record_processed_tx(&pool, "p", "TX_A", 40_000_000)
+            .await
+            .unwrap());
+        assert_eq!(sum_processed_stroops(&pool, "p").await.unwrap(), 40_000_000);
+
+        // Re-seeing the same transaction is a no-op — no double credit.
+        assert!(!record_processed_tx(&pool, "p", "TX_A", 40_000_000)
+            .await
+            .unwrap());
+        assert_eq!(sum_processed_stroops(&pool, "p").await.unwrap(), 40_000_000);
+
+        // A distinct transaction adds to the running total.
+        assert!(record_processed_tx(&pool, "p", "TX_B", 30_000_000)
+            .await
+            .unwrap());
+        assert_eq!(sum_processed_stroops(&pool, "p").await.unwrap(), 70_000_000);
+
+        // Re-seeing an *earlier* transaction after a later one is still a no-op,
+        // regardless of order (issue #119).
+        assert!(!record_processed_tx(&pool, "p", "TX_A", 40_000_000)
+            .await
+            .unwrap());
+        assert_eq!(sum_processed_stroops(&pool, "p").await.unwrap(), 70_000_000);
+
+        // Rows are scoped per intent.
+        assert_eq!(sum_processed_stroops(&pool, "other").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn migrate_backfills_processed_transactions_from_legacy_rows() {
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("legacy", "MEMOLEG", 3600))
+            .await
+            .unwrap();
+        // Simulate a pre-#119 underpaid intent: only the latest tx_hash and the
+        // cumulative paid_amount were persisted.
+        update_payment_status(&pool, "legacy", "underpaid", "TX_OLD", "3")
+            .await
+            .unwrap();
+        // The join table is empty until a backfill runs.
+        assert_eq!(sum_processed_stroops(&pool, "legacy").await.unwrap(), 0);
+
+        // A subsequent migrate() (as on the next startup) backfills the ledger.
+        migrate(&pool).await.unwrap();
+        assert_eq!(
+            sum_processed_stroops(&pool, "legacy").await.unwrap(),
+            30_000_000
+        );
+        // And it is idempotent across restarts.
+        migrate(&pool).await.unwrap();
+        assert_eq!(
+            sum_processed_stroops(&pool, "legacy").await.unwrap(),
+            30_000_000
+        );
+    }
+
+    #[tokio::test]
+    async fn list_redrivable_deliveries_respects_grace_window() {
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("p1", "MEMOR2", 3600))
+            .await
+            .unwrap();
+        save_webhook_delivery(&pool, "fresh", "p1", "http://x", "{}", "payment.completed")
+            .await
+            .unwrap();
+
+        // Freshly inserted, so a large grace window makes it ineligible...
+        assert!(list_redrivable_deliveries(&pool, 8, 3600)
+            .await
+            .unwrap()
+            .is_empty());
+        // ...while a zero grace window makes it immediately eligible.
+        assert_eq!(
+            list_redrivable_deliveries(&pool, 8, 0).await.unwrap().len(),
+            1
+        );
     }
 }
