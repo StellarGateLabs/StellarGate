@@ -383,16 +383,30 @@ async fn generate_unique_memo(pool: &db::Db) -> Result<String, AppError> {
 }
 
 fn to_json(p: &db::Payment) -> Value {
+    // Canonicalize amount: parse to stroops and format back to canonical form.
+    // This ensures "10.00", "10.0", and "10" all serialize identically,
+    // eliminating spurious string-based comparisons across responses.
+    let canonical_amount = crate::money::parse_stroops(&p.amount)
+        .map(crate::money::stroops_to_string)
+        .unwrap_or_else(|| p.amount.clone());
+
+    // Canonicalize paid_amount the same way (defensive; it should already be
+    // canonical from horizon.rs, but this ensures consistency across all
+    // serialization paths).
+    let canonical_paid_amount = p.paid_amount.as_ref().and_then(|pa| {
+        crate::money::parse_stroops(pa).map(crate::money::stroops_to_string)
+    });
+
     json!({
         "id": p.id,
         "merchant_id": p.merchant_id,
         "destination_address": p.destination_address,
         "memo": p.memo,
-        "amount": p.amount,
+        "amount": canonical_amount,
         "asset": p.asset,
         "status": p.status,
         "tx_hash": p.tx_hash,
-        "paid_amount": p.paid_amount,
+        "paid_amount": canonical_paid_amount,
         "created_at": p.created_at,
         "updated_at": p.updated_at,
         "expires_at": p.expires_at,

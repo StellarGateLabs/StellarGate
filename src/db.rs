@@ -270,6 +270,14 @@ pub struct NewPayment<'a> {
 }
 
 pub async fn create_payment(pool: &Db, new: NewPayment<'_>) -> Result<Payment> {
+    /* Canonicalize the amount: parse to stroops, then convert back to the
+    canonical string representation. This ensures "10.00", "10.0", and "10"
+    all serialize identically, eliminating spurious string-based comparisons
+    across create/get/webhook responses. */
+    let stroops = crate::money::parse_stroops(new.amount)
+        .ok_or_else(|| anyhow::anyhow!("Invalid amount"))?;
+    let canonical_amount = crate::money::stroops_to_string(stroops);
+
     /* Compute the expiry as `now + ttl_secs` in SQLite so it shares the exact
     clock and RFC 3339 format as created_at. */
     let ttl_modifier = format!("{:+} seconds", new.ttl_secs);
@@ -281,7 +289,7 @@ pub async fn create_payment(pool: &Db, new: NewPayment<'_>) -> Result<Payment> {
     .bind(new.merchant_id)
     .bind(new.destination_address)
     .bind(new.memo)
-    .bind(new.amount)
+    .bind(&canonical_amount)
     .bind(new.asset)
     .bind(new.webhook_url)
     .bind(&ttl_modifier)

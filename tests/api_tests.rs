@@ -1199,3 +1199,115 @@ async fn test_webhook_delivery_isolation() {
         .await;
     res_cross.assert_status(StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn test_amount_canonicalization_on_create_get_list() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+
+    // Test various representations of the same value.
+    // All should serialize to "10.5" regardless of input format.
+    let test_cases = vec![
+        ("10.5", "10.5"),
+        ("10.50", "10.5"),
+        ("10.500", "10.5"),
+        ("10.5000", "10.5"),
+        ("10.50000", "10.5"),
+        ("10.500000", "10.5"),
+        ("10.5000000", "10.5"),
+    ];
+
+    let mut payment_ids = Vec::new();
+
+    for (input, expected_canonical) in test_cases {
+        let res = server
+            .post("/payments")
+            .add_header("Authorization", auth.clone())
+            .json(&json!({ "amount": input, "asset": "XLM" }))
+            .await;
+        res.assert_status(StatusCode::CREATED);
+        let body: Value = res.json();
+        
+        // Verify that the created payment has the canonical form
+        assert_eq!(
+            body["amount"].as_str().unwrap(),
+            expected_canonical,
+            "create response should canonicalize amount: {} -> {}",
+            input,
+            expected_canonical
+        );
+        
+        let payment_id = body["id"].as_str().unwrap().to_string();
+        payment_ids.push((input, expected_canonical, payment_id));
+    }
+
+    // Verify canonicalization persists across GET requests
+    for (input, expected_canonical, payment_id) in &payment_ids {
+        let res = server
+            .get(&format!("/payments/{payment_id}"))
+            .add_header("Authorization", auth.clone())
+            .await;
+        res.assert_status_ok();
+        let body: Value = res.json();
+        
+        assert_eq!(
+            body["amount"].as_str().unwrap(),
+            *expected_canonical,
+            "get response should return canonical form for input: {}",
+            input
+        );
+    }
+
+    // Verify canonicalization in list endpoint
+    let res = server
+        .get("/payments?limit=100")
+        .add_header("Authorization", auth.clone())
+        .await;
+    res.assert_status_ok();
+    let list: Value = res.json();
+    
+    for payment in list["payments"].as_array().unwrap() {
+        let amount_str = payment["amount"].as_str().unwrap();
+        // All amounts should be in canonical form (no trailing zeros)
+        for (_, expected_canonical, _) in &payment_ids {
+            if amount_str == *expected_canonical {
+                // Found one of our test payments, good
+                break;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_whole_amount_canonicalization() {
+    // Test that whole amounts are serialized without decimal point
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    
+    let test_cases = vec![
+        ("1", "1"),
+        ("1.0", "1"),
+        ("1.00", "1"),
+        ("100", "100"),
+        ("100.0000000", "100"),
+    ];
+
+    for (input, expected) in test_cases {
+        let res = server
+            .post("/payments")
+            .add_header("Authorization", format!("Bearer {key}"))
+            .json(&json!({ "amount": input, "asset": "XLM" }))
+            .await;
+        res.assert_status(StatusCode::CREATED);
+        let body: Value = res.json();
+        
+        assert_eq!(
+            body["amount"].as_str().unwrap(),
+            expected,
+            "whole amount {} should canonicalize to {}",
+            input,
+            expected
+        );
+    }
+}

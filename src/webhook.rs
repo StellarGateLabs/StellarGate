@@ -66,18 +66,37 @@ pub(crate) fn current_timestamp() -> i64 {
 /// `delta` carries the absolute difference between the requested and received
 /// amounts, and is included in the payload for `payment.overpaid` (excess to
 /// refund) and `payment.underpaid` (shortfall still owed) events.
+///
+/// Amounts are canonicalized to ensure consistent serialization: "10.00", "10.0",
+/// and "10" all serialize as "10". This handles both new payments (already
+/// canonicalized on write) and any legacy data.
 pub fn build_payload(payment: &db::Payment, event: &str, delta: Option<&str>) -> serde_json::Value {
+    // Canonicalize the requested amount
+    let canonical_amount = crate::money::parse_stroops(&payment.amount)
+        .map(crate::money::stroops_to_string)
+        .unwrap_or_else(|| payment.amount.clone());
+
+    // Canonicalize the received amount
+    let canonical_paid_amount = payment.paid_amount.as_ref().and_then(|pa| {
+        crate::money::parse_stroops(pa).map(crate::money::stroops_to_string)
+    });
+
+    // Canonicalize delta if present (it's a price difference)
+    let canonical_delta = delta.and_then(|d| {
+        crate::money::parse_stroops(d).map(|s| crate::money::stroops_to_string(s))
+    });
+
     let mut payload = json!({
         "event": event,
         "payment_id": payment.id,
         "merchant_id": payment.merchant_id,
         "tx_hash": payment.tx_hash,
-        "amount": payment.amount,
-        "paid_amount": payment.paid_amount,
+        "amount": canonical_amount,
+        "paid_amount": canonical_paid_amount,
         "asset": payment.asset,
         "status": payment.status,
     });
-    if let Some(d) = delta {
+    if let Some(d) = canonical_delta {
         payload["delta"] = json!(d);
     }
     payload
