@@ -188,6 +188,13 @@ impl Config {
             raw_origins
         };
 
+        if network == "public" && cors_allowed_origins.is_empty() {
+            return Err(anyhow::anyhow!(
+                "CORS_ALLOWED_ORIGINS must be set when STELLAR_NETWORK=public. \
+                 Leaving it unset would allow any browser origin to access the public API."
+            ));
+        }
+
         let config = Self {
             port: parse_env("PORT", 3000)?,
             database_url,
@@ -755,6 +762,10 @@ mod tests {
                     "STELLAR_GATEWAY_SECRET",
                     Some("SCZANGBA5RLKJHTBF4RJNRJMZWI4VKTHCRKOVAH7LRZZPZHHZWATAWBN"),
                 ),
+                (
+                    "CORS_ALLOWED_ORIGINS",
+                    Some("https://example.com"),
+                ),
             ],
             || {
                 let cfg = Config::from_env().unwrap();
@@ -762,6 +773,37 @@ mod tests {
                 assert_eq!(
                     cfg.webhook_secret,
                     "a-very-long-and-secure-webhook-signing-secret-32-chars"
+                );
+                assert_eq!(cfg.cors_allowed_origins, vec!["https://example.com"]);
+            },
+        );
+    }
+
+    #[test]
+    fn startup_fails_on_public_without_cors_allowed_origins() {
+        run_with_env(
+            &[
+                ("STELLAR_NETWORK", Some("public")),
+                (
+                    "WEBHOOK_SECRET",
+                    Some("a-very-long-and-secure-webhook-signing-secret-32-chars"),
+                ),
+                ("DATABASE_URL", Some("sqlite::memory:")),
+                (
+                    "STELLAR_GATEWAY_PUBLIC",
+                    Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"),
+                ),
+                (
+                    "STELLAR_GATEWAY_SECRET",
+                    Some("SCZANGBA5RLKJHTBF4RJNRJMZWI4VKTHCRKOVAH7LRZZPZHHZWATAWBN"),
+                ),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("CORS_ALLOWED_ORIGINS must be set") ||
+                    err.contains("CORS_ALLOWED_ORIGINS must be set when STELLAR_NETWORK=public"),
+                    "got: {err}"
                 );
             },
         );
