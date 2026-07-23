@@ -51,7 +51,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
     let request_timeout = Duration::from_secs(state.config.request_timeout_secs);
 
     axum::Router::new()
-        .route("/", get(|| async { "StellarGate API v0.1.0" }))
+        .route("/", get(|| async { concat!("StellarGate API v", env!("CARGO_PKG_VERSION")) }))
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/metrics", get(metrics_handler))
