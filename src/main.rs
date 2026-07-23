@@ -52,6 +52,7 @@ async fn main() -> Result<()> {
         http,
         webhook_http,
         webhook_metrics: WebhookMetrics::new(),
+        task_health: crate::TaskHealth::new(),
     });
 
     if cfg.gateway_configured() {
