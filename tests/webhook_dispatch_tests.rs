@@ -35,6 +35,8 @@ fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
         webhook_redrive_concurrency: 4,
         webhook_redrive_max_attempts: 8,
         webhook_redrive_grace_secs: 60,
+        webhook_redrive_backoff_initial_secs: 0,
+        webhook_redrive_backoff_max_secs: 0,
         poll_interval_secs: 10,
         payment_ttl_secs: 3600,
         cors_allowed_origins: vec![],
@@ -66,6 +68,9 @@ async fn setup_state(cfg: Config) -> AppState {
         http: reqwest::Client::new(),
         webhook_http: reqwest::Client::new(),
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
+        auth_metrics: stellargate::metrics::AuthMetrics::new(),
+        request_metrics: stellargate::metrics::RequestMetrics::new(),
+        settlement_metrics: stellargate::metrics::SettlementMetrics::new(),
         task_health: stellargate::TaskHealth::new(),
     }
 }

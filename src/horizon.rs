@@ -565,6 +565,27 @@ async fn settle(
     }
     info!(payment_id = %payment.id, status, %tx_hash, "payment settled");
 
+    /* Settlement metrics (issue #133). `underpaid` is counted but excluded
+    from the latency histogram since the intent is still open — its eventual
+    top-up to `completed`/`overpaid` will record the real end-to-end latency
+    at that point. */
+    match event {
+        "payment.completed" => {
+            state.settlement_metrics.record_completed();
+            if let Some(secs) = crate::metrics::seconds_since_rfc3339(&payment.created_at) {
+                state.settlement_metrics.record_latency_secs(secs);
+            }
+        }
+        "payment.overpaid" => {
+            state.settlement_metrics.record_overpaid();
+            if let Some(secs) = crate::metrics::seconds_since_rfc3339(&payment.created_at) {
+                state.settlement_metrics.record_latency_secs(secs);
+            }
+        }
+        "payment.underpaid" => state.settlement_metrics.record_underpaid(),
+        _ => {}
+    }
+
     // Reflect the new state in the copy we hand to the webhook.
     let mut settled = payment.clone();
     settled.status = status.to_string();

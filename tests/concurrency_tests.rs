@@ -82,6 +82,8 @@ fn make_state(pool: db::Db, _webhook_url: Option<String>) -> Arc<AppState> {
             webhook_redrive_concurrency: 4,
             webhook_redrive_max_attempts: 8,
             webhook_redrive_grace_secs: 60,
+            webhook_redrive_backoff_initial_secs: 0,
+            webhook_redrive_backoff_max_secs: 0,
             poll_interval_secs: 10,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 10000,
@@ -97,6 +99,9 @@ fn make_state(pool: db::Db, _webhook_url: Option<String>) -> Arc<AppState> {
         http: reqwest::Client::new(),
         webhook_http: reqwest::Client::new(),
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
+        auth_metrics: stellargate::metrics::AuthMetrics::new(),
+        request_metrics: stellargate::metrics::RequestMetrics::new(),
+        settlement_metrics: stellargate::metrics::SettlementMetrics::new(),
         task_health: stellargate::TaskHealth::new(),
     })
 }
@@ -363,4 +368,39 @@ async fn reprocessing_past_transactions_never_double_credits() {
         assert!(!reconcile_payment(&state, tx).await.unwrap());
         assert_state(&pool, &payment_id, "completed", "10").await;
     }
+}
+
+/// A completed settlement must be counted in `SettlementMetrics`, and its
+/// latency histogram must gain an observation — otherwise `/metrics` would
+/// silently under-report throughput (issue #133).
+#[tokio::test]
+async fn settlement_is_recorded_in_metrics() {
+    let pool = memory_pool().await;
+    let payment_id = seed_pending_payment(&pool, None).await;
+    let state = make_state(pool, None);
+    let hp = make_horizon_payment();
+
+    assert_eq!(state.settlement_metrics.completed(), 0);
+    assert_eq!(state.settlement_metrics.latency_count(), 0);
+
+    let settled = reconcile_payment(&state, &hp).await.unwrap();
+    assert!(settled, "an exact payment must settle");
+
+    assert_eq!(
+        state.settlement_metrics.completed(),
+        1,
+        "a completed settlement must be counted"
+    );
+    assert_eq!(
+        state.settlement_metrics.latency_count(),
+        1,
+        "settlement must add one observation to the latency histogram"
+    );
+
+    // Sanity: the id we settled is the one we seeded.
+    let payment = db::get_payment(&state.pool, &payment_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(payment.status, "completed");
 }

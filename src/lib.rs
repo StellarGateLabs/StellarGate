@@ -76,6 +76,17 @@ pub struct AppState {
     /// histogram. Exposed via `GET /metrics` so operators can see delivery
     /// success rate, retry volume, and failure spikes at a glance.
     pub webhook_metrics: metrics::WebhookMetrics,
+    /// Auth middleware outcome counters: success/failure (by reason) counts.
+    /// Exposed via `GET /metrics` so credential-stuffing or misconfigured
+    /// clients are visible without grepping logs.
+    pub auth_metrics: metrics::AuthMetrics,
+    /// HTTP request counters (by method/route/status) and a latency
+    /// histogram. Exposed via `GET /metrics` (issue #133).
+    pub request_metrics: metrics::RequestMetrics,
+    /// Payment settlement outcome counters (completed/overpaid/underpaid/
+    /// expired) and a created-to-settled latency histogram. Exposed via
+    /// `GET /metrics` (issue #133).
+    pub settlement_metrics: metrics::SettlementMetrics,
     /// Background task health: tracks started, stopped, and failed task counts
     /// for monitoring and alerting.
     pub task_health: TaskHealth,

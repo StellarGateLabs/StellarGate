@@ -1,6 +1,6 @@
 use crate::{db, AppState};
 use axum::{
-    extract::{ConnectInfo, Request, State},
+    extract::{ConnectInfo, MatchedPath, Request, State},
     http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tower_http::{
     cors::CorsLayer,
     limit::RequestBodyLimitLayer,
@@ -100,14 +100,30 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             StatusCode::REQUEST_TIMEOUT,
             request_timeout,
         ))
+        // Outermost so it captures the final status (including a 408 from the
+        // timeout layer above) and the full request latency (issue #133).
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            request_metrics_middleware,
+        ))
         .with_state(state)
 }
 
+/// Authenticates via the `Authorization: Bearer <key>` header, injecting
+/// [`AuthenticatedMerchant`] into request extensions on success.
+///
+/// Every outcome is both logged (`source_ip` + `reason`, at a level matched
+/// to severity — failures visible by default, success at `debug` to avoid
+/// flooding logs) and counted in `AuthMetrics` (issue #139), so
+/// credential-stuffing or a misconfigured client shows up in logs/metrics
+/// instead of silently returning 401s.
 async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     mut req: Request,
     next: Next,
 ) -> axum::response::Response {
+    let source_ip = client_ip_key(&req);
+
     let raw_key = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
@@ -118,6 +134,12 @@ async fn auth_middleware(
         .map(str::to_string);
 
     let Some(key) = raw_key else {
+        tracing::warn!(
+            %source_ip,
+            reason = "missing_key",
+            "auth denied: missing or malformed Authorization header"
+        );
+        state.auth_metrics.record_failure_missing_key();
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "missing or invalid Authorization header", "code": "unauthorized" })),
@@ -127,20 +149,34 @@ async fn auth_middleware(
 
     match db::find_merchant_by_key(&state.pool, &key).await {
         Ok(Some(merchant_id)) => {
+            tracing::debug!(%source_ip, %merchant_id, "auth succeeded");
+            state.auth_metrics.record_success();
             req.extensions_mut()
                 .insert(AuthenticatedMerchant(merchant_id));
             next.run(req).await
         }
-        Ok(None) => (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "invalid API key", "code": "unauthorized" })),
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "internal server error", "code": "internal_error" })),
-        )
-            .into_response(),
+        Ok(None) => {
+            tracing::warn!(
+                %source_ip,
+                reason = "invalid_key",
+                "auth denied: API key did not match any merchant"
+            );
+            state.auth_metrics.record_failure_invalid_key();
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "invalid API key", "code": "unauthorized" })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(%source_ip, error = %e, "auth errored: merchant key lookup failed");
+            state.auth_metrics.record_failure_internal_error();
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal server error", "code": "internal_error" })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -193,6 +229,39 @@ async fn provision_merchant(
             "api_key": raw_key,
         })),
     ))
+}
+
+/// Records every request's `(method, matched route, status)` and its
+/// end-to-end latency into `AppState::request_metrics`, exposed via
+/// `GET /metrics` (issue #133).
+///
+/// Uses the route *template* from [`MatchedPath`] rather than the raw path so
+/// `/payments/:id` style routes don't blow up the label cardinality with one
+/// series per id. Requests that matched no route (e.g. a 404 on an arbitrary
+/// path) are counted under the fixed `"unmatched"` route for the same reason.
+async fn request_metrics_middleware(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> axum::response::Response {
+    let method = req.method().to_string();
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "unmatched".to_string());
+
+    let start = Instant::now();
+    let resp = next.run(req).await;
+
+    state
+        .request_metrics
+        .record(&method, &route, resp.status().as_u16());
+    state
+        .request_metrics
+        .record_latency_ms(start.elapsed().as_millis() as u64);
+
+    resp
 }
 
 async fn rate_limit_middleware(
@@ -365,7 +434,12 @@ async fn check_horizon_ready(state: &Arc<AppState>) -> Result<(), String> {
 
 /// `GET /metrics` — Prometheus-compatible plain-text metrics snapshot.
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let body = crate::metrics::render(&state.webhook_metrics);
+    let body = crate::metrics::render(
+        &state.webhook_metrics,
+        &state.auth_metrics,
+        &state.request_metrics,
+        &state.settlement_metrics,
+    );
     (
         StatusCode::OK,
         [(

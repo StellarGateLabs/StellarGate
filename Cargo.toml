@@ -36,10 +36,10 @@ dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+time = { version = "0.3", features = ["parsing"] }
 
 
 [dev-dependencies]
 axum-test = "15"
 tokio = { version = "1", features = ["full"] }
-time = { version = "0.3", features = ["parsing"] }
 wiremock = "0.6.5"
