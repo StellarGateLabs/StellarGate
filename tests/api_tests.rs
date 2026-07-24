@@ -28,6 +28,8 @@ fn make_config() -> Config {
         webhook_redrive_concurrency: 4,
         webhook_redrive_max_attempts: 8,
         webhook_redrive_grace_secs: 60,
+        webhook_redrive_backoff_initial_secs: 0,
+        webhook_redrive_backoff_max_secs: 0,
         poll_interval_secs: 10,
         payment_ttl_secs: 3600,
         /* High enough that these tests never trip the limiter; dedicated
@@ -67,6 +69,7 @@ async fn server_with_config(cfg: Config) -> (TestServer, db::Db) {
         http,
         webhook_http: reqwest::Client::new(),
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
+        auth_metrics: stellargate::metrics::AuthMetrics::new(),
         task_health: stellargate::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
@@ -158,6 +161,45 @@ async fn test_invalid_api_key_returns_401() {
         .json(&json!({ "amount": "10", "asset": "XLM" }))
         .await;
     res.assert_status(StatusCode::UNAUTHORIZED);
+}
+
+/// Auth outcomes must be observable via `/metrics` (issue #139), not just as
+/// a bare 401 with nothing left behind for an operator to alert on.
+#[tokio::test]
+async fn test_auth_outcomes_are_counted_in_metrics() {
+    let server = test_server().await;
+
+    server.get("/payments").await; // missing key
+    server
+        .post("/payments")
+        .add_header("Authorization", "Bearer not-a-real-key")
+        .json(&json!({ "amount": "10", "asset": "XLM" }))
+        .await; // invalid key
+    let key = provision_merchant(&server).await;
+    server
+        .get("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await; // valid key
+
+    let res = server.get("/metrics").await;
+    res.assert_status_ok();
+    let body = res.text();
+    assert!(
+        body.contains("stellargate_auth_attempts_total{outcome=\"success\"} 1"),
+        "got: {body}"
+    );
+    assert!(
+        body.contains(
+            "stellargate_auth_attempts_total{outcome=\"failure\",reason=\"missing_key\"} 1"
+        ),
+        "got: {body}"
+    );
+    assert!(
+        body.contains(
+            "stellargate_auth_attempts_total{outcome=\"failure\",reason=\"invalid_key\"} 1"
+        ),
+        "got: {body}"
+    );
 }
 
 #[tokio::test]
