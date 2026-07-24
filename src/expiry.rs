@@ -25,6 +25,10 @@ pub async fn sweep_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
     let expired = db::expire_overdue(&state.pool).await?;
     for payment in &expired {
         info!(payment_id = %payment.id, "payment intent expired");
+        state.settlement_metrics.record_expired();
+        if let Some(secs) = crate::metrics::seconds_since_rfc3339(&payment.created_at) {
+            state.settlement_metrics.record_latency_secs(secs);
+        }
         webhook::dispatch(state, payment, EXPIRED_EVENT, None).await;
     }
     Ok(expired.len())
@@ -115,6 +119,8 @@ mod tests {
             webhook_http: reqwest::Client::new(),
             webhook_metrics: crate::metrics::WebhookMetrics::new(),
             auth_metrics: crate::metrics::AuthMetrics::new(),
+            request_metrics: crate::metrics::RequestMetrics::new(),
+            settlement_metrics: crate::metrics::SettlementMetrics::new(),
             task_health: crate::TaskHealth::new(),
         }
     }

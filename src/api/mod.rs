@@ -1,6 +1,6 @@
 use crate::{db, AppState};
 use axum::{
-    extract::{ConnectInfo, Request, State},
+    extract::{ConnectInfo, MatchedPath, Request, State},
     http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tower_http::{
     cors::CorsLayer,
     limit::RequestBodyLimitLayer,
@@ -99,6 +99,12 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             request_timeout,
+        ))
+        // Outermost so it captures the final status (including a 408 from the
+        // timeout layer above) and the full request latency (issue #133).
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            request_metrics_middleware,
         ))
         .with_state(state)
 }
@@ -223,6 +229,39 @@ async fn provision_merchant(
             "api_key": raw_key,
         })),
     ))
+}
+
+/// Records every request's `(method, matched route, status)` and its
+/// end-to-end latency into `AppState::request_metrics`, exposed via
+/// `GET /metrics` (issue #133).
+///
+/// Uses the route *template* from [`MatchedPath`] rather than the raw path so
+/// `/payments/:id` style routes don't blow up the label cardinality with one
+/// series per id. Requests that matched no route (e.g. a 404 on an arbitrary
+/// path) are counted under the fixed `"unmatched"` route for the same reason.
+async fn request_metrics_middleware(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> axum::response::Response {
+    let method = req.method().to_string();
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "unmatched".to_string());
+
+    let start = Instant::now();
+    let resp = next.run(req).await;
+
+    state
+        .request_metrics
+        .record(&method, &route, resp.status().as_u16());
+    state
+        .request_metrics
+        .record_latency_ms(start.elapsed().as_millis() as u64);
+
+    resp
 }
 
 async fn rate_limit_middleware(
@@ -395,7 +434,12 @@ async fn check_horizon_ready(state: &Arc<AppState>) -> Result<(), String> {
 
 /// `GET /metrics` — Prometheus-compatible plain-text metrics snapshot.
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let body = crate::metrics::render(&state.webhook_metrics, &state.auth_metrics);
+    let body = crate::metrics::render(
+        &state.webhook_metrics,
+        &state.auth_metrics,
+        &state.request_metrics,
+        &state.settlement_metrics,
+    );
     (
         StatusCode::OK,
         [(

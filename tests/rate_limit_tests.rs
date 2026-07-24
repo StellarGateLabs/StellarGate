@@ -67,6 +67,8 @@ async fn server_with_config(cfg: Config) -> (TestServer, db::Db) {
         webhook_http: reqwest::Client::new(),
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
+        request_metrics: stellargate::metrics::RequestMetrics::new(),
+        settlement_metrics: stellargate::metrics::SettlementMetrics::new(),
         task_health: stellargate::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();

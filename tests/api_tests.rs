@@ -70,6 +70,8 @@ async fn server_with_config(cfg: Config) -> (TestServer, db::Db) {
         webhook_http: reqwest::Client::new(),
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
+        request_metrics: stellargate::metrics::RequestMetrics::new(),
+        settlement_metrics: stellargate::metrics::SettlementMetrics::new(),
         task_health: stellargate::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
@@ -198,6 +200,55 @@ async fn test_auth_outcomes_are_counted_in_metrics() {
         body.contains(
             "stellargate_auth_attempts_total{outcome=\"failure\",reason=\"invalid_key\"} 1"
         ),
+        "got: {body}"
+    );
+}
+
+/// HTTP requests must be counted by matched route template (not raw path),
+/// so `/payments/:id`-style requests don't blow up label cardinality, and
+/// the response status must be reflected too (issue #133).
+#[tokio::test]
+async fn test_http_requests_are_counted_by_matched_route_in_metrics() {
+    let server = test_server().await;
+
+    server.get("/health").await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "10", "asset": "XLM" }))
+        .await;
+    let payment_id = res.json::<Value>()["id"].as_str().unwrap().to_string();
+
+    // A real id (200) and a made-up one (404) both hit GET /payments/:id — the
+    // route label must be the template, not either literal id.
+    server
+        .get(&format!("/payments/{payment_id}"))
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    server.get("/payments/some-other-id").await;
+
+    let res = server.get("/metrics").await;
+    res.assert_status_ok();
+    let body = res.text();
+    assert!(
+        body.contains("stellargate_http_requests_total{method=\"GET\",route=\"/health\",status=\"200\"} 1"),
+        "got: {body}"
+    );
+    assert!(
+        body.contains(
+            "stellargate_http_requests_total{method=\"GET\",route=\"/payments/:id\",status=\"200\"} 1"
+        ),
+        "route label must be the matched-path template, not the literal id; got: {body}"
+    );
+    assert!(
+        body.contains(
+            "stellargate_http_requests_total{method=\"GET\",route=\"/payments/:id\",status=\"404\"} 1"
+        ),
+        "got: {body}"
+    );
+    assert!(
+        body.contains("stellargate_http_request_duration_ms_count"),
         "got: {body}"
     );
 }
