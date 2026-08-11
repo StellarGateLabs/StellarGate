@@ -41,7 +41,7 @@ time = { version = "0.3", features = ["parsing"] }
 
 
 [dev-dependencies]
-axum-test = "15"
+axum-test = "20"
 tokio = { version = "1", features = ["full"] }
 time = { version = "0.3", features = ["parsing"] }
 wiremock = "0.6.5"
