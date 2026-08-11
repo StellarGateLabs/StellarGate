@@ -1,5 +1,5 @@
 # ── Stage 1: dependency cache via cargo-chef ─────────────────────────────────
-FROM rust:1.88-bookworm AS chef
+FROM rust:1.96-bookworm AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 
