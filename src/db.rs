@@ -23,7 +23,11 @@ fn normalize_ts(raw: &str) -> String {
     s.to_string()
 }
 
-pub async fn migrate(pool: &Db) -> Result<()> {
+/// DEPRECATED: Old migration system using IF NOT EXISTS and pragma_table_info probes.
+/// This is kept temporarily for reference but should not be called.
+/// Use migrate() (below) which uses sqlx::migrate! instead.
+#[allow(dead_code)]
+async fn migrate_old(pool: &Db) -> Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS payments (
             id TEXT PRIMARY KEY,
@@ -268,6 +272,56 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             col = tbl_col.1
         );
         sqlx::query(&sql).execute(pool).await?;
+    }
+
+    Ok(())
+}
+
+/// Run database migrations using sqlx::migrate!.
+///
+/// Migrations are in `migrations/*.sql` and tracked in the `_sqlx_migrations`
+/// table. Each migration runs exactly once; sqlx records which have been applied
+/// so they are never re-run, enabling non-idempotent schema changes.
+///
+/// For the transition period, this also calls backfill_processed_transactions()
+/// to handle legacy data that exists before the migration system was adopted.
+pub async fn migrate(pool: &Db) -> Result<()> {
+    sqlx::migrate!("./migrations").run(pool).await?;
+
+    // Transition period: backfill processed_transactions for existing deployments.
+    // This preserves the received-amount ledger for in-flight intents.
+    // Once all deployments are on the new schema, this can be removed.
+    backfill_processed_transactions(pool).await?;
+
+    Ok(())
+}
+
+/// Backfill processed_transactions from legacy payments.tx_hash + paid_amount.
+/// Idempotent via ON CONFLICT; safe to run multiple times during transition.
+async fn backfill_processed_transactions(pool: &Db) -> Result<()> {
+    let legacy = sqlx::query(
+        "SELECT id, tx_hash, paid_amount FROM payments
+         WHERE tx_hash IS NOT NULL AND tx_hash <> '' AND paid_amount IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    for row in &legacy {
+        let id: String = row.get("id");
+        let tx_hash: String = row.get("tx_hash");
+        let paid_amount: String = row.get("paid_amount");
+        if let Some(stroops) = crate::money::parse_stroops(&paid_amount) {
+            sqlx::query(
+                "INSERT INTO processed_transactions (payment_id, tx_hash, amount_stroops)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(payment_id, tx_hash) DO NOTHING",
+            )
+            .bind(&id)
+            .bind(&tx_hash)
+            .bind(stroops)
+            .execute(pool)
+            .await?;
+        }
     }
 
     Ok(())
