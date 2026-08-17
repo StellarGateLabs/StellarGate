@@ -41,7 +41,7 @@ time = { version = "0.3", features = ["parsing"] }
 # API key generation. Uses the OS CSPRNG — a UUIDv4 is random but only carries
 # 122 bits and encodes a version/variant, so it is the wrong primitive for a
 # bearer credential.
-rand = "0.9"
+rand = "0.10"
 
 
 [dev-dependencies]
