@@ -5,17 +5,15 @@
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use stellargate::{
     config::{AcceptedAsset, Config, ListenerMode},
-    db,
-    horizon::{self, HorizonPayment, TransactionRef},
-    webhook, AppState,
+    db, horizon, webhook, AppState,
 };
 use tokio::sync::watch;
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 fn make_config() -> Config {
