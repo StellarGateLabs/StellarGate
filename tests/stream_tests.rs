@@ -184,7 +184,7 @@ async fn stream_reassembles_split_multibyte_character() {
     let mut cfg = make_config();
     cfg.horizon_url = server.uri();
     let state = Arc::new(setup_state(cfg).await);
-    
+
     // Create a payment with a memo containing multibyte UTF-8 (emoji)
     let memo_with_emoji = "MEMO🚀TEST";
     db::create_payment(
@@ -276,7 +276,12 @@ async fn stream_ignores_greeting_and_keepalives() {
          : keep-alive\n\n\
          {}\
          : another keep-alive\n\n",
-        sse_payment_event("555", "10.0000000", "STREAMMEMO", &state.config.gateway_public)
+        sse_payment_event(
+            "555",
+            "10.0000000",
+            "STREAMMEMO",
+            &state.config.gateway_public
+        )
     );
 
     Mock::given(method("GET"))
@@ -366,7 +371,7 @@ async fn stream_reconnects_with_last_cursor() {
         )))
         .respond_with(move |req: &Request| {
             let n = conn_count_clone.fetch_add(1, Ordering::SeqCst);
-            
+
             // Capture the cursor parameter
             let cursor_param = req
                 .url
@@ -374,7 +379,7 @@ async fn stream_reconnects_with_last_cursor() {
                 .find(|(k, _)| k == "cursor")
                 .map(|(_, v)| v.to_string())
                 .unwrap_or_else(|| "now".to_string());
-            
+
             let cursor_clone_inner = cursor_clone.clone();
             tokio::spawn(async move {
                 let mut guard = cursor_clone_inner.lock().await;
@@ -424,7 +429,10 @@ async fn stream_reconnects_with_last_cursor() {
     assert_eq!(final_cursor, "100", "reconnect must use last-seen cursor");
 
     // Both payments should be settled
-    let first = db::get_payment(&state.pool, "pay_first").await.unwrap().unwrap();
+    let first = db::get_payment(&state.pool, "pay_first")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(first.status, "completed");
 }
 
@@ -572,7 +580,7 @@ async fn stream_backoff_behavior() {
         .respond_with(move |_req: &Request| {
             let n = conn_count_clone.fetch_add(1, Ordering::SeqCst);
             let ts_clone = timestamps_clone.clone();
-            
+
             tokio::spawn(async move {
                 let mut guard = ts_clone.lock().await;
                 guard.push(std::time::Instant::now());
