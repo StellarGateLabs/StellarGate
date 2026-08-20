@@ -67,6 +67,8 @@ struct TaskHealthInner {
     /// Unix seconds of the last successful poll cycle or stream event; `0`
     /// means never. Drives `/ready`'s cursor-freshness check (issue #315).
     last_success_unix: AtomicI64,
+    /// Whether the gateway account exists on the ledger.
+    gateway_account_exists: std::sync::atomic::AtomicBool,
 }
 
 impl Default for TaskHealthInner {
@@ -81,6 +83,7 @@ impl Default for TaskHealthInner {
             disabled: Mutex::new(HashMap::new()),
             required: Mutex::new(Vec::new()),
             last_success_unix: AtomicI64::new(0),
+            gateway_account_exists: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }

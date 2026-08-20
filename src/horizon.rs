@@ -131,6 +131,8 @@ pub struct AccountBalance {
     pub asset_code: Option<String>,
     #[serde(default)]
     pub asset_issuer: Option<String>,
+    #[serde(default)]
+    pub balance: Option<String>,
 }
 
 /// The outcome of matching a Horizon payment against a pending intent.
@@ -382,44 +384,84 @@ pub fn missing_trustlines<'a>(
         .collect()
 }
 
-/// At startup, check that the gateway account holds a trustline for every
-/// accepted non-native asset, and warn about any that are missing.
+/// At startup, and periodically, check that the gateway account exists and
+/// holds a trustline for every accepted non-native asset.
 ///
-/// An accepted asset without a trustline mints unpayable intents: the gateway
-/// advertises (say) USDC, a customer pays, and the payment bounces on-chain
-/// because the account cannot receive it. Surfacing this at boot turns a silent
-/// runtime failure into an actionable startup warning.
+/// An accepted asset without a trustline mints unpayable intents. Surfacing
+/// this turns a silent runtime failure into an actionable warning.
 ///
-/// Best-effort by design: a Horizon error (unreachable, account not yet funded)
-/// is returned to the caller to log, but must not abort boot — the account may
-/// be provisioned shortly after start. Returns the list of accepted asset codes
-/// that are missing a trustline (empty when all are present).
-pub async fn check_trustlines(state: &Arc<AppState>) -> anyhow::Result<Vec<String>> {
+/// If the account does not exist (404), it may be optionally configured to abort
+/// boot. Otherwise it logs an error. Account existence is recorded in the task health
+/// metrics. Native XLM balance is logged so an under-reserved account is visible.
+pub async fn verify_gateway_account(state: &Arc<AppState>) -> anyhow::Result<()> {
     let url = format!(
         "{}/accounts/{}",
         state.config.horizon_url.trim_end_matches('/'),
         state.config.gateway_public,
     );
-    let account: AccountResponse = state
+    let resp = state
         .http
         .get(&url)
         .header("Accept", "application/json")
         .send()
-        .await?
-        .error_for_status()?
-        .json()
         .await?;
 
-    let missing = missing_trustlines(&state.config.accepted_assets, &account.balances);
-    for asset in &missing {
-        warn!(
-            asset = %asset.code,
-            issuer = %asset.issuer.as_deref().unwrap_or(""),
-            "gateway account has no trustline for an accepted asset; intents in \
-             this asset will be unpayable until a trustline is established"
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        state.task_health.set_gateway_account_exists(false);
+        let msg = format!(
+            "STELLAR_GATEWAY_PUBLIC ({}) does not exist on the ledger. It cannot receive payments.",
+            state.config.gateway_public
         );
+        if state.config.require_gateway_account {
+            return Err(anyhow::anyhow!(msg));
+        } else {
+            tracing::error!("{}", msg);
+            return Ok(());
+        }
     }
-    Ok(missing.iter().map(|a| a.code.clone()).collect())
+
+    let resp = resp.error_for_status().map_err(|e| {
+        anyhow::anyhow!(
+            "HTTP status client error ({}): could not verify gateway trustlines",
+            e.status()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        )
+    })?;
+
+    state.task_health.set_gateway_account_exists(true);
+    let account: AccountResponse = resp.json().await?;
+
+    // Log the native XLM balance.
+    if let Some(native_balance) = account.balances.iter().find(|b| b.asset_type.as_deref() == Some("native")) {
+        if let Some(amt) = &native_balance.balance {
+            info!(
+                balance = %amt,
+                account = %state.config.gateway_public,
+                "gateway account native XLM balance"
+            );
+        }
+    }
+
+    let missing = missing_trustlines(&state.config.accepted_assets, &account.balances);
+    if missing.is_empty() {
+        info!("gateway trustlines verified for all accepted assets");
+    } else {
+        let missing_codes: Vec<_> = missing.iter().map(|a| a.code.clone()).collect();
+        info!(
+            missing = ?missing_codes,
+            "accepted assets with no trustline on the gateway account"
+        );
+        for asset in &missing {
+            warn!(
+                asset = %asset.code,
+                issuer = %asset.issuer.as_deref().unwrap_or(""),
+                "gateway account has no trustline for an accepted asset; intents in \
+                 this asset will be unpayable until a trustline is established"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// How many pages [`starting_cursor`] will walk backward, at most, while
@@ -847,6 +889,11 @@ pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool
                 info!("Horizon poller shutting down");
                 return TaskExit::ShutdownRequested;
             }
+        }
+        
+        // Re-check account existence and trustlines periodically.
+        if let Err(e) = verify_gateway_account(&state).await {
+            warn!(error = %e, "failed to verify gateway account during polling");
         }
 
         match poll_once(&state).await {
