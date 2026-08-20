@@ -1047,6 +1047,40 @@ fn warn_missing_connect_info_once() {
     });
 }
 
+/// The HTTP methods the strict CORS layer permits from a browser.
+///
+/// This is the complete set any mounted route responds to — `GET`, `POST`, and
+/// `DELETE` (`DELETE /merchants/:id/keys/:key_id`, key revocation) — plus
+/// `OPTIONS` for the preflight itself. `DELETE` was previously absent, so key
+/// revocation failed preflight in every browser on a strict deployment (#281).
+///
+/// `tests/cors_tests.rs` checks this against the live router: the methods the
+/// router's routes use must be exactly the non-`OPTIONS` methods here, so
+/// dropping one — or adding a route whose method is missing here — fails CI.
+const CORS_ALLOWED_METHODS: [Method; 4] =
+    [Method::GET, Method::POST, Method::DELETE, Method::OPTIONS];
+
+/// Request headers a browser may send. `content-type`/`authorization` cover a
+/// JSON body and bearer auth; `idempotency-key` (safe retry of `POST /payments`)
+/// and `x-admin-secret` (admin routes) are read by specific handlers and must
+/// clear preflight too — without them, idempotent creation and all merchant/key
+/// provisioning were unreachable from a browser on a strict deployment (#281).
+///
+/// Header names must be lowercase: `HeaderName::from_static` panics otherwise.
+const CORS_ALLOWED_REQUEST_HEADERS: [&str; 4] = [
+    "content-type",
+    "authorization",
+    "idempotency-key",
+    "x-admin-secret",
+];
+
+/// Response headers a browser client is allowed to *read*. Without these on
+/// `Access-Control-Expose-Headers` a browser can see the status but not the
+/// header value. `x-request-id` is for support correlation; `deprecation`/`link`
+/// are how a legacy (unprefixed) response advertises its `/v1` successor, which
+/// exists specifically so a client can discover the move (#281).
+const CORS_EXPOSED_HEADERS: [&str; 3] = ["x-request-id", "deprecation", "link"];
+
 fn build_cors(cfg: &crate::config::Config) -> CorsLayer {
     use axum::http::HeaderName;
     use tower_http::cors::AllowOrigin;
