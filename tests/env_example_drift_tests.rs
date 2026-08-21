@@ -9,13 +9,9 @@ fn is_env_key(candidate: &str) -> bool {
         .chars()
         .next()
         .is_some_and(|first| first.is_ascii_uppercase())
-        && candidate
-            .chars()
-            .all(|character| {
-                character.is_ascii_uppercase()
-                    || character.is_ascii_digit()
-                    || character == '_'
-            })
+        && candidate.chars().all(|character| {
+            character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_'
+        })
 }
 
 fn config_env_keys() -> BTreeSet<String> {
