@@ -60,7 +60,11 @@ async fn memory_pool() -> db::Db {
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .min_connections(1)
-        .connect_with(SqliteConnectOptions::from_str(&dsn).unwrap())
+        .connect_with(
+            SqliteConnectOptions::from_str(&dsn)
+                .unwrap()
+                .foreign_keys(true),
+        )
         .await
         .unwrap();
     db::migrate(&pool).await.unwrap();

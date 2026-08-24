@@ -87,7 +87,11 @@ async fn setup_state(cfg: Config) -> AppState {
         // A shared-cache in-memory database is dropped once its last
         // connection closes — keep exactly one open for the pool's lifetime.
         .min_connections(1)
-        .connect_with(SqliteConnectOptions::from_str(&cfg.database_url).unwrap())
+        .connect_with(
+            SqliteConnectOptions::from_str(&cfg.database_url)
+                .unwrap()
+                .foreign_keys(true),
+        )
         .await
         .unwrap();
     db::migrate(&pool).await.unwrap();

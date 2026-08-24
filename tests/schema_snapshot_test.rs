@@ -28,7 +28,11 @@ const SNAPSHOT: &str = include_str!("schema_snapshot.sql");
 /// than another hand-maintained copy that can itself drift.
 async fn current_schema_statements() -> Vec<String> {
     let pool = SqlitePoolOptions::new()
-        .connect_with(SqliteConnectOptions::from_str("sqlite::memory:").unwrap())
+        .connect_with(
+            SqliteConnectOptions::from_str("sqlite::memory:")
+                .unwrap()
+                .foreign_keys(true),
+        )
         .await
         .unwrap();
     db::migrate(&pool).await.unwrap();

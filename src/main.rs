@@ -206,6 +206,7 @@ async fn open_pool(cfg: &Config) -> Result<db::Db> {
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(Duration::from_millis(cfg.db_busy_timeout_ms))
+        .foreign_keys(true)
         .pragma("wal_autocheckpoint", "1000")
         .pragma("journal_size_limit", "67108864");
 

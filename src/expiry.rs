@@ -127,7 +127,8 @@ mod tests {
             .connect_with(
                 SqliteConnectOptions::from_str(&cfg.database_url)
                     .unwrap()
-                    .create_if_missing(true),
+                    .create_if_missing(true)
+                    .foreign_keys(true),
             )
             .await
             .unwrap();

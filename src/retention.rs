@@ -146,7 +146,6 @@ where
 mod tests {
     use super::*;
     use crate::config::{AcceptedAsset, Config, ListenerMode};
-    use sqlx::sqlite::SqlitePoolOptions;
 
     fn test_config(delivery_days: i64, idempotency_days: i64) -> Config {
         Config {
@@ -202,12 +201,35 @@ mod tests {
     }
 
     async fn state_with(cfg: Config) -> Arc<AppState> {
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use std::str::FromStr;
+
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect("sqlite::memory:")
+            .connect_with(
+                SqliteConnectOptions::from_str("sqlite::memory:")
+                    .unwrap()
+                    .foreign_keys(true),
+            )
             .await
             .unwrap();
         db::migrate(&pool).await.unwrap();
+        db::create_payment(
+            &pool,
+            db::NewPayment {
+                id: "p",
+                merchant_id: "anonymous",
+                destination_address: "GDEST",
+                memo: "MEMO_P",
+                amount: "10",
+                asset: "XLM",
+                asset_issuer: None,
+                webhook_url: None,
+                ttl_secs: 3600,
+            },
+        )
+        .await
+        .unwrap();
         Arc::new(AppState {
             pool,
             config: cfg,

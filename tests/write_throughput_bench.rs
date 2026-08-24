@@ -48,7 +48,8 @@ async fn measures_sustained_payment_creation_throughput() {
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(Duration::from_millis(5000));
+        .busy_timeout(Duration::from_millis(5000))
+        .foreign_keys(true);
     let pool = SqlitePoolOptions::new()
         .max_connections(10) // DB_POOL_MAX_CONNECTIONS default
         .connect_with(opts)

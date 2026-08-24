@@ -30,7 +30,11 @@ async fn shared_cache_dsn_is_genuinely_shared_across_pooled_connections() {
     let pool = SqlitePoolOptions::new()
         .max_connections(2)
         .min_connections(1)
-        .connect_with(SqliteConnectOptions::from_str(&dsn).unwrap())
+        .connect_with(
+            SqliteConnectOptions::from_str(&dsn)
+                .unwrap()
+                .foreign_keys(true),
+        )
         .await
         .unwrap();
     db::migrate(&pool).await.unwrap();

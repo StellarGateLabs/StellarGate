@@ -12,17 +12,30 @@ const MIGRATION_KEY_PREFIX: &str = "migration:";
 /// database. Backed by `kv_state` as a cheap interim guard until a proper
 /// schema-version table exists — a full-table backfill or scan gated behind
 /// this runs at most once per database instead of on every boot.
-async fn migration_applied(pool: &Db, name: &str) -> Result<bool> {
-    Ok(get_state(pool, &format!("{MIGRATION_KEY_PREFIX}{name}"))
-        .await?
-        .as_deref()
-        == Some("done"))
+async fn migration_applied(conn: &mut sqlx::SqliteConnection, name: &str) -> Result<bool> {
+    let key = format!("{MIGRATION_KEY_PREFIX}{name}");
+    let val: Option<String> = sqlx::query_scalar("SELECT value FROM kv_state WHERE key = ?")
+        .bind(&key)
+        .fetch_optional(conn)
+        .await?;
+    Ok(val.as_deref() == Some("done"))
 }
 
 /// Record that the one-time migration `name` has completed, so future calls
 /// to [`migrate`] skip it.
-async fn mark_migration_applied(pool: &Db, name: &str) -> Result<()> {
-    set_state(pool, &format!("{MIGRATION_KEY_PREFIX}{name}"), "done").await
+async fn mark_migration_applied(conn: &mut sqlx::SqliteConnection, name: &str) -> Result<()> {
+    let key = format!("{MIGRATION_KEY_PREFIX}{name}");
+    sqlx::query(
+        "INSERT INTO kv_state (key, value, updated_at)
+         VALUES (?, 'done', strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = excluded.updated_at",
+    )
+    .bind(&key)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 /// Normalize a raw SQLite timestamp to strict RFC 3339 UTC with a Z suffix.
@@ -65,11 +78,79 @@ fn normalize_ts(raw: &str) -> String {
 /// already on disk — the startup normalisation below is what repairs those.
 const TS_PATTERN: &str = "____-__-__T__:__:__Z";
 
+async fn rebuild_table_with_fk(
+    conn: &mut sqlx::SqliteConnection,
+    table_name: &str,
+    create_sql: &str,
+) -> Result<()> {
+    let old_table = format!("{table_name}_old_fk_migration");
+    sqlx::query(&format!("DROP TABLE IF EXISTS {old_table}")).execute(&mut *conn).await?;
+    sqlx::query(&format!("ALTER TABLE {table_name} RENAME TO {old_table}")).execute(&mut *conn).await?;
+    sqlx::query(create_sql).execute(&mut *conn).await?;
+
+    let cols: Vec<(String,)> = sqlx::query_as(&format!(
+        "SELECT name FROM pragma_table_info('{old_table}')"
+    ))
+    .fetch_all(&mut *conn)
+    .await?;
+    let col_names = cols.into_iter().map(|(c,)| c).collect::<Vec<_>>().join(", ");
+
+    if !col_names.is_empty() {
+        sqlx::query(&format!(
+            "INSERT INTO {table_name} ({col_names}) SELECT {col_names} FROM {old_table}"
+        ))
+        .execute(&mut *conn)
+        .await?;
+    }
+
+    sqlx::query(&format!("DROP TABLE {old_table}")).execute(&mut *conn).await?;
+    Ok(())
+}
+
 pub async fn migrate(pool: &Db) -> Result<()> {
+    let mut conn = pool.acquire().await?;
+    sqlx::query("PRAGMA foreign_keys = OFF").execute(&mut *conn).await?;
+
+    /* Merchants are provisioned via POST /merchants. The raw API key is never
+    stored; only its SHA-256 hex digest is persisted so a DB breach does not
+    expose live credentials. */
+    sqlx::query(&format!(
+        "CREATE TABLE IF NOT EXISTS merchants (
+            id TEXT PRIMARY KEY,
+            api_key_hash TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                CHECK (created_at LIKE '{TS_PATTERN}')
+        )",
+    ))
+    .execute(&mut *conn)
+    .await?;
+
+    /* Per-merchant rate-limit override (issue: rate limiter keyed on IP, not
+    identity). NULL means "use the configured default"; a merchant only gets
+    a row value once an operator sets one explicitly. */
+    let has_rate_limit_per_sec: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('merchants') WHERE name = 'rate_limit_per_sec'",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if has_rate_limit_per_sec == 0 {
+        sqlx::query("ALTER TABLE merchants ADD COLUMN rate_limit_per_sec INTEGER")
+            .execute(&mut *conn)
+            .await?;
+    }
+
+    /* Seed default 'anonymous' merchant so unauthenticated/default payment intents
+    satisfy referential integrity. */
+    sqlx::query(
+        "INSERT OR IGNORE INTO merchants (id, api_key_hash) VALUES ('anonymous', '')",
+    )
+    .execute(&mut *conn)
+    .await?;
+
     sqlx::query(&format!(
         "CREATE TABLE IF NOT EXISTS payments (
             id TEXT PRIMARY KEY,
-            merchant_id TEXT NOT NULL DEFAULT 'anonymous',
+            merchant_id TEXT NOT NULL DEFAULT 'anonymous' REFERENCES merchants(id) ON DELETE CASCADE,
             destination_address TEXT NOT NULL,
             memo TEXT NOT NULL UNIQUE,
             amount TEXT NOT NULL,
@@ -87,7 +168,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
                 CHECK (expires_at LIKE '{TS_PATTERN}')
         )",
     ))
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     /* Bring pre-existing payment tables up to schema. New databases already have
@@ -97,11 +178,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     let has_expires_at: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('payments') WHERE name = 'expires_at'",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     if has_expires_at == 0 {
         sqlx::query("ALTER TABLE payments ADD COLUMN expires_at TEXT")
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
     }
     /* Backfill any row without an expiry (legacy rows, or rows inserted in the
@@ -112,7 +193,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', created_at, '+1 hour')
           WHERE expires_at IS NULL",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     /* Pin each intent to the issuer it was priced in. Rows written before this
@@ -121,36 +202,36 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     let has_asset_issuer: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('payments') WHERE name = 'asset_issuer'",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     if has_asset_issuer == 0 {
         sqlx::query("ALTER TABLE payments ADD COLUMN asset_issuer TEXT")
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
     }
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_memo ON payments(memo)")
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)")
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_payments_created_id ON payments(created_at DESC, id DESC)",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_payments_status_expires_at ON payments(status, expires_at)
          WHERE status IN ('pending', 'underpaid')",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     sqlx::query(&format!(
         "CREATE TABLE IF NOT EXISTS webhook_deliveries (
             id TEXT PRIMARY KEY,
-            payment_id TEXT NOT NULL,
+            payment_id TEXT NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
             url TEXT NOT NULL,
             payload TEXT NOT NULL,
             event_type TEXT,
@@ -163,7 +244,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
                 CHECK (created_at LIKE '{TS_PATTERN}')
         )",
     ))
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     /* Bring pre-existing delivery tables up to schema. `event_type` records
@@ -174,11 +255,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     let has_event_type: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'event_type'",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     if has_event_type == 0 {
         sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN event_type TEXT")
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
     }
 
@@ -191,11 +272,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     let has_acknowledged_at: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'acknowledged_at'",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     if has_acknowledged_at == 0 {
         sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN acknowledged_at TEXT")
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
     }
 
@@ -205,13 +286,13 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     let has_manual_attempts: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'manual_attempts'",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     if has_manual_attempts == 0 {
         sqlx::query(
             "ALTER TABLE webhook_deliveries ADD COLUMN manual_attempts INTEGER NOT NULL DEFAULT 0",
         )
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     }
 
@@ -225,36 +306,8 @@ pub async fn migrate(pool: &Db) -> Result<()> {
                 CHECK (updated_at LIKE '{TS_PATTERN}')
         )",
     ))
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
-
-    /* Merchants are provisioned via POST /merchants. The raw API key is never
-    stored; only its SHA-256 hex digest is persisted so a DB breach does not
-    expose live credentials. */
-    sqlx::query(&format!(
-        "CREATE TABLE IF NOT EXISTS merchants (
-            id TEXT PRIMARY KEY,
-            api_key_hash TEXT NOT NULL UNIQUE,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-                CHECK (created_at LIKE '{TS_PATTERN}')
-        )",
-    ))
-    .execute(pool)
-    .await?;
-
-    /* Per-merchant rate-limit override (issue: rate limiter keyed on IP, not
-    identity). NULL means "use the configured default"; a merchant only gets
-    a row value once an operator sets one explicitly. */
-    let has_rate_limit_per_sec: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM pragma_table_info('merchants') WHERE name = 'rate_limit_per_sec'",
-    )
-    .fetch_one(pool)
-    .await?;
-    if has_rate_limit_per_sec == 0 {
-        sqlx::query("ALTER TABLE merchants ADD COLUMN rate_limit_per_sec INTEGER")
-            .execute(pool)
-            .await?;
-    }
 
     /* API keys, one row per credential rather than one per merchant, so a key
     can be rotated (issue a second, revoke the first) and revoked individually
@@ -267,7 +320,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     sqlx::query(&format!(
         "CREATE TABLE IF NOT EXISTS api_keys (
             id TEXT PRIMARY KEY,
-            merchant_id TEXT NOT NULL,
+            merchant_id TEXT NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
             key_hash TEXT NOT NULL UNIQUE,
             prefix TEXT NOT NULL,
             label TEXT,
@@ -277,16 +330,16 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             revoked_at TEXT CHECK (revoked_at IS NULL OR revoked_at LIKE '{TS_PATTERN}')
         )",
     ))
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     /* Authentication looks a key up by hash on every request, so this index is
     load-bearing rather than an optimisation. */
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash)")
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_merchant ON api_keys(merchant_id)")
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
 
     /* Carry pre-existing single-key merchants across. Their raw key is not
@@ -299,7 +352,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
            FROM merchants
           WHERE api_key_hash IS NOT NULL AND api_key_hash <> ''",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     /* `webhook_deliveries` is queried by payment_id on every delivery listing
@@ -308,7 +361,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_payment
          ON webhook_deliveries(payment_id)",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     /* Idempotency keys for payment creation. A key is unique per merchant and
@@ -319,13 +372,13 @@ pub async fn migrate(pool: &Db) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS idempotency_keys (
             merchant_id TEXT NOT NULL,
             idempotency_key TEXT NOT NULL,
-            payment_id TEXT NOT NULL,
+            payment_id TEXT NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
                 CHECK (created_at LIKE '{TS_PATTERN}'),
             PRIMARY KEY (merchant_id, idempotency_key)
         )",
     ))
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     /* Every on-chain transaction we credit to an intent, one row per
@@ -336,7 +389,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     integer stroop value so SUM is exact. */
     sqlx::query(&format!(
         "CREATE TABLE IF NOT EXISTS processed_transactions (
-            payment_id TEXT NOT NULL,
+            payment_id TEXT NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
             tx_hash TEXT NOT NULL,
             amount_stroops INTEGER NOT NULL,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
@@ -344,56 +397,8 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             PRIMARY KEY (payment_id, tx_hash)
         )",
     ))
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
-
-    /* Backfill from legacy rows that recorded only the most-recent `tx_hash`
-    and a cumulative `paid_amount`, so upgrading preserves the received-amount
-    ledger for intents that are still in flight. This is a one-time upgrade
-    step: it only needs to run once per database, so it is gated behind a
-    `kv_state` flag rather than re-scanning the full `payments` table (and
-    re-issuing one INSERT per matching row) on every boot (issue #266).
-    Startup cost would otherwise grow, forever, with lifetime payment volume. */
-    const BACKFILL_PROCESSED_TRANSACTIONS: &str = "backfill_processed_transactions";
-    if migration_applied(pool, BACKFILL_PROCESSED_TRANSACTIONS).await? {
-        info!(
-            migration = BACKFILL_PROCESSED_TRANSACTIONS,
-            "migration skipped (already applied)"
-        );
-    } else {
-        let legacy = sqlx::query(
-            "SELECT id, tx_hash, paid_amount FROM payments
-             WHERE tx_hash IS NOT NULL AND tx_hash <> '' AND paid_amount IS NOT NULL",
-        )
-        .fetch_all(pool)
-        .await?;
-        let mut backfilled = 0u64;
-        for row in &legacy {
-            let id: String = row.get("id");
-            let tx_hash: String = row.get("tx_hash");
-            let paid_amount: String = row.get("paid_amount");
-            if let Some(stroops) = crate::money::parse_stroops(&paid_amount) {
-                let result = sqlx::query(
-                    "INSERT INTO processed_transactions (payment_id, tx_hash, amount_stroops)
-                     VALUES (?, ?, ?)
-                     ON CONFLICT(payment_id, tx_hash) DO NOTHING",
-                )
-                .bind(&id)
-                .bind(&tx_hash)
-                .bind(stroops)
-                .execute(pool)
-                .await?;
-                backfilled += result.rows_affected();
-            }
-        }
-        mark_migration_applied(pool, BACKFILL_PROCESSED_TRANSACTIONS).await?;
-        info!(
-            migration = BACKFILL_PROCESSED_TRANSACTIONS,
-            candidates = legacy.len(),
-            backfilled,
-            "migration applied"
-        );
-    }
 
     /* Normalise legacy rows that were written by the old datetime('now') default,
     which produced "YYYY-MM-DD HH:MM:SS" (space, no Z). This is a one-time
@@ -408,7 +413,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     already expired. It would never surface as a detectable payment again and
     would be swept on the very next expiry cycle. */
     const NORMALIZE_LEGACY_TIMESTAMPS: &str = "normalize_legacy_timestamps";
-    if migration_applied(pool, NORMALIZE_LEGACY_TIMESTAMPS).await? {
+    if migration_applied(&mut conn, NORMALIZE_LEGACY_TIMESTAMPS).await? {
         info!(
             migration = NORMALIZE_LEGACY_TIMESTAMPS,
             "migration skipped (already applied)"
@@ -426,14 +431,309 @@ pub async fn migrate(pool: &Db) -> Result<()> {
                 tbl_col.0,
                 col = tbl_col.1
             );
-            normalized += sqlx::query(&sql).execute(pool).await?.rows_affected();
+            normalized += sqlx::query(&sql).execute(&mut *conn).await?.rows_affected();
         }
-        mark_migration_applied(pool, NORMALIZE_LEGACY_TIMESTAMPS).await?;
+        mark_migration_applied(&mut conn, NORMALIZE_LEGACY_TIMESTAMPS).await?;
         info!(
             migration = NORMALIZE_LEGACY_TIMESTAMPS,
             normalized, "migration applied"
         );
     }
+
+    /* Backfill from legacy rows that recorded only the most-recent `tx_hash`
+    and a cumulative `paid_amount`, so upgrading preserves the received-amount
+    ledger for intents that are still in flight. This is a one-time upgrade
+    step: it only needs to run once per database, so it is gated behind a
+    `kv_state` flag rather than re-scanning the full `payments` table (and
+    re-issuing one INSERT per matching row) on every boot (issue #266).
+    Startup cost would otherwise grow, forever, with lifetime payment volume. */
+    const BACKFILL_PROCESSED_TRANSACTIONS: &str = "backfill_processed_transactions";
+    if migration_applied(&mut conn, BACKFILL_PROCESSED_TRANSACTIONS).await? {
+        info!(
+            migration = BACKFILL_PROCESSED_TRANSACTIONS,
+            "migration skipped (already applied)"
+        );
+    } else {
+        let legacy = sqlx::query(
+            "SELECT id, tx_hash, paid_amount FROM payments
+             WHERE tx_hash IS NOT NULL AND tx_hash <> '' AND paid_amount IS NOT NULL",
+        )
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut backfilled = 0u64;
+        for row in &legacy {
+            let id: String = row.get("id");
+            let tx_hash: String = row.get("tx_hash");
+            let paid_amount: String = row.get("paid_amount");
+            if let Some(stroops) = crate::money::parse_stroops(&paid_amount) {
+                let result = sqlx::query(
+                    "INSERT INTO processed_transactions (payment_id, tx_hash, amount_stroops)
+                     VALUES (?, ?, ?)
+                     ON CONFLICT(payment_id, tx_hash) DO NOTHING",
+                )
+                .bind(&id)
+                .bind(&tx_hash)
+                .bind(stroops)
+                .execute(&mut *conn)
+                .await?;
+                backfilled += result.rows_affected();
+            }
+        }
+        mark_migration_applied(&mut conn, BACKFILL_PROCESSED_TRANSACTIONS).await?;
+        info!(
+            migration = BACKFILL_PROCESSED_TRANSACTIONS,
+            candidates = legacy.len(),
+            backfilled,
+            "migration applied"
+        );
+    }
+
+    /* Enforce foreign key constraints across the schema. Audit existing data
+    for pre-existing orphans on all 5 relationships and log any found rather
+    than deleting them. Rebuild pre-existing tables under PRAGMA foreign_keys = OFF
+    if their sqlite_master DDL lacks foreign key declarations. */
+    const ENFORCE_FOREIGN_KEYS: &str = "enforce_foreign_keys_v1";
+    if migration_applied(&mut conn, ENFORCE_FOREIGN_KEYS).await? {
+        info!(
+            migration = ENFORCE_FOREIGN_KEYS,
+            "migration skipped (already applied)"
+        );
+    } else {
+        let orphan_webhook_deliveries: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM webhook_deliveries WHERE payment_id NOT IN (SELECT id FROM payments)",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap_or(0);
+
+        let orphan_api_keys: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM api_keys WHERE merchant_id NOT IN (SELECT id FROM merchants)",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap_or(0);
+
+        let orphan_idempotency_keys: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM idempotency_keys WHERE payment_id NOT IN (SELECT id FROM payments)",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap_or(0);
+
+        let orphan_processed_transactions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM processed_transactions WHERE payment_id NOT IN (SELECT id FROM payments)",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap_or(0);
+
+        let orphan_payments: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM payments WHERE merchant_id NOT IN (SELECT id FROM merchants)",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap_or(0);
+
+        let total_orphans = orphan_webhook_deliveries
+            + orphan_api_keys
+            + orphan_idempotency_keys
+            + orphan_processed_transactions
+            + orphan_payments;
+
+        if total_orphans > 0 {
+            tracing::warn!(
+                migration = ENFORCE_FOREIGN_KEYS,
+                orphan_webhook_deliveries,
+                orphan_api_keys,
+                orphan_idempotency_keys,
+                orphan_processed_transactions,
+                orphan_payments,
+                total_orphans,
+                "pre-existing orphaned references detected in database during foreign key migration; preserved without deletion"
+            );
+        }
+
+        let payments_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'payments'",
+        )
+        .fetch_optional(&mut *conn)
+        .await?
+        .unwrap_or_default();
+
+        let webhook_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'webhook_deliveries'",
+        )
+        .fetch_optional(&mut *conn)
+        .await?
+        .unwrap_or_default();
+
+        let api_keys_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'api_keys'",
+        )
+        .fetch_optional(&mut *conn)
+        .await?
+        .unwrap_or_default();
+
+        let idempotency_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'idempotency_keys'",
+        )
+        .fetch_optional(&mut *conn)
+        .await?
+        .unwrap_or_default();
+
+        let processed_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'processed_transactions'",
+        )
+        .fetch_optional(&mut *conn)
+        .await?
+        .unwrap_or_default();
+
+        if !payments_sql.contains("REFERENCES")
+            || !webhook_sql.contains("REFERENCES")
+            || !api_keys_sql.contains("REFERENCES")
+            || !idempotency_sql.contains("REFERENCES")
+            || !processed_sql.contains("REFERENCES")
+        {
+            rebuild_table_with_fk(
+                &mut conn,
+                "payments",
+                &format!(
+                    "CREATE TABLE payments (
+                        id TEXT PRIMARY KEY,
+                        merchant_id TEXT NOT NULL DEFAULT 'anonymous' REFERENCES merchants(id) ON DELETE CASCADE,
+                        destination_address TEXT NOT NULL,
+                        memo TEXT NOT NULL UNIQUE,
+                        amount TEXT NOT NULL,
+                        asset TEXT NOT NULL DEFAULT 'XLM',
+                        asset_issuer TEXT,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        webhook_url TEXT,
+                        tx_hash TEXT,
+                        paid_amount TEXT,
+                        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                            CHECK (created_at LIKE '{TS_PATTERN}'),
+                        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                            CHECK (updated_at LIKE '{TS_PATTERN}'),
+                        expires_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 hour'))
+                            CHECK (expires_at LIKE '{TS_PATTERN}')
+                    )"
+                ),
+            )
+            .await?;
+
+            rebuild_table_with_fk(
+                &mut conn,
+                "webhook_deliveries",
+                &format!(
+                    "CREATE TABLE webhook_deliveries (
+                        id TEXT PRIMARY KEY,
+                        payment_id TEXT NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
+                        url TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        event_type TEXT,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        manual_attempts INTEGER NOT NULL DEFAULT 0,
+                        last_attempt TEXT CHECK (last_attempt IS NULL OR last_attempt LIKE '{TS_PATTERN}'),
+                        acknowledged_at TEXT CHECK (acknowledged_at IS NULL OR acknowledged_at LIKE '{TS_PATTERN}'),
+                        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                            CHECK (created_at LIKE '{TS_PATTERN}')
+                    )"
+                ),
+            )
+            .await?;
+
+            rebuild_table_with_fk(
+                &mut conn,
+                "api_keys",
+                &format!(
+                    "CREATE TABLE api_keys (
+                        id TEXT PRIMARY KEY,
+                        merchant_id TEXT NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+                        key_hash TEXT NOT NULL UNIQUE,
+                        prefix TEXT NOT NULL,
+                        label TEXT,
+                        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                            CHECK (created_at LIKE '{TS_PATTERN}'),
+                        last_used_at TEXT CHECK (last_used_at IS NULL OR last_used_at LIKE '{TS_PATTERN}'),
+                        revoked_at TEXT CHECK (revoked_at IS NULL OR revoked_at LIKE '{TS_PATTERN}')
+                    )"
+                ),
+            )
+            .await?;
+
+            rebuild_table_with_fk(
+                &mut conn,
+                "idempotency_keys",
+                &format!(
+                    "CREATE TABLE idempotency_keys (
+                        merchant_id TEXT NOT NULL,
+                        idempotency_key TEXT NOT NULL,
+                        payment_id TEXT NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
+                        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                            CHECK (created_at LIKE '{TS_PATTERN}'),
+                        PRIMARY KEY (merchant_id, idempotency_key)
+                    )"
+                ),
+            )
+            .await?;
+
+            rebuild_table_with_fk(
+                &mut conn,
+                "processed_transactions",
+                &format!(
+                    "CREATE TABLE processed_transactions (
+                        payment_id TEXT NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
+                        tx_hash TEXT NOT NULL,
+                        amount_stroops INTEGER NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                            CHECK (created_at LIKE '{TS_PATTERN}'),
+                        PRIMARY KEY (payment_id, tx_hash)
+                    )"
+                ),
+            )
+            .await?;
+
+            sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_memo ON payments(memo)")
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)")
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query(
+                "CREATE INDEX IF NOT EXISTS idx_payments_created_id ON payments(created_at DESC, id DESC)",
+            )
+            .execute(&mut *conn)
+            .await?;
+            sqlx::query(
+                "CREATE INDEX IF NOT EXISTS idx_payments_status_expires_at ON payments(status, expires_at)
+                 WHERE status IN ('pending', 'underpaid')",
+            )
+            .execute(&mut *conn)
+            .await?;
+            sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash)")
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_merchant ON api_keys(merchant_id)")
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query(
+                "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_payment
+                 ON webhook_deliveries(payment_id)",
+            )
+            .execute(&mut *conn)
+            .await?;
+        }
+
+        mark_migration_applied(&mut conn, ENFORCE_FOREIGN_KEYS).await?;
+        info!(
+            migration = ENFORCE_FOREIGN_KEYS,
+            total_orphans,
+            "migration applied"
+        );
+    }
+
+    sqlx::query("PRAGMA foreign_keys = ON").execute(&mut *conn).await?;
 
     Ok(())
 }
@@ -520,7 +820,19 @@ pub struct NewPayment<'a> {
     pub ttl_secs: i64,
 }
 
+#[derive(Debug)]
+pub enum IdempotencyResult {
+    Created(Payment),
+    Existing(String),
+}
+
 pub async fn create_payment(pool: &Db, new: NewPayment<'_>) -> Result<Payment> {
+    sqlx::query("INSERT OR IGNORE INTO merchants (id, api_key_hash) VALUES (?, ?)")
+        .bind(new.merchant_id)
+        .bind(new.merchant_id)
+        .execute(pool)
+        .await?;
+
     /* Canonicalize the amount: parse to stroops, then convert back to the
     canonical string representation. This ensures "10.00", "10.0", and "10"
     all serialize identically, eliminating spurious string-based comparisons
@@ -551,6 +863,77 @@ pub async fn create_payment(pool: &Db, new: NewPayment<'_>) -> Result<Payment> {
     get_payment(pool, new.id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("Payment not found after insert"))
+}
+
+pub async fn create_payment_with_idempotency(
+    pool: &Db,
+    new: NewPayment<'_>,
+    idempotency_key: Option<&str>,
+) -> Result<IdempotencyResult> {
+    let Some(key) = idempotency_key else {
+        let p = create_payment(pool, new).await?;
+        return Ok(IdempotencyResult::Created(p));
+    };
+
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("INSERT OR IGNORE INTO merchants (id, api_key_hash) VALUES (?, ?)")
+        .bind(new.merchant_id)
+        .bind(new.merchant_id)
+        .execute(&mut *tx)
+        .await?;
+
+    let stroops =
+        crate::money::parse_stroops(new.amount).ok_or_else(|| anyhow::anyhow!("Invalid amount"))?;
+    let canonical_amount = crate::money::stroops_to_string(stroops);
+    let ttl_modifier = format!("{:+} seconds", new.ttl_secs);
+
+    sqlx::query(
+        "INSERT INTO payments (id, merchant_id, destination_address, memo, amount, asset, asset_issuer, webhook_url, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ','now',?))",
+    )
+    .bind(new.id)
+    .bind(new.merchant_id)
+    .bind(new.destination_address)
+    .bind(new.memo)
+    .bind(&canonical_amount)
+    .bind(new.asset)
+    .bind(new.asset_issuer)
+    .bind(new.webhook_url)
+    .bind(&ttl_modifier)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO idempotency_keys (merchant_id, idempotency_key, payment_id)
+         VALUES (?, ?, ?)
+         ON CONFLICT(merchant_id, idempotency_key) DO NOTHING",
+    )
+    .bind(new.merchant_id)
+    .bind(key)
+    .bind(new.id)
+    .execute(&mut *tx)
+    .await?;
+
+    let stored: String = sqlx::query_scalar(
+        "SELECT payment_id FROM idempotency_keys WHERE merchant_id = ? AND idempotency_key = ?",
+    )
+    .bind(new.merchant_id)
+    .bind(key)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if stored != new.id {
+        tx.rollback().await?;
+        return Ok(IdempotencyResult::Existing(stored));
+    }
+
+    tx.commit().await?;
+
+    let p = get_payment(pool, new.id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Payment not found after insert"))?;
+    Ok(IdempotencyResult::Created(p))
 }
 
 /// Look up the payment id previously minted for `(merchant_id, key)`, if any.
@@ -1812,7 +2195,11 @@ mod tests {
             // connection closes — keep exactly one open for the pool's
             // lifetime.
             .min_connections(1)
-            .connect_with(SqliteConnectOptions::from_str(&shared_memory_dsn()).unwrap())
+            .connect_with(
+                SqliteConnectOptions::from_str(&shared_memory_dsn())
+                    .unwrap()
+                    .foreign_keys(true),
+            )
             .await
             .unwrap();
         migrate(&pool).await.unwrap();
@@ -2105,7 +2492,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO payments
                 (id, merchant_id, destination_address, memo, amount, asset, status, expires_at)
-             VALUES ('legacy', 'm', 'GGATEWAY', 'MEMOLEG', '5', 'USDC', 'pending',
+             VALUES ('legacy', 'anonymous', 'GGATEWAY', 'MEMOLEG', '5', 'USDC', 'pending',
                      strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 hour'))",
         )
         .execute(&pool)
@@ -2170,7 +2557,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO payments
                 (id, merchant_id, destination_address, memo, amount, asset, status, expires_at)
-             VALUES (?, 'm', 'GGATEWAY', ?, '10', 'XLM', 'pending', ?)",
+             VALUES (?, 'anonymous', 'GGATEWAY', ?, '10', 'XLM', 'pending', ?)",
         )
         .bind(id)
         .bind(memo)
@@ -2276,7 +2663,7 @@ mod tests {
         let result = sqlx::query(
             "INSERT INTO payments
                 (id, merchant_id, destination_address, memo, amount, asset, status, expires_at)
-             VALUES ('bad', 'm', 'GGATEWAY', 'MEMOBAD', '10', 'XLM', 'pending', '2026-04-29 15:00:00')",
+             VALUES ('bad', 'anonymous', 'GGATEWAY', 'MEMOBAD', '10', 'XLM', 'pending', '2026-04-29 15:00:00')",
         )
         .execute(&pool)
         .await;
@@ -2826,5 +3213,85 @@ mod tests {
         // its `?mode=...` query string.
         let (main, wal, shm) = file_sizes(&shared_memory_dsn());
         assert_eq!((main, wal, shm), (None, None, None));
+    }
+
+    #[tokio::test]
+    async fn orphan_insert_is_rejected_by_foreign_keys() {
+        let pool = memory_db().await;
+
+        // 1. webhook_deliveries referencing nonexistent payment
+        let res = sqlx::query(
+            "INSERT INTO webhook_deliveries (id, payment_id, url, payload) VALUES ('d1', 'nonexistent_p', 'https://example.com', '{}')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(res.is_err(), "webhook_deliveries orphan insert must fail FK constraint");
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("FOREIGN KEY constraint failed") || err.contains("foreign key"), "err: {err}");
+
+        // 2. api_keys referencing nonexistent merchant
+        let res = sqlx::query(
+            "INSERT INTO api_keys (id, merchant_id, key_hash, prefix) VALUES ('k1', 'nonexistent_m', 'hash1', 'pref')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(res.is_err(), "api_keys orphan insert must fail FK constraint");
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("FOREIGN KEY constraint failed") || err.contains("foreign key"), "err: {err}");
+
+        // 3. idempotency_keys referencing nonexistent payment
+        let res = sqlx::query(
+            "INSERT INTO idempotency_keys (merchant_id, idempotency_key, payment_id) VALUES ('anonymous', 'key1', 'nonexistent_p')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(res.is_err(), "idempotency_keys orphan insert must fail FK constraint");
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("FOREIGN KEY constraint failed") || err.contains("foreign key"), "err: {err}");
+
+        // 4. processed_transactions referencing nonexistent payment
+        let res = sqlx::query(
+            "INSERT INTO processed_transactions (payment_id, tx_hash, amount_stroops) VALUES ('nonexistent_p', 'tx1', 100)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(res.is_err(), "processed_transactions orphan insert must fail FK constraint");
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("FOREIGN KEY constraint failed") || err.contains("foreign key"), "err: {err}");
+
+        // 5. payments referencing nonexistent merchant
+        let res = sqlx::query(
+            "INSERT INTO payments (id, merchant_id, destination_address, memo, amount) VALUES ('p1', 'nonexistent_m', 'gdest', 'memo1', '10')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(res.is_err(), "payments orphan insert must fail FK constraint");
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("FOREIGN KEY constraint failed") || err.contains("foreign key"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn migration_reports_preexisting_orphans() {
+        let dsn = shared_memory_dsn();
+        let opts = SqliteConnectOptions::from_str(&dsn).unwrap().foreign_keys(false);
+        let pool = SqlitePoolOptions::new().min_connections(1).connect_with(opts).await.unwrap();
+
+        sqlx::query("CREATE TABLE payments (id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL DEFAULT 'anonymous', destination_address TEXT NOT NULL, memo TEXT NOT NULL UNIQUE, amount TEXT NOT NULL, asset TEXT NOT NULL DEFAULT 'XLM', asset_issuer TEXT, status TEXT NOT NULL DEFAULT 'pending', webhook_url TEXT, tx_hash TEXT, paid_amount TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')), updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')), expires_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 hour')))").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE webhook_deliveries (id TEXT PRIMARY KEY, payment_id TEXT NOT NULL, url TEXT NOT NULL, payload TEXT NOT NULL, event_type TEXT, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, manual_attempts INTEGER NOT NULL DEFAULT 0, last_attempt TEXT, acknowledged_at TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')))").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE merchants (id TEXT PRIMARY KEY, api_key_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')), rate_limit_per_sec INTEGER)").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE api_keys (id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, prefix TEXT NOT NULL, label TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')), last_used_at TEXT, revoked_at TEXT)").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE idempotency_keys (merchant_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, payment_id TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')), PRIMARY KEY (merchant_id, idempotency_key))").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE processed_transactions (payment_id TEXT NOT NULL, tx_hash TEXT NOT NULL, amount_stroops INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')), PRIMARY KEY (payment_id, tx_hash))").execute(&pool).await.unwrap();
+
+        sqlx::query("INSERT INTO webhook_deliveries (id, payment_id, url, payload) VALUES ('d_orphan', 'p_missing', 'https://example.com', '{}')").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO idempotency_keys (merchant_id, idempotency_key, payment_id) VALUES ('m_missing', 'k_orphan', 'p_missing')").execute(&pool).await.unwrap();
+
+        migrate(&pool).await.unwrap();
+
+        let d_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries WHERE id = 'd_orphan'").fetch_one(&pool).await.unwrap();
+        assert_eq!(d_count, 1, "pre-existing orphan webhook delivery must be preserved");
+
+        let ik_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM idempotency_keys WHERE idempotency_key = 'k_orphan'").fetch_one(&pool).await.unwrap();
+        assert_eq!(ik_count, 1, "pre-existing orphan idempotency key must be preserved");
     }
 }

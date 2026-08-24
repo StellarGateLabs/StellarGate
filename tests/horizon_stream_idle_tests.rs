@@ -36,7 +36,8 @@ async fn make_state(horizon_url: String, stream_idle_timeout_secs: u64) -> Arc<A
         .connect_with(
             SqliteConnectOptions::from_str("sqlite::memory:")
                 .unwrap()
-                .create_if_missing(true),
+                .create_if_missing(true)
+                .foreign_keys(true),
         )
         .await
         .unwrap();

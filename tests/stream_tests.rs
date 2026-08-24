@@ -93,7 +93,11 @@ async fn setup_state(horizon_url: &str) -> Arc<AppState> {
         // A shared-cache in-memory database is dropped once its last
         // connection closes — keep exactly one open for the pool's lifetime.
         .min_connections(1)
-        .connect_with(SqliteConnectOptions::from_str(&cfg.database_url).unwrap())
+        .connect_with(
+            SqliteConnectOptions::from_str(&cfg.database_url)
+                .unwrap()
+                .foreign_keys(true),
+        )
         .await
         .unwrap();
     db::migrate(&pool).await.unwrap();
@@ -503,7 +507,11 @@ async fn unconfigured_gateway_exits_disabled_by_config() {
 
     let pool = SqlitePoolOptions::new()
         .min_connections(1)
-        .connect_with(SqliteConnectOptions::from_str(&shared_memory_dsn()).unwrap())
+        .connect_with(
+            SqliteConnectOptions::from_str(&shared_memory_dsn())
+                .unwrap()
+                .foreign_keys(true),
+        )
         .await
         .unwrap();
     db::migrate(&pool).await.unwrap();

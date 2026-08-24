@@ -446,28 +446,6 @@ pub async fn create(
 
     let id = Uuid::new_v4().to_string();
 
-    /* Reserve the idempotency key before minting the payment so concurrent
-    same-key requests can't both create payments. The DB primary key
-    serialises the race: only one request's INSERT succeeds. */
-    if let Some(key) = idempotency_key {
-        let canonical_id = db::save_idempotency_key(&state.pool, &merchant_id, key, &id).await?;
-        if canonical_id != id {
-            /* Lost the race — the winner is about to create its payment. Wait
-            for it with a short retry loop and then return that payment. */
-            for _ in 0..50 {
-                if let Some(payment) = db::get_payment(&state.pool, &canonical_id).await? {
-                    return Ok((StatusCode::OK, Json(to_json(&payment))));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            return Err(AppError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "idempotency_conflict",
-                "concurrent request conflict, please retry",
-            ));
-        }
-    }
-
     // Retry loop to handle UNIQUE constraint violations on memo generation.
     // Each iteration generates a fresh memo and attempts to create the payment.
     // If the memo collides (concurrent request claimed the same memo), we retry
@@ -475,7 +453,7 @@ pub async fn create(
     let payment = 'retry: {
         for _ in 0..10 {
             let memo = generate_unique_memo();
-            match db::create_payment(
+            match db::create_payment_with_idempotency(
                 &state.pool,
                 db::NewPayment {
                     id: &id,
@@ -488,10 +466,24 @@ pub async fn create(
                     webhook_url: body.webhook_url.as_deref(),
                     ttl_secs: state.config.payment_ttl_secs as i64,
                 },
+                idempotency_key,
             )
             .await
             {
-                Ok(p) => break 'retry p,
+                Ok(db::IdempotencyResult::Created(p)) => break 'retry p,
+                Ok(db::IdempotencyResult::Existing(canonical_id)) => {
+                    for _ in 0..50 {
+                        if let Some(payment) = db::get_payment(&state.pool, &canonical_id).await? {
+                            return Ok((StatusCode::OK, Json(to_json(&payment))));
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    return Err(AppError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "idempotency_conflict",
+                        "concurrent request conflict, please retry",
+                    ));
+                }
                 Err(err) if is_unique_violation(&err) => continue,
                 Err(err) => return Err(err.into()),
             }
