@@ -1,3 +1,11 @@
+# Base image digests should be pinned for production builds.
+# To pin: docker buildx imagetools inspect rust:1.88-bookworm --format '{{.Manifest.Digest}}'
+#         docker buildx imagetools inspect debian:bookworm-slim --format '{{.Manifest.Digest}}'
+# Then replace the FROM lines with:
+#   FROM rust:1.88-bookworm@sha256:<digest> AS chef
+#   FROM debian:bookworm-slim@sha256:<digest> AS runtime
+# Pinning prevents silent base-image updates from changing the build.
+
 # ── Stage 1: dependency cache via cargo-chef ─────────────────────────────────
 FROM rust:1.88-bookworm AS chef
 RUN cargo install cargo-chef --locked
@@ -16,6 +24,8 @@ RUN cargo build --release --locked
 
 # ── Stage 2: slim runtime image ───────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
+
+LABEL org.opencontainers.image.description="StellarGate payment gateway — runs as non-root uid 1001"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \

@@ -284,8 +284,14 @@ Current trustline state is on `GET /metrics`, so it's alertable rather than
 grep-only:
 
 ```
-# a confirmed-missing trustline
+# a confirmed-missing or unauthorized trustline
 stellargate_missing_trustlines{asset="USDC"} 1
+
+# trustline exists but is_authorized=false (issuer revoked authorization)
+stellargate_trustline_unauthorized{asset="USDC"} 1
+
+# remaining capacity in stroops (limit - balance); alert when near your typical payment size
+stellargate_trustline_headroom_stroops{asset="USDC"} 9223372036854775807
 
 # how many checks have failed to reach Horizon at all — distinct from a
 # confirmed-absent trustline, which only ever comes from a check that
@@ -297,6 +303,20 @@ stellargate_trustline_check_failures_total 0
 # until this is nonzero
 stellargate_trustline_check_last_success_timestamp_seconds 1732000000
 ```
+
+`stellargate_missing_trustlines=1` covers two distinct cases — both cause payments
+to bounce on-chain:
+
+- **No trustline** — the account has no balance line for this asset. Add one with `changeTrust`.
+- **Unauthorized trustline** — the balance line exists but `is_authorized=false`. The issuer uses
+  `AUTH_REQUIRED` and has not yet granted (or has revoked) authorization. Contact the issuer.
+
+`stellargate_trustline_unauthorized` distinguishes the second case from the first, so an alert can
+recommend the right action.
+
+`stellargate_trustline_headroom_stroops` is the remaining capacity (`limit - balance`). A payment
+that would push the balance past `limit` fails on-chain just like a missing trustline. Alert when
+this approaches your typical payment size.
 
 A Horizon outage during a check only increments
 `stellargate_trustline_check_failures_total`; it leaves the last confirmed
@@ -718,6 +738,7 @@ later would silently change the behaviour of requests that appeared to work.
 | `invalid_label` | `400` | Key label exceeds 100 characters |
 | `delivery_not_found` | `404` | No such delivery for that payment |
 | `webhook_target_blocked` | `400` | Redelivery target rejected by the SSRF guard |
+| `already_delivered` | `409` | Delivery was already successfully delivered; pass `?force=true` to redeliver anyway |
 | `webhook_delivery_failed` | `502` | Receiver returned a non-success response |
 | `rate_limit_exceeded` | `429` | Per-IP bucket limit exceeded |
 | `idempotency_conflict` | `409` | Concurrent creates raced on one idempotency key; retry |
@@ -1301,6 +1322,7 @@ Every on-chain payment matched by memo, destination, and asset resolves as follo
 | Top-up reaching exactly the total | `completed` | `payment.completed` | — |
 | Top-up exceeding the total | `completed` | `payment.overpaid` | cumulative excess |
 | TTL elapsed, unpaid | `expired` | `payment.expired` | — |
+| Payment after `completed` or `expired` | unchanged | `payment.unexpected` | unexpected amount to refund |
 
 **Overpayment** fulfils the intent. The `delta` field carries the excess; refunding it is the merchant's responsibility — the gateway cannot send funds.
 
@@ -1309,8 +1331,7 @@ Every on-chain payment matched by memo, destination, and asset resolves as follo
 **Limitations to be aware of:**
 
 - Only a **single** top-up is tracked per underpaid intent. If more is needed, the payer should send the full remaining `delta` in one transaction.
-- Once an intent is `completed`, further payments to the same address and memo are **not** tracked and fire no webhooks.
-- Failed on-chain transactions are ignored entirely.
+- Once an intent is `completed`, further payments to the same address and memo fire a `payment.unexpected` webhook so the merchant can refund them, but the intent's `completed` status is not changed.
 
 ---
 
@@ -1326,6 +1347,7 @@ When a payment reaches a terminal state, StellarGate POSTs a signed JSON event t
 | `payment.overpaid` | Cumulative received exceeds it (`delta` = excess, `full` detail only) |
 | `payment.underpaid` | Payment received but short (`delta` = shortfall, `full` detail only) |
 | `payment.expired` | TTL elapsed with no payment |
+| `payment.unexpected` | Payment received after intent is already `completed` or `expired` (`delta` = the unexpected amount the merchant must refund) |
 
 ### Payload detail
 
@@ -1507,6 +1529,11 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 | `stellargate_db_pool_connections` | gauge | SQLite connection pool size, labelled by `state` (`idle`, `in_use`) |
 | `stellargate_db_pool_max_connections` | gauge | Configured maximum pool size |
 | `stellargate_db_file_size_bytes` | gauge | On-disk size of the SQLite database files, labelled by `file` (`main`, `wal`, `shm`); absent for an in-memory database |
+| `stellargate_missing_trustlines` | gauge | `1` if the gateway account has no usable trustline for this asset (absent or unauthorized); `0` if confirmed usable |
+| `stellargate_trustline_unauthorized` | gauge | `1` if the trustline exists but `is_authorized=false` (issuer revoked/has not granted authorization) |
+| `stellargate_trustline_headroom_stroops` | gauge | Remaining trustline capacity in stroops (`limit - balance`); alert when near your typical payment size |
+| `stellargate_trustline_check_failures_total` | counter | Trustline checks that failed to reach Horizon (does not affect `stellargate_missing_trustlines`) |
+| `stellargate_trustline_check_last_success_timestamp_seconds` | gauge | Unix timestamp of the last confirmed trustline check; `0` until first success |
 
 **Alert on `stellargate_tasks_live < stellargate_tasks_expected`.** That
 comparison was not previously possible: `stellargate_tasks_stopped_total` was

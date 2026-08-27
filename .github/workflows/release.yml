@@ -9,6 +9,35 @@ on:
     tags:
       - "v*"
 
+# =============================================================================
+# SIGNING IDENTITY & COMPROMISE RESPONSE
+# =============================================================================
+# This workflow uses GitHub's KEYLESS attestation (Sigstore/Rekor via OIDC),
+# NOT a stored signing key. The signing identity IS the GitHub Actions OIDC
+# token scoped to this repo and workflow — there is no key material to rotate
+# or revoke in the traditional sense.
+#
+# IF the repository or Actions environment is compromised, the remediation
+# steps are:
+#
+#   1. Rotate ALL repository secrets immediately:
+#        GitHub → Settings → Secrets and variables → Actions → rotate each
+#   2. Revoke any personal access tokens or deploy keys associated with the repo
+#   3. Review and remove any malicious workflow runs from the Actions tab
+#   4. Verify published release artifacts by checking their attestations:
+#        Images:   gh attestation verify --owner <org> oci://<image>@<digest>
+#        Binaries: gh attestation verify <file> --owner <org>
+#   5. If a release was published under a compromised identity, delete and
+#      re-publish it from a clean state after rotating secrets
+#
+# The attestation is tied to the specific workflow run SHA. Old attestations
+# for legitimately-built artifacts remain valid even after rotating secrets,
+# because they were signed by a non-compromised run.
+#
+# Reference:
+#   https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds
+# =============================================================================
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -28,7 +57,7 @@ jobs:
           - x86_64-unknown-linux-gnu
           - aarch64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       # libsqlite3-sys builds its bundled SQLite from C source via the `cc`
       # crate, so cross-compiling only needs a cross gcc + linker — no target
@@ -45,7 +74,7 @@ jobs:
           toolchain: "1.88"
           targets: ${{ matrix.target }}
 
-      - uses: actions/cache@v6
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -87,7 +116,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - name: Compute image name and version
         id: vars
@@ -130,7 +159,7 @@ jobs:
     name: SBOM
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - name: Generate SBOM
         uses: anchore/sbom-action@v0

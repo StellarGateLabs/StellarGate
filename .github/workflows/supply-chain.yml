@@ -14,7 +14,7 @@ jobs:
     name: cargo audit (RustSec)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       # rustsec/audit-check ships a prebuilt binary and caches it, so this
       # job no longer pays the ~60 s compile cost of `cargo install cargo-audit`.
@@ -52,18 +52,30 @@ jobs:
     name: cargo deny (licenses + bans + sources + advisories)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       # EmbarkStudios/cargo-deny-action ships a prebuilt binary and caches it.
-      # deny.toml at the repo root is picked up automatically.
+      # deny.toml at the repo root is picked up automatically and contains the
+      # full policy with justifications for every exception.
       #
-      # Checks run:
-      #   advisories — RustSec advisory database (overlaps with cargo audit;
-      #                belt-and-suspenders for the weekly scheduled run).
-      #   licenses   — every dependency must use an approved SPDX license.
-      #   bans       — banned crates and duplicate-version policy.
-      #   sources    — only crates.io dependencies are permitted.
+      # Checks run and what each enforces:
+      #   advisories — RustSec advisory DB: fails on known vulnerabilities,
+      #                unsound code, and yanked crates. Overlaps with cargo
+      #                audit above; belt-and-suspenders for the weekly run.
+      #   licenses   — every dependency must use an approved SPDX identifier
+      #                from the `allow` list in deny.toml; any unlisted license
+      #                fails CI, forcing a conscious review decision.
+      #   bans       — banned crates list and duplicate-version policy;
+      #                `multiple-versions = "deny"` means any new unregistered
+      #                duplicate fails CI, requiring an explicit `skip` entry.
+      #   sources    — only crates.io is permitted; any git or path dependency
+      #                not explicitly listed in deny.toml fails CI.
+      #
+      # `fail-on-error: true` makes every violation above a hard CI failure,
+      # not a warning. (This is already the default for cargo-deny-action, but
+      # is set explicitly here so the intent is unambiguous to any reader.)
       - name: Run cargo deny
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check bans licenses sources advisories
+          fail-on-error: true

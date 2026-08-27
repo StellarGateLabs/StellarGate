@@ -33,6 +33,29 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Redact a webhook URL for logging: keep scheme and host so a target is
+/// still identifiable, but drop the path and query string entirely.
+///
+/// Webhook URLs commonly embed capability tokens in the path or query string
+/// (e.g. `https://hooks.example.com/t/SecretToken`). Logging the full URL
+/// copies that credential into every log sink and aggregator (issue #240).
+///
+/// ```text
+/// https://hooks.example.com/t/Secret?sig=abc  →  https://hooks.example.com/…
+/// https://example.com/                         →  https://example.com
+/// <unparseable input>                          →  <unparseable>
+/// ```
+pub fn redact_url(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(u) => {
+            let host = u.host_str().unwrap_or("?");
+            let suffix = if u.path() == "/" { "" } else { "/\u{2026}" };
+            format!("{}://{}{}", u.scheme(), host, suffix)
+        }
+        Err(_) => "<unparseable>".into(),
+    }
+}
+
 /// Compute the hex-encoded HMAC-SHA256 signature for a webhook, binding it to
 /// `timestamp` by signing the Stripe-style payload `"{timestamp}.{body}"`.
 ///
@@ -154,8 +177,20 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
     let client = match safe_client(state, &url).await {
         Ok(c) => c,
         Err(e) => {
-            warn!(payment_id = %payment.id, %url, error = %e, "webhook blocked by SSRF guard");
-            let _ = db::update_webhook_delivery(&state.pool, &delivery_id, "failed", 0).await;
+            warn!(payment_id = %payment.id, url = %redact_url(&url), error = %e, "webhook blocked by SSRF guard");
+            /* This is a terminal failure and must be counted like one. It was
+            not, so an entire class of permanent failure — a target that
+            resolves into a blocked range — was invisible to
+            `stellargate_webhook_deliveries_total{outcome="failed"}` and to any
+            alert built on it (issues #319, #233). */
+            state.webhook_metrics.record_failed();
+            let _ = db::update_webhook_delivery(
+                &state.pool,
+                &delivery_id,
+                "failed",
+                blocked_delivery_attempts(state),
+            )
+            .await;
             return;
         }
     };
@@ -182,7 +217,7 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
 
         match result {
             Ok(resp) if resp.status().is_success() => {
-                info!(payment_id = %payment.id, %url, attempt, "webhook delivered");
+                info!(payment_id = %payment.id, url = %redact_url(&url), attempt, "webhook delivered");
                 state.webhook_metrics.record_delivered();
                 state
                     .webhook_metrics
@@ -209,7 +244,7 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
         }
     }
 
-    warn!(payment_id = %payment.id, %url, "webhook delivery exhausted all retries");
+    warn!(payment_id = %payment.id, url = %redact_url(&url), "webhook delivery exhausted all retries");
     state.webhook_metrics.record_failed();
     state
         .webhook_metrics
@@ -296,10 +331,16 @@ async fn redrive_one(state: &Arc<AppState>, delivery: db::WebhookDelivery) {
     let client = match safe_client(state, &delivery.url).await {
         Ok(c) => c,
         Err(e) => {
-            warn!(delivery_id = %delivery.id, url = %delivery.url, error = %e, "redrive blocked by SSRF guard");
-            let _ =
-                db::update_webhook_delivery(&state.pool, &delivery.id, "failed", delivery.attempts)
-                    .await;
+            warn!(delivery_id = %delivery.id, url = %redact_url(&delivery.url), error = %e, "redrive blocked by SSRF guard");
+            // Terminal, so counted — same gap as the inline path above.
+            state.webhook_metrics.record_failed();
+            let _ = db::update_webhook_delivery(
+                &state.pool,
+                &delivery.id,
+                "failed",
+                blocked_delivery_attempts(state),
+            )
+            .await;
             return;
         }
     };
@@ -390,6 +431,154 @@ pub async fn run_redrive_worker(state: Arc<AppState>, mut shutdown: watch::Recei
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Panic-risk audit (#433) ───────────────────────────────────────────────
+    //
+    // Two `.unwrap()` calls remain in this test module:
+    //
+    // * `serde_json::to_vec(&payload).unwrap()` — test assertion: the only way
+    //   `to_vec` can fail is if the value contains a non-serialisable type (e.g.
+    //   a map with non-string keys). `serde_json::Value` produced by the `json!`
+    //   macro is always serialisable; a failure here is a bug in the test
+    //   fixture, not a recoverable error.
+    // * `String::from_utf8(body).unwrap()` — `serde_json::to_vec` always emits
+    //   valid UTF-8, so this is infallible for any body that `to_vec` produced.
+    //
+    // Neither pattern appears in production code paths.
+
+    // ── redact_url (issue #240) ───────────────────────────────────────────────
+
+    /// The path and query string — the most common location for capability
+    /// tokens in signed-URL webhook endpoints — must not appear in the
+    /// redacted form.
+    #[test]
+    fn redact_url_strips_path_and_query() {
+        let raw = "https://hooks.example.com/t/AbCdEfSecretToken?sig=abc123&ts=1700000000";
+        let redacted = redact_url(raw);
+        assert!(
+            !redacted.contains("AbCdEfSecretToken"),
+            "path secret must not appear in redacted URL: {redacted}"
+        );
+        assert!(
+            !redacted.contains("sig=abc123"),
+            "query secret must not appear in redacted URL: {redacted}"
+        );
+        assert!(
+            redacted.contains("hooks.example.com"),
+            "host must be preserved for debugging: {redacted}"
+        );
+        assert!(
+            redacted.starts_with("https://"),
+            "scheme must be preserved: {redacted}"
+        );
+    }
+
+    #[test]
+    fn redact_url_root_path_produces_no_ellipsis() {
+        // A URL with no path beyond "/" is identified by scheme+host alone —
+        // adding "/…" would imply a path was omitted when there isn't one.
+        let redacted = redact_url("https://example.com/");
+        assert_eq!(redacted, "https://example.com");
+    }
+
+    #[test]
+    fn redact_url_non_root_path_appends_ellipsis() {
+        let redacted = redact_url("https://example.com/webhooks/stellar");
+        assert_eq!(redacted, "https://example.com/\u{2026}");
+        assert!(!redacted.contains("stellar"), "path must be dropped");
+    }
+
+    #[test]
+    fn redact_url_unparseable_returns_placeholder() {
+        assert_eq!(redact_url("not a url at all"), "<unparseable>");
+        assert_eq!(redact_url(""), "<unparseable>");
+    }
+
+    #[test]
+    fn redact_url_preserves_http_scheme() {
+        let redacted = redact_url("http://dev.example.com/hook/secret");
+        assert!(redacted.starts_with("http://"), "http scheme must be kept");
+        assert!(!redacted.contains("secret"), "path secret must be stripped");
+    }
+
+    const BASE: Duration = Duration::from_millis(1_000);
+    const MAX: Duration = Duration::from_millis(30_000);
+
+    /// The ceiling doubles per attempt: a constant delay meant a settlement
+    /// burst of N payments produced 3N requests in three tight clusters,
+    /// arriving exactly while a restarting receiver was least able to take
+    /// them.
+    #[test]
+    fn inline_retry_delay_grows_exponentially() {
+        // Equal jitter puts every sample in [ceiling/2, ceiling], so the
+        // *whole range* for attempt n sits at or above attempt n-1's ceiling
+        // only once doubled — assert on the bounds rather than one sample.
+        for (attempt, lo, hi) in [(1, 500, 1_000), (2, 1_000, 2_000), (3, 2_000, 4_000)] {
+            for _ in 0..200 {
+                let d = retry_delay(attempt, BASE, MAX).as_millis() as u64;
+                assert!(
+                    (lo..=hi).contains(&d),
+                    "attempt {attempt} delay {d}ms outside [{lo}, {hi}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inline_retry_delay_is_capped() {
+        // Attempt 20 would be 1s * 2^19 ≈ 145 hours without the cap.
+        for _ in 0..200 {
+            assert!(retry_delay(20, BASE, MAX) <= MAX);
+        }
+    }
+
+    /// Saturating arithmetic, not wrapping: an absurd attempt number must
+    /// clamp to the cap rather than overflow into a tiny delay and reproduce
+    /// the burst this issue is about.
+    #[test]
+    fn inline_retry_delay_does_not_overflow_to_a_small_value() {
+        let d = retry_delay(u32::MAX, BASE, MAX);
+        assert!(d >= MAX / 2 && d <= MAX, "got {d:?}");
+    }
+
+    /// The property the issue actually asks for: deliveries that fail at the
+    /// same moment must not retry at the same moment. Without jitter every one
+    /// of these samples would be identical.
+    #[test]
+    fn simultaneous_failures_do_not_retry_simultaneously() {
+        let samples: std::collections::HashSet<u128> = (0..500)
+            .map(|_| retry_delay(1, BASE, MAX).as_millis())
+            .collect();
+        assert!(
+            samples.len() > 100,
+            "500 deliveries failing together produced only {} distinct retry \
+             delays — they would still arrive in lockstep",
+            samples.len()
+        );
+    }
+
+    /// Equal jitter, not full jitter. `WEBHOOK_RETRY_DELAY_MS == 0` is rejected
+    /// at boot because "a zero delay causes retry bursts that hammer the target
+    /// endpoint"; jitter that could return ~0 would reintroduce exactly that.
+    #[test]
+    fn jitter_never_collapses_the_delay_to_zero() {
+        for _ in 0..500 {
+            assert!(
+                retry_delay(1, BASE, MAX) >= BASE / 2,
+                "every retry keeps a floor of half the configured base delay"
+            );
+        }
+    }
+
+    /// A zero base (only reachable with retries disabled, which the config
+    /// validator enforces) must not panic on the modulo.
+    #[test]
+    fn zero_base_delay_is_handled() {
+        assert_eq!(
+            retry_delay(1, Duration::ZERO, Duration::ZERO),
+            Duration::ZERO
+        );
+    }
 
     #[test]
     fn signature_is_deterministic() {

@@ -308,4 +308,138 @@ mod tests {
             .unwrap();
         assert_eq!(n, 0);
     }
+
+    // ── New targeted tests (issue #437) ─────────────────────────────────────
+
+    /// `run_retention_worker` must exit immediately with `DisabledByConfig`
+    /// when both retention windows are 0, without ever touching the database.
+    /// It must not wait for the shutdown signal.
+    #[tokio::test]
+    async fn run_retention_worker_disabled_when_both_windows_are_zero() {
+        let state = state_with(test_config(0, 0)).await;
+        // Channel is never closed / never sends true — the worker must not
+        // wait for it when both windows are 0.
+        let (_tx, rx) = watch::channel(false);
+        let exit = run_retention_worker(state, rx).await;
+        assert!(
+            matches!(exit, TaskExit::DisabledByConfig(_)),
+            "expected DisabledByConfig, got {exit:?}"
+        );
+    }
+
+    /// `drain` with `retention_max_rows_per_cycle = 1` and
+    /// `db_prune_batch_size = 500`: after inserting 1 000 rows, `prune_once`
+    /// must run exactly one batch (≤ 500 rows) and then stop — it must not
+    /// drain the whole table in one call.
+    #[tokio::test]
+    async fn prune_once_respects_per_cycle_cap() {
+        let mut cfg = test_config(1, 1);
+        // One unit of cap means: stop after the first batch completes.
+        cfg.retention_max_rows_per_cycle = 1;
+        cfg.db_prune_batch_size = 500;
+        let state = state_with(cfg).await;
+
+        // Insert 1 000 aged delivered rows.
+        for i in 0..1_000i64 {
+            sqlx::query(
+                "INSERT INTO webhook_deliveries (id, payment_id, url, payload, status, created_at)
+                 VALUES (?, 'p', 'https://e.example/h', '{}', 'delivered',
+                         strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 days'))",
+            )
+            .bind(format!("cap{i}"))
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+
+        let (deliveries, _) = prune_once(&state).await.unwrap();
+        // With cap=1 the loop exits after the first batch because
+        // `total (500) >= cap (1)`.
+        assert_eq!(
+            deliveries, 500,
+            "expected exactly one batch (500 rows) to be pruned before the cap stops the loop"
+        );
+        // 500 rows remain in the table.
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 500);
+    }
+
+    /// When only idempotency pruning is enabled (`delivery_days=0`), old keys
+    /// must be removed and the deliveries table must be left untouched.
+    #[tokio::test]
+    async fn prune_once_only_idempotency_when_delivery_days_is_zero() {
+        let state = state_with(test_config(0, 7)).await;
+
+        // Insert an aged idempotency key (30 days old — beyond the 7-day window).
+        sqlx::query(
+            "INSERT INTO idempotency_keys (merchant_id, idempotency_key, payment_id, created_at)
+             VALUES ('m', 'old-key', 'p', strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 days'))",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        // Also insert an aged delivered row — it must NOT be pruned because
+        // delivery_days == 0 ("keep forever").
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (id, payment_id, url, payload, status, created_at)
+             VALUES ('d1', 'p', 'https://e.example/h', '{}', 'delivered',
+                     strftime('%Y-%m-%dT%H:%M:%SZ','now','-60 days'))",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let (deliveries, keys) = prune_once(&state).await.unwrap();
+        assert_eq!(deliveries, 0, "deliveries must not be pruned when delivery_days==0");
+        assert_eq!(keys, 1, "the aged idempotency key must be pruned");
+
+        // The delivery row survives.
+        let d_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(d_count, 1, "delivery row must remain when delivery_days==0");
+    }
+
+    /// When only delivery pruning is enabled (`idempotency_days=0`), old
+    /// deliveries must be removed and idempotency_keys must be left untouched.
+    #[tokio::test]
+    async fn prune_once_only_deliveries_when_idempotency_days_is_zero() {
+        let state = state_with(test_config(30, 0)).await;
+
+        // Insert an aged delivered row (60 days old — beyond the 30-day window).
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (id, payment_id, url, payload, status, created_at)
+             VALUES ('d1', 'p', 'https://e.example/h', '{}', 'delivered',
+                     strftime('%Y-%m-%dT%H:%M:%SZ','now','-60 days'))",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        // Also insert an aged idempotency key — it must NOT be pruned because
+        // idempotency_days == 0 ("keep forever").
+        sqlx::query(
+            "INSERT INTO idempotency_keys (merchant_id, idempotency_key, payment_id, created_at)
+             VALUES ('m', 'old-key', 'p', strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 days'))",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let (deliveries, keys) = prune_once(&state).await.unwrap();
+        assert_eq!(deliveries, 1, "the aged delivery must be pruned");
+        assert_eq!(keys, 0, "idempotency keys must not be pruned when idempotency_days==0");
+
+        // The idempotency key survives.
+        let k_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM idempotency_keys")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(k_count, 1, "idempotency key must remain when idempotency_days==0");
+    }
 }

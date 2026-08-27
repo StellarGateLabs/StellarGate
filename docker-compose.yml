@@ -1,4 +1,8 @@
 services:
+  # Dev defaults are safe to run locally. For production sizing see
+  # deploy/docker-compose.prod.yml and DEPLOYMENT.md. Override resource limits
+  # via COMPOSE_CPU_LIMIT / COMPOSE_MEMORY_LIMIT / COMPOSE_MEMORY_RESERVATION
+  # environment variables.
   api:
     build: .
     ports:
@@ -21,10 +25,10 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "2.0"
-          memory: 1G
+          cpus: "${COMPOSE_CPU_LIMIT:-2.0}"
+          memory: "${COMPOSE_MEMORY_LIMIT:-1G}"
         reservations:
-          memory: 256M
+          memory: "${COMPOSE_MEMORY_RESERVATION:-256M}"
     logging:
       driver: json-file
       options:

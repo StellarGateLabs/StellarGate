@@ -128,6 +128,41 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .await?;
     if has_event_type == 0 {
         sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN event_type TEXT")
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    /* Back-fill `event_type` for legacy rows whose column is NULL but whose
+    stored payload carries an `event` field (issue #237). This makes the
+    FALLBACK_EVENT path in `WebhookDelivery::event` genuinely unreachable for
+    rows this gateway wrote — the fallback is only needed for payloads that
+    could not be parsed at all (corruption, manual edits), which should never
+    happen for rows we inserted ourselves.
+    The JSON path expression `json_extract(payload, '$.event')` returns NULL
+    when the field is absent, keeping those rows NULL (they remain for the
+    fallback). This is a no-op for rows that already have event_type set. */
+    sqlx::query(
+        "UPDATE webhook_deliveries
+            SET event_type = json_extract(payload, '$.event')
+          WHERE event_type IS NULL
+            AND json_extract(payload, '$.event') IS NOT NULL",
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    /* `acknowledged_at` records that somebody has seen a terminal failure and
+    acted on it — set by the bulk requeue/acknowledge endpoint. It exists so
+    retention can distinguish "this failure was dealt with" from "nobody has
+    looked at this yet", and refuse to delete the latter (issue #319). Rows
+    that predate the column are NULL, i.e. unacknowledged, which is the safe
+    reading: we do not know that anyone saw them. */
+    let has_acknowledged_at: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'acknowledged_at'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_acknowledged_at == 0 {
+        sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN acknowledged_at TEXT")
             .execute(pool)
             .await?;
     }
@@ -207,6 +242,32 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_payment
          ON webhook_deliveries(payment_id)",
+    )
+    .execute(pool)
+    .await?;
+
+    /* Partial index covering the redrive worker's per-tick query (issue #239).
+    The query filters on `status IN ('pending', 'failed')` plus `attempts <
+    max_attempts`, then applies date arithmetic over `last_attempt` /
+    `created_at`. Two properties matter here:
+
+    1. The `WHERE status IN ('pending', 'failed')` partial clause keeps the
+       index tiny: in steady state almost every row is `delivered` and therefore
+       immediately excluded — a full table index would grow without bound and
+       still need to visit the status check first.
+    2. Including `attempts`, `last_attempt`, and `created_at` in the index
+       covers the remaining predicates as much as SQLite's limited expression
+       indexing allows; the date-arithmetic expression is not sargable, but
+       narrowing the candidate set to the handful of non-delivered, under-cap
+       rows first is where the dominant win is.
+
+    Verified with EXPLAIN QUERY PLAN: `list_redrivable_deliveries` now shows
+    "SEARCH webhook_deliveries USING INDEX idx_webhook_deliveries_redrive"
+    instead of a full table scan (see `redrive_index_is_used` test). */
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_redrive
+         ON webhook_deliveries(status, attempts, last_attempt, created_at)
+         WHERE status IN ('pending', 'failed')",
     )
     .execute(pool)
     .await?;
@@ -664,6 +725,26 @@ pub async fn find_pending_by_memo(pool: &Db, memo: &str) -> Result<Option<Paymen
     Ok(row.as_ref().map(row_to_payment))
 }
 
+/// Like [`find_pending_by_memo`] but matches any status — used to detect
+/// payments arriving after an intent has already been settled or expired.
+/// Such payments must still be recorded and reported to the merchant (issue
+/// #232), even though the intent's terminal status must not change.
+pub async fn find_by_memo_any_status(pool: &Db, memo: &str) -> Result<Option<Payment>> {
+    let row = sqlx::query(
+        "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
+                webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
+         FROM payments
+         WHERE memo = ?
+         ORDER BY created_at DESC
+         LIMIT 1",
+    )
+    .bind(memo)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.as_ref().map(row_to_payment))
+}
+
 /// Transition a payment to a new status, returning `true` when the row was
 /// actually updated.
 ///
@@ -885,20 +966,33 @@ pub struct WebhookDelivery {
     pub created_at: String,
 }
 
-/// Event name used when a legacy row has no `event_type` and its payload can't
-/// be parsed. Every payload this gateway has ever written carries an `event`
-/// field, so this is a last resort rather than an expected path.
-const FALLBACK_EVENT: &str = "payment.completed";
+/// Event name used when a legacy row has no `event_type` and its stored payload
+/// cannot be parsed. This sentinel is intentionally non-actionable: a receiver
+/// that routes on `payment.completed` (the old fallback) could fulfil an order
+/// because a payload failed to parse — which is precisely the risk #237 closes.
+/// Receivers must treat `payment.unknown` as an opaque signal to look the
+/// payment up via `GET /v1/payments/:id` rather than acting on the event name
+/// directly.
+const FALLBACK_EVENT: &str = "payment.unknown";
 
 impl WebhookDelivery {
     /// The event name to report for this delivery, falling back to the `event`
     /// field of the stored payload for rows written before `event_type`
-    /// existed. Used to reproduce the original `X-StellarGate-Event` header on
-    /// redelivery so the header can never contradict the body.
+    /// existed (and for which the migration backfill could not extract the
+    /// field — e.g. corrupted or externally written rows). If neither source
+    /// yields a value, returns [`FALLBACK_EVENT`] (`"payment.unknown"`), which
+    /// is intentionally non-actionable: a caller receiving that value must
+    /// fetch the full record via `GET /v1/payments/:id` rather than acting on
+    /// the event name directly (issue #237).
     pub fn event(&self) -> String {
         if let Some(event) = &self.event_type {
             return event.clone();
         }
+        // Reach here only for rows whose payload could not be used by the
+        // migration backfill (or rows written after the column existed but
+        // somehow NULL — not possible through normal code paths). The backfill
+        // already tried json_extract; we try a full parse here as a last resort
+        // before falling back to the sentinel.
         serde_json::from_str::<serde_json::Value>(&self.payload)
             .ok()
             .and_then(|v| v.get("event")?.as_str().map(str::to_string))
@@ -1239,27 +1333,92 @@ pub async fn list_api_keys(pool: &Db, merchant_id: &str) -> Result<Vec<ApiKeyInf
         .collect())
 }
 
-/// Revoke a key. Scoped by merchant so one merchant cannot revoke another's.
+/// The outcome of an atomic revocation attempt (issue #247).
 ///
-/// Returns `Ok(false)` when no such live key exists — either it was never
-/// there, belongs to someone else, or is already revoked. Revoking twice is
-/// not an error worth surfacing, but "no key was revoked" is.
-pub async fn revoke_api_key(pool: &Db, merchant_id: &str, key_id: &str) -> Result<bool> {
+/// The previous implementation called `count_active_api_keys` and then
+/// `revoke_api_key` in two separate statements. Two concurrent revocations of
+/// a merchant's two remaining keys would each read a count of 2, each pass the
+/// guard, and both succeed — locking the merchant out. SQLite's serialised
+/// write path makes it safe to fold the guard into the UPDATE's `WHERE` clause
+/// and inspect `rows_affected`, exactly as `update_payment_status` and
+/// `expire_overdue` do.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RevokeKeyOutcome {
+    /// The key was revoked successfully.
+    Revoked,
+    /// The key exists and is active, but it is the merchant's only remaining
+    /// active key — revoking it would lock them out.
+    LastActiveKey,
+    /// No active key with that id was found for this merchant (never existed,
+    /// wrong merchant, or already revoked).
+    NotFound,
+}
+
+/// Revoke a key atomically. Scoped by merchant so one merchant cannot revoke
+/// another's. The last-active-key guard is embedded in the `WHERE` clause, so
+/// it is enforced under SQLite's serialised write path rather than as a
+/// separate check-then-act pair that concurrent requests can both pass.
+///
+/// Returns:
+/// - [`RevokeKeyOutcome::Revoked`] if the key was revoked.
+/// - [`RevokeKeyOutcome::LastActiveKey`] if the key exists but is the only
+///   remaining active key. The caller should issue a replacement first.
+/// - [`RevokeKeyOutcome::NotFound`] if no active key with that id exists for
+///   this merchant.
+pub async fn revoke_api_key(
+    pool: &Db,
+    merchant_id: &str,
+    key_id: &str,
+) -> Result<RevokeKeyOutcome> {
+    // The subquery `(SELECT COUNT(*) … WHERE … AND revoked_at IS NULL) > 1`
+    // is evaluated atomically with the UPDATE under SQLite's single-writer
+    // serialisation. If it evaluates to false (only one active key left), the
+    // UPDATE matches zero rows — the same outcome as when the key does not
+    // exist. We distinguish the two by checking whether the key is live at all
+    // in a second, read-only query run only when rows_affected == 0.
     let affected = sqlx::query(
         "UPDATE api_keys
-            SET revoked_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-          WHERE id = ? AND merchant_id = ? AND revoked_at IS NULL",
+            SET revoked_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+          WHERE id = ?
+            AND merchant_id = ?
+            AND revoked_at IS NULL
+            AND (SELECT COUNT(*) FROM api_keys
+                  WHERE merchant_id = ? AND revoked_at IS NULL) > 1",
     )
     .bind(key_id)
+    .bind(merchant_id)
     .bind(merchant_id)
     .execute(pool)
     .await?
     .rows_affected();
-    Ok(affected > 0)
+
+    if affected > 0 {
+        return Ok(RevokeKeyOutcome::Revoked);
+    }
+
+    // rows_affected == 0: either the key does not exist, or it is the last
+    // active key. Distinguish the two with a read query.
+    let is_last: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM api_keys
+              WHERE id = ? AND merchant_id = ? AND revoked_at IS NULL
+         )",
+    )
+    .bind(key_id)
+    .bind(merchant_id)
+    .fetch_one(pool)
+    .await?;
+
+    if is_last {
+        Ok(RevokeKeyOutcome::LastActiveKey)
+    } else {
+        Ok(RevokeKeyOutcome::NotFound)
+    }
 }
 
-/// Number of usable keys a merchant has, so the API can refuse to revoke the
-/// last one and lock them out.
+/// Number of usable keys a merchant has. Retained for callers that need a
+/// count for informational purposes; the revocation guard itself is now
+/// embedded atomically inside [`revoke_api_key`] (issue #247).
 pub async fn count_active_api_keys(pool: &Db, merchant_id: &str) -> Result<i64> {
     let n: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM api_keys WHERE merchant_id = ? AND revoked_at IS NULL",
@@ -1688,5 +1847,179 @@ mod tests {
                 .is_empty(),
             "grace_secs must floor eligibility even when backoff computes to 0"
         );
+    }
+
+    #[tokio::test]
+    async fn list_redrivable_deliveries_caps_attempt_33_at_the_configured_max() {
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("p1", "MEMOR33", 3600))
+            .await
+            .unwrap();
+        save_webhook_delivery(
+            &pool,
+            "many-failures",
+            "p1",
+            "http://x",
+            "{}",
+            "payment.completed",
+        )
+        .await
+        .unwrap();
+        update_webhook_delivery(&pool, "many-failures", "failed", 33)
+            .await
+            .unwrap();
+
+        // At attempt 33, the uncapped factor is 2^32. With the accepted
+        // one-day extreme, the row must use the 86,400-second cap without
+        // evaluating an overflowing initial * factor product.
+        sqlx::query(
+            "UPDATE webhook_deliveries
+                SET last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ','now','-86399 seconds')
+              WHERE id = 'many-failures'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            list_redrivable_deliveries(&pool, 34, 0, 86_400, 86_400, 0)
+                .await
+                .unwrap()
+                .is_empty(),
+            "attempt 33 must remain ineligible until the configured cap elapses"
+        );
+
+        sqlx::query(
+            "UPDATE webhook_deliveries
+                SET last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ','now','-86401 seconds')
+              WHERE id = 'many-failures'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            list_redrivable_deliveries(&pool, 34, 0, 86_400, 86_400, 0)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "attempt 33 must become eligible immediately after the cap"
+        );
+    }
+
+    /// The partial index on `webhook_deliveries` must exist after migration
+    /// (issue #239) — this is a precondition for the index-scan assertion below.
+    #[tokio::test]
+    async fn redrive_partial_index_exists_after_migration() {
+        let pool = memory_db().await;
+
+        let index_exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index'
+               AND name = 'idx_webhook_deliveries_redrive'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            index_exists, 1,
+            "idx_webhook_deliveries_redrive must exist after db::migrate"
+        );
+
+        let table: String = sqlx::query_scalar(
+            "SELECT tbl_name FROM sqlite_master
+             WHERE type = 'index'
+               AND name = 'idx_webhook_deliveries_redrive'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(table, "webhook_deliveries");
+    }
+
+    /// EXPLAIN QUERY PLAN for the redrive worker's inner query must reference
+    /// the partial index, not a full table scan (issue #239).
+    ///
+    /// We assert that at least one plan step's `detail` column mentions the
+    /// index by name, which would not happen on a full scan.
+    #[tokio::test]
+    async fn redrive_index_is_used_by_list_redrivable_deliveries() {
+        let pool = memory_db().await;
+
+        let plan_rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+            "EXPLAIN QUERY PLAN
+             SELECT id FROM webhook_deliveries
+             WHERE status IN ('pending', 'failed')
+               AND attempts < 8
+             ORDER BY created_at ASC",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let uses_index = plan_rows
+            .iter()
+            .any(|(_, _, _, detail)| detail.contains("idx_webhook_deliveries_redrive"));
+
+        assert!(
+            uses_index,
+            "EXPLAIN QUERY PLAN must reference idx_webhook_deliveries_redrive. \
+             Plan was:\n{:#?}",
+            plan_rows
+                .iter()
+                .map(|(_, _, _, d)| d.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn redrive_backoff_exponent_cap_avoids_extreme_products() {
+        assert_eq!(redrive_backoff_exponent_cap(0, 86_400), 0);
+        assert_eq!(redrive_backoff_exponent_cap(86_400, 86_400), 0);
+        assert_eq!(redrive_backoff_exponent_cap(1, 86_400), 17);
+
+        // Even callers that bypass Config cannot make the SQL multiply two
+        // values whose product would exceed SQLite's signed integer range.
+        assert_eq!(redrive_backoff_exponent_cap(1, i64::MAX), 63);
+        assert_eq!(redrive_backoff_exponent_cap(i64::MAX / 2, i64::MAX), 2);
+    }
+
+    // ── file_sizes / sqlite_path (issue: missing DB metrics) ────────────────
+
+    #[test]
+    fn file_sizes_is_none_for_in_memory_database() {
+        let (main, wal, shm) = file_sizes("sqlite::memory:");
+        assert_eq!((main, wal, shm), (None, None, None));
+    }
+
+    #[test]
+    fn file_sizes_reports_the_main_file_and_absent_wal_shm() {
+        let contents = b"pretend sqlite header bytes";
+        let path =
+            std::env::temp_dir().join(format!("stellargate-metrics-test-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, contents).unwrap();
+
+        let url = format!("sqlite:{}", path.display());
+        let (main, wal, shm) = file_sizes(&url);
+        assert_eq!(
+            main,
+            Some(contents.len() as u64),
+            "main file size must be reported"
+        );
+        assert_eq!(wal, None, "no -wal file exists yet");
+        assert_eq!(shm, None, "no -shm file exists yet");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn file_sizes_strips_query_parameters_before_stat() {
+        // The shared-memory DSN other tests in this module use
+        // (`sqlite:file:<uuid>?mode=memory&cache=shared`) has no on-disk
+        // file, but must not panic or attempt to stat a path still carrying
+        // its `?mode=...` query string.
+        let (main, wal, shm) = file_sizes(&shared_memory_dsn());
+        assert_eq!((main, wal, shm), (None, None, None));
     }
 }

@@ -172,4 +172,91 @@ mod tests {
             Err(StrkeyError::Version) | Err(StrkeyError::Checksum)
         ));
     }
+
+    // ── New targeted tests (issue #439) ─────────────────────────────────────
+
+    #[test]
+    fn display_produces_expected_messages() {
+        // Each variant's Display must map to its documented human-readable
+        // string — the same message the API and logs surface on a bad config.
+        assert_eq!(
+            StrkeyError::Length.to_string(),
+            "must be 56 characters"
+        );
+        assert_eq!(
+            StrkeyError::Alphabet.to_string(),
+            "contains non-base32 characters"
+        );
+        assert_eq!(
+            StrkeyError::Version.to_string(),
+            "wrong version byte (expected a 'G' account address)"
+        );
+        assert_eq!(
+            StrkeyError::Checksum.to_string(),
+            "checksum mismatch (corrupted or mistyped)"
+        );
+    }
+
+    #[test]
+    fn strkey_error_implements_std_error() {
+        // Verify the trait bound is satisfied and that source() returns None
+        // (no cause chain — these are leaf errors).
+        let _: &dyn std::error::Error = &StrkeyError::Length;
+        let _: &dyn std::error::Error = &StrkeyError::Alphabet;
+        let _: &dyn std::error::Error = &StrkeyError::Version;
+        let _: &dyn std::error::Error = &StrkeyError::Checksum;
+
+        use std::error::Error;
+        assert!(StrkeyError::Length.source().is_none());
+        assert!(StrkeyError::Alphabet.source().is_none());
+        assert!(StrkeyError::Version.source().is_none());
+        assert!(StrkeyError::Checksum.source().is_none());
+    }
+
+    #[test]
+    fn all_a_string_fails_version_or_checksum_not_length_or_alphabet() {
+        // 56 uppercase 'A' characters satisfy the length and base32-alphabet
+        // checks (A is a valid base32 symbol) but the decoded version byte
+        // will not be 0x30 (the 'G' marker) and/or the checksum will not
+        // match.
+        let all_a = "A".repeat(56);
+        assert_eq!(all_a.len(), 56);
+        let err = validate_account_id(&all_a).unwrap_err();
+        assert!(
+            matches!(err, StrkeyError::Version | StrkeyError::Checksum),
+            "expected Version or Checksum, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn is_valid_account_id_true_for_known_good() {
+        // The public helper must agree with validate_account_id for the known
+        // valid address used throughout the test suite.
+        assert!(is_valid_account_id(VALID));
+    }
+
+    #[test]
+    fn is_valid_account_id_false_for_empty_string() {
+        // An empty string has length 0, which is not 56 — Length error, false.
+        assert!(!is_valid_account_id(""));
+    }
+
+    #[test]
+    fn digit_one_in_56_char_string_causes_alphabet_error() {
+        // '1' is not in the base32 alphabet (A-Z2-7). Replace the last
+        // character of the valid address with '1' so the length stays 56 and
+        // the only failure is the alphabet check.
+        let bad = format!("{}1", &VALID[..55]);
+        assert_eq!(bad.len(), 56);
+        assert_eq!(validate_account_id(&bad), Err(StrkeyError::Alphabet));
+    }
+
+    #[test]
+    fn lowercase_letters_cause_alphabet_error() {
+        // base32 uses uppercase only. A lowercase version of the valid address
+        // has the correct length but every character is outside the alphabet.
+        let lower = VALID.to_lowercase();
+        assert_eq!(lower.len(), 56);
+        assert_eq!(validate_account_id(&lower), Err(StrkeyError::Alphabet));
+    }
 }

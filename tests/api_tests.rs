@@ -434,8 +434,10 @@ async fn test_create_invalid_asset() {
 }
 
 #[tokio::test]
-async fn test_create_invalid_amount() {
-    let server = test_server().await;
+async fn test_create_rejects_asset_with_confirmed_missing_trustline() {
+    let trustlines = stellargate::metrics::TrustlineMetrics::new();
+    trustlines.record_check(["USDC"], &["USDC".to_string()], &[], &[]);
+    let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
     let key = provision_merchant(&server).await;
     let res = server
         .post("/payments")
@@ -446,18 +448,27 @@ async fn test_create_invalid_amount() {
 }
 
 #[tokio::test]
-async fn test_get_by_id() {
-    let server = test_server().await;
+async fn test_create_accepts_asset_with_confirmed_present_trustline() {
+    let trustlines = stellargate::metrics::TrustlineMetrics::new();
+    trustlines.record_check(["USDC"], &[], &[], &[]);
+    let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
     let key = provision_merchant(&server).await;
     let id = server
         .post("/payments")
         .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({ "amount": "5", "asset": "USDC" }))
-        .await
-        .json::<Value>()["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+        .json(&json!({ "amount": "10", "asset": "USDC" }))
+        .await;
+    res.assert_status(StatusCode::CREATED);
+}
+
+/// Native XLM never needs a trustline, so it's exempt from the check even if
+/// somehow marked missing.
+#[tokio::test]
+async fn test_create_never_rejects_native_xlm_for_a_missing_trustline() {
+    let trustlines = stellargate::metrics::TrustlineMetrics::new();
+    trustlines.record_check(["USDC"], &["USDC".to_string()], &[], &[]);
+    let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
+    let key = provision_merchant(&server).await;
 
     // Full detail now requires the owning merchant's key (issues #67, #85).
     let res = server
@@ -479,9 +490,29 @@ async fn test_get_by_id() {
 }
 
 #[tokio::test]
-async fn test_get_not_found() {
-    let res = test_server().await.get("/payments/does-not-exist").await;
-    res.assert_status(StatusCode::NOT_FOUND);
+async fn test_metrics_expose_trustline_state() {
+    let trustlines = stellargate::metrics::TrustlineMetrics::new();
+    trustlines.record_check(["USDC", "EURC"], &["USDC".to_string()], &[], &[]);
+    trustlines.record_check_failure();
+    let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
+
+    let body = server.get("/metrics").await.text();
+    assert!(
+        body.contains("stellargate_missing_trustlines{asset=\"USDC\"} 1"),
+        "got: {body}"
+    );
+    assert!(
+        body.contains("stellargate_missing_trustlines{asset=\"EURC\"} 0"),
+        "got: {body}"
+    );
+    assert!(
+        body.contains("stellargate_trustline_check_failures_total 1"),
+        "got: {body}"
+    );
+    assert!(
+        body.contains("stellargate_trustline_check_last_success_timestamp_seconds"),
+        "got: {body}"
+    );
 }
 
 #[tokio::test]

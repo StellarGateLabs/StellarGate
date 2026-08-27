@@ -258,12 +258,43 @@ async fn require_admin_secret(
     next: Next,
 ) -> axum::response::Response {
     let configured = &state.config.admin_provisioning_secret;
-    let provided = req
+
+    // An empty configured secret means provisioning is disabled — reject
+    // immediately without touching any caller-supplied value (issue #244).
+    if configured.is_empty() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "missing or invalid admin secret", "code": "unauthorized" })),
+        )
+            .into_response();
+    }
+
+    // Reject a missing or non-UTF-8 header before any comparison.
+    let Some(provided) = req
         .headers()
         .get("x-admin-secret")
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| v.to_str().ok())
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "missing or invalid admin secret", "code": "unauthorized" })),
+        )
+            .into_response();
+    };
 
-    if configured.is_empty() || provided != Some(configured.as_str()) {
+    // Compare SHA-256 digests in constant time (issue #244).
+    //
+    // `str` equality short-circuits on the first differing byte, leaking a
+    // prefix-match oracle. Hashing both sides with SHA-256 normalises them to
+    // fixed-length byte arrays; `==` on `[u8; 32]` uses a fixed-time
+    // comparison in the standard library, removing the oracle. Salting is
+    // unnecessary here — we are comparing a caller-supplied value against a
+    // configured secret, not storing a password.
+    use sha2::{Digest, Sha256};
+    let provided_digest = Sha256::digest(provided.as_bytes());
+    let configured_digest = Sha256::digest(configured.as_bytes());
+
+    if provided_digest != configured_digest {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "missing or invalid admin secret", "code": "unauthorized" })),
@@ -402,25 +433,45 @@ async fn revoke_api_key(
         ));
     }
 
-    if db::count_active_api_keys(&state.pool, &merchant_id).await? <= 1 {
-        return Err(AppError::bad_request(
+    // The guard against revoking the last active key is now enforced atomically
+    // inside the UPDATE via a subquery (issue #247). The previous
+    // check-then-act split (count_active_api_keys → revoke_api_key) could be
+    // bypassed by two concurrent revocations of a merchant's two remaining
+    // keys: both would read a count of 2, both pass the guard, and both
+    // succeed, locking the merchant out. RevokeKeyOutcome::LastActiveKey is
+    // returned when the atomic guard fires.
+    match db::revoke_api_key(&state.pool, &merchant_id, &key_id).await? {
+        db::RevokeKeyOutcome::Revoked => {
+            let source_ip = client_ip_key_from_parts(
+                Some(peer),
+                &headers,
+                &state.config.trusted_proxy_cidrs,
+            );
+            tracing::warn!(
+                audit = true,
+                action = "api_key.revoke",
+                actor = "admin",
+                outcome = "revoked",
+                %merchant_id,
+                %key_id,
+                source_ip = %source_ip,
+                request_id = %request_id(&headers),
+                "api key revoked"
+            );
+            Ok((
+                StatusCode::OK,
+                Json(json!({ "key_id": key_id, "revoked": true })),
+            ))
+        }
+        db::RevokeKeyOutcome::LastActiveKey => Err(AppError::bad_request(
             "last_active_key",
             "cannot revoke a merchant's only active key — issue a replacement first",
-        ));
-    }
-
-    if !db::revoke_api_key(&state.pool, &merchant_id, &key_id).await? {
-        return Err(AppError::not_found(
+        )),
+        db::RevokeKeyOutcome::NotFound => Err(AppError::not_found(
             "key_not_found",
             "no active key with that id for this merchant",
-        ));
+        )),
     }
-
-    tracing::warn!(%merchant_id, %key_id, "api key revoked");
-    Ok((
-        StatusCode::OK,
-        Json(json!({ "key_id": key_id, "revoked": true })),
-    ))
 }
 
 #[derive(serde::Deserialize)]
@@ -484,12 +535,25 @@ fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
             _ if path.starts_with("/payments/") && path.ends_with("/redeliver") => {
                 Some("redeliver")
             }
+            // Key issuance: POST /merchants/:id/keys — credential lifecycle
+            // belongs in the "merchants" write bucket, not the default read
+            // bucket that gives it 5× the quota (issue #243).
+            _ if path.starts_with("/merchants/") => Some("merchants"),
             _ => Some("default"),
         };
     }
-    // All non-POST requests (GET, etc.) fall into the default bucket so that
-    // payment enumeration, webhook listing, and health/ready probes are all
-    // covered by a baseline limit.
+    // DELETE is a write/destructive operation. Key revocation
+    // (DELETE /merchants/:id/keys/:key_id) must be treated as a write like
+    // POST /merchants, not as cheap read-only traffic (issue #243).
+    if req.method() == axum::http::Method::DELETE
+        && path.starts_with("/merchants/")
+        && path.contains("/keys/")
+    {
+        return Some("merchants");
+    }
+    // All other non-POST requests (GET, etc.) fall into the default bucket so
+    // that payment enumeration and webhook listing are covered by a baseline
+    // limit.
     Some("default")
 }
 
@@ -769,5 +833,257 @@ mod tests {
         let server = TestServer::new(timeout_test_router(Duration::from_millis(200))).unwrap();
         let response = server.get("/fast").await;
         response.assert_status_ok();
+    }
+
+    // ── client_ip_key (issue #330) ───────────────────────────────────────────
+
+    /// Build a bare request with an optional peer IP and headers, the inputs
+    /// `client_ip_key` actually reads (extensions + headers).
+    fn req_with(peer: Option<&str>, headers: &[(&str, &str)]) -> Request<axum::body::Body> {
+        let mut req = Request::builder().body(axum::body::Body::empty()).unwrap();
+        if let Some(ip) = peer {
+            let addr = SocketAddr::new(ip.parse().unwrap(), 0);
+            req.extensions_mut().insert(ConnectInfo(addr));
+        }
+        for (name, value) in headers {
+            req.headers_mut().insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        req
+    }
+
+    fn cidrs(list: &[&str]) -> Vec<IpNet> {
+        list.iter().map(|c| c.parse().unwrap()).collect()
+    }
+
+    /// TEST-NET-3 (RFC 5737) — documentation IPs, safe to use as fake clients.
+    const PEER: &str = "203.0.113.9";
+    const FAKE_CLIENT: &str = "198.51.100.7";
+
+    #[test]
+    fn untrusted_peer_ignores_spoofed_forwarding_headers() {
+        let req = req_with(
+            Some(PEER),
+            &[
+                ("x-forwarded-for", FAKE_CLIENT),
+                ("x-real-ip", "198.51.100.8"),
+            ],
+        );
+        assert_eq!(
+            client_ip_key(&req, &cidrs(&["10.0.0.0/8"])),
+            PEER,
+            "an untrusted peer must be attributed by its own address"
+        );
+    }
+
+    #[test]
+    fn headers_ignored_when_no_trusted_proxies_configured() {
+        // The acceptance criterion: with TRUSTED_PROXY_CIDRS unset, forwarding
+        // headers are ignored regardless of ConnectInfo.
+        let req = req_with(Some(PEER), &[("x-forwarded-for", FAKE_CLIENT)]);
+        assert_eq!(client_ip_key(&req, &[]), PEER);
+    }
+
+    #[test]
+    fn trusted_proxy_chain_takes_rightmost_non_trusted_hop() {
+        // Peer is a trusted proxy; the chain was appended by trusted proxies
+        // (rightmost first), so the leftmost client survives.
+        let req = req_with(
+            Some("10.0.0.1"),
+            &[("x-forwarded-for", "198.51.100.7, 10.0.0.5, 10.0.0.1")],
+        );
+        assert_eq!(client_ip_key(&req, &cidrs(&["10.0.0.0/8"])), FAKE_CLIENT);
+    }
+
+    #[test]
+    fn trusted_proxy_chain_of_only_trusted_hops_falls_back_to_peer() {
+        let req = req_with(
+            Some("10.0.0.1"),
+            &[("x-forwarded-for", "10.0.0.9, 10.0.0.1")],
+        );
+        assert_eq!(client_ip_key(&req, &cidrs(&["10.0.0.0/8"])), "10.0.0.1");
+    }
+
+    #[test]
+    fn trusted_proxy_honors_x_real_ip_when_no_forwarded_for() {
+        let req = req_with(Some("10.0.0.1"), &[("x-real-ip", FAKE_CLIENT)]);
+        assert_eq!(client_ip_key(&req, &cidrs(&["10.0.0.0/8"])), FAKE_CLIENT);
+    }
+
+    #[test]
+    fn missing_connect_info_fails_closed_to_shared_key() {
+        // Router served without connect info: headers must never be trusted,
+        // and every request shares one key rather than minting per-header ones.
+        let req = req_with(None, &[("x-forwarded-for", FAKE_CLIENT)]);
+        assert_eq!(
+            client_ip_key(&req, &cidrs(&["10.0.0.0/8"])),
+            CLIENT_IP_UNKNOWN
+        );
+    }
+
+    #[test]
+    fn plain_peer_with_no_headers_uses_peer_address() {
+        let req = req_with(Some(PEER), &[]);
+        assert_eq!(client_ip_key(&req, &cidrs(&["10.0.0.0/8"])), PEER);
+    }
+
+    // ── reset_and_retry_after (issue #327) ───────────────────────────────────
+    //
+    // These are where the "derived, not fabricated" claim is actually pinned.
+    // The integration tests cannot do it: every quota the service builds is a
+    // `Quota::per_second(n)`, under which one cell replenishes in `1/n` seconds,
+    // so the wait is always sub-second and `Retry-After` — an integer per
+    // RFC 9110 — rounds to `1` at every configured rate. The hard-coded `1` was
+    // numerically indistinguishable from the truth for every reachable
+    // configuration, which is precisely why it survived review.
+    //
+    // A slow quota is where the two diverge, so that is what these use. They
+    // also mean the derivation stays correct if the quota shape ever changes
+    // (a per-minute window, a burst allowance) without anyone remembering that
+    // a constant elsewhere encodes an assumption about it.
+
+    /// A ten-minute replenish interval: the derived answer is 600, a fabricated
+    /// one is 1.
+    #[test]
+    fn retry_after_follows_a_slow_quota_instead_of_a_constant() {
+        assert_eq!(retry_after_secs(Duration::from_secs(600)), 600);
+    }
+
+    #[test]
+    fn retry_after_rounds_up_rather_than_truncating() {
+        // 1.4s truncated to 1 would retry into another rejection.
+        assert_eq!(retry_after_secs(Duration::from_millis(1_400)), 2);
+    }
+
+    #[test]
+    fn retry_after_never_tells_a_client_to_retry_immediately() {
+        assert_eq!(retry_after_secs(Duration::ZERO), 1);
+        assert_eq!(retry_after_secs(Duration::from_millis(1)), 1);
+    }
+
+    fn slow_quota(period: Duration, burst: u32) -> governor::Quota {
+        governor::Quota::with_period(period)
+            .unwrap()
+            .allow_burst(NonZeroU32::new(burst).unwrap())
+    }
+
+    #[test]
+    fn reset_is_zero_when_the_bucket_is_untouched() {
+        let quota = slow_quota(Duration::from_secs(60), 5);
+        assert_eq!(reset_secs(quota, 5, Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn reset_counts_every_missing_cell_not_just_the_next_one() {
+        // 3 of 5 cells spent, one minute each to replenish → 180s to full.
+        let quota = slow_quota(Duration::from_secs(60), 5);
+        assert_eq!(reset_secs(quota, 2, Duration::ZERO), 180);
+    }
+
+    #[test]
+    fn reset_on_a_drained_bucket_covers_the_whole_refill() {
+        // Empty, with the next cell 60s out: still 5 × 60s to full capacity.
+        let quota = slow_quota(Duration::from_secs(60), 5);
+        assert_eq!(reset_secs(quota, 0, Duration::from_secs(60)), 300);
+    }
+
+    /// `Reset` is time-to-full and `Retry-After` is time-to-one-cell, so the
+    /// former can never be the smaller of the two. A client that waited
+    /// `Reset` and still got throttled would have no way to make progress.
+    #[test]
+    fn reset_is_never_shorter_than_retry_after() {
+        let quota = slow_quota(Duration::from_secs(600), 1);
+        let wait = Duration::from_secs(600);
+        assert!(reset_secs(quota, 0, wait) >= retry_after_secs(wait));
+    }
+
+    // ── rate_limited_bucket — probe exemption ────────────────────────────────
+
+    fn method_req(method: axum::http::Method, path: &str) -> Request<axum::body::Body> {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn probe_endpoints_bypass_the_rate_limiter() {
+        for path in ["/health", "/ready", "/metrics"] {
+            assert_eq!(
+                rate_limited_bucket(&method_req(axum::http::Method::GET, path)),
+                None,
+                "{path} must return None so rate_limit_middleware skips it entirely"
+            );
+        }
+    }
+
+    /// The exemption is scoped to exactly the three probe paths — it must not
+    /// widen into "every GET is exempt", which would silently undo the
+    /// per-IP protection on payment enumeration and webhook listing.
+    #[test]
+    fn other_get_routes_still_fall_into_the_default_bucket() {
+        assert_eq!(
+            rate_limited_bucket(&method_req(axum::http::Method::GET, "/payments/abc")),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_bucket_assignment_all_routes() {
+        use axum::http::Method;
+        let cases = [
+            (Method::POST, "/payments", Some("payments")),
+            (Method::POST, "/v1/payments", Some("payments")),
+            (Method::POST, "/merchants", Some("merchants")),
+            (Method::POST, "/v1/merchants", Some("merchants")),
+            (
+                Method::POST,
+                "/payments/x/webhooks/y/redeliver",
+                Some("redeliver"),
+            ),
+            (
+                Method::POST,
+                "/v1/payments/x/webhooks/y/redeliver",
+                Some("redeliver"),
+            ),
+            // Key issuance: POST to /merchants/:id/keys must be in the
+            // write "merchants" bucket, not the 5× read default (issue #243).
+            (Method::POST, "/merchants/abc/keys", Some("merchants")),
+            (Method::POST, "/v1/merchants/abc/keys", Some("merchants")),
+            // Key revocation: DELETE is a destructive write, same bucket (issue #243).
+            (
+                Method::DELETE,
+                "/merchants/abc/keys/key-id",
+                Some("merchants"),
+            ),
+            (
+                Method::DELETE,
+                "/v1/merchants/abc/keys/key-id",
+                Some("merchants"),
+            ),
+            (Method::GET, "/health", None),
+            (Method::GET, "/v1/health", None),
+        ];
+
+        for (method, path, expected_bucket) in cases {
+            let req = method_req(method.clone(), path);
+            assert_eq!(
+                rate_limited_bucket(&req),
+                expected_bucket,
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bucket_rate_multiplier() {
+        assert_eq!(bucket_rate_multiplier("payments"), 1);
+        assert_eq!(bucket_rate_multiplier("merchants"), 1);
+        assert_eq!(bucket_rate_multiplier("redeliver"), 1);
+        assert_eq!(bucket_rate_multiplier("default"), 5);
+        assert_eq!(bucket_rate_multiplier("unknown"), 5);
     }
 }
