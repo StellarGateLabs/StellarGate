@@ -425,12 +425,43 @@ async fn require_admin_secret(
     next: Next,
 ) -> axum::response::Response {
     let configured = &state.config.admin_provisioning_secret;
-    let provided = req
+
+    // An empty configured secret means provisioning is disabled — reject
+    // immediately without touching any caller-supplied value (issue #244).
+    if configured.is_empty() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "missing or invalid admin secret", "code": "unauthorized" })),
+        )
+            .into_response();
+    }
+
+    // Reject a missing or non-UTF-8 header before any comparison.
+    let Some(provided) = req
         .headers()
         .get("x-admin-secret")
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| v.to_str().ok())
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "missing or invalid admin secret", "code": "unauthorized" })),
+        )
+            .into_response();
+    };
 
-    if configured.is_empty() || provided != Some(configured.as_str()) {
+    // Compare SHA-256 digests in constant time (issue #244).
+    //
+    // `str` equality short-circuits on the first differing byte, leaking a
+    // prefix-match oracle. Hashing both sides with SHA-256 normalises them to
+    // fixed-length byte arrays; `==` on `[u8; 32]` uses a fixed-time
+    // comparison in the standard library, removing the oracle. Salting is
+    // unnecessary here — we are comparing a caller-supplied value against a
+    // configured secret, not storing a password.
+    use sha2::{Digest, Sha256};
+    let provided_digest = Sha256::digest(provided.as_bytes());
+    let configured_digest = Sha256::digest(configured.as_bytes());
+
+    if provided_digest != configured_digest {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "missing or invalid admin secret", "code": "unauthorized" })),
@@ -778,37 +809,45 @@ async fn revoke_api_key(
         ));
     }
 
-    if db::count_active_api_keys(&state.pool, &merchant_id).await? <= 1 {
-        return Err(AppError::bad_request(
+    // The guard against revoking the last active key is now enforced atomically
+    // inside the UPDATE via a subquery (issue #247). The previous
+    // check-then-act split (count_active_api_keys → revoke_api_key) could be
+    // bypassed by two concurrent revocations of a merchant's two remaining
+    // keys: both would read a count of 2, both pass the guard, and both
+    // succeed, locking the merchant out. RevokeKeyOutcome::LastActiveKey is
+    // returned when the atomic guard fires.
+    match db::revoke_api_key(&state.pool, &merchant_id, &key_id).await? {
+        db::RevokeKeyOutcome::Revoked => {
+            let source_ip = client_ip_key_from_parts(
+                Some(peer),
+                &headers,
+                &state.config.trusted_proxy_cidrs,
+            );
+            tracing::warn!(
+                audit = true,
+                action = "api_key.revoke",
+                actor = "admin",
+                outcome = "revoked",
+                %merchant_id,
+                %key_id,
+                source_ip = %source_ip,
+                request_id = %request_id(&headers),
+                "api key revoked"
+            );
+            Ok((
+                StatusCode::OK,
+                Json(json!({ "key_id": key_id, "revoked": true })),
+            ))
+        }
+        db::RevokeKeyOutcome::LastActiveKey => Err(AppError::bad_request(
             "last_active_key",
             "cannot revoke a merchant's only active key — issue a replacement first",
-        ));
-    }
-
-    if !db::revoke_api_key(&state.pool, &merchant_id, &key_id).await? {
-        return Err(AppError::not_found(
+        )),
+        db::RevokeKeyOutcome::NotFound => Err(AppError::not_found(
             "key_not_found",
             "no active key with that id for this merchant",
-        ));
+        )),
     }
-
-    let source_ip =
-        client_ip_key_from_parts(Some(peer), &headers, &state.config.trusted_proxy_cidrs);
-    tracing::warn!(
-        audit = true,
-        action = "api_key.revoke",
-        actor = "admin",
-        outcome = "revoked",
-        %merchant_id,
-        %key_id,
-        source_ip = %source_ip,
-        request_id = %request_id(&headers),
-        "api key revoked"
-    );
-    Ok((
-        StatusCode::OK,
-        Json(json!({ "key_id": key_id, "revoked": true })),
-    ))
 }
 
 /// The optional `POST /merchants/:id/keys` body.

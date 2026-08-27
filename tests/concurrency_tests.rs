@@ -426,3 +426,99 @@ async fn reprocessing_past_transactions_never_double_credits() {
         assert_state(&pool, &payment_id, "completed", "10").await;
     }
 }
+
+// ── issue #247: atomic last-key guard in revoke_api_key ──────────────────────
+
+/// Two concurrent revocations of a merchant's two remaining keys must leave
+/// exactly one key active. The previous TOCTOU implementation (read count,
+/// then revoke) allowed both revocations to pass the "is this the last key?"
+/// check, locking the merchant out entirely.
+///
+/// The fix folds the guard into the UPDATE's WHERE clause with a subquery, so
+/// SQLite's serialised write path enforces it atomically. This test verifies
+/// the guarantee end-to-end.
+#[tokio::test]
+async fn concurrent_last_key_revocations_leave_exactly_one_active() {
+    use stellargate::db::{self, RevokeKeyOutcome};
+
+    // Use a multi-connection pool so the two concurrent write paths can
+    // genuinely land on different pooled connections (same database via
+    // cache=shared).
+    let pool = memory_pool().await;
+
+    // Provision a merchant with two active keys.
+    let merchant_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO merchants (id, created_at) VALUES (?, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+    )
+    .bind(&merchant_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert two raw API-key rows (pre-hashed; we just need live rows).
+    let key_id_a = uuid::Uuid::new_v4().to_string();
+    let key_id_b = uuid::Uuid::new_v4().to_string();
+    for key_id in [&key_id_a, &key_id_b] {
+        sqlx::query(
+            "INSERT INTO api_keys (id, merchant_id, key_hash, prefix, created_at)
+             VALUES (?, ?, 'hash', 'sg_', strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+        )
+        .bind(key_id)
+        .bind(&merchant_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // Sanity check: two active keys before the race.
+    let active_before = db::count_active_api_keys(&pool, &merchant_id)
+        .await
+        .unwrap();
+    assert_eq!(active_before, 2, "must start with exactly 2 active keys");
+
+    // Fire both revocations concurrently.
+    let pool_a = pool.clone();
+    let pool_b = pool.clone();
+    let mid_a = merchant_id.clone();
+    let mid_b = merchant_id.clone();
+    let kid_a = key_id_a.clone();
+    let kid_b = key_id_b.clone();
+
+    let (outcome_a, outcome_b) = tokio::join!(
+        db::revoke_api_key(&pool_a, &mid_a, &kid_a),
+        db::revoke_api_key(&pool_b, &mid_b, &kid_b),
+    );
+
+    let outcome_a = outcome_a.expect("revoke A must not error");
+    let outcome_b = outcome_b.expect("revoke B must not error");
+
+    // Exactly one revocation must succeed; the other must be blocked by the
+    // atomic last-key guard and return LastActiveKey.
+    let successes = [&outcome_a, &outcome_b]
+        .iter()
+        .filter(|o| ***o == RevokeKeyOutcome::Revoked)
+        .count();
+    let blocked = [&outcome_a, &outcome_b]
+        .iter()
+        .filter(|o| ***o == RevokeKeyOutcome::LastActiveKey)
+        .count();
+
+    assert_eq!(
+        successes, 1,
+        "exactly one revocation must succeed; outcomes: {outcome_a:?}, {outcome_b:?}"
+    );
+    assert_eq!(
+        blocked, 1,
+        "exactly one revocation must be blocked as last active key; outcomes: {outcome_a:?}, {outcome_b:?}"
+    );
+
+    // Confirm database state: one active key remains.
+    let active_after = db::count_active_api_keys(&pool, &merchant_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        active_after, 1,
+        "exactly one active key must survive concurrent revocations; got {active_after}"
+    );
+}

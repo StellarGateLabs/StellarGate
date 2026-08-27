@@ -1815,27 +1815,92 @@ pub async fn list_api_keys_keyset(
     Ok(key_rows_to_info(rows))
 }
 
-/// Revoke a key. Scoped by merchant so one merchant cannot revoke another's.
+/// The outcome of an atomic revocation attempt (issue #247).
 ///
-/// Returns `Ok(false)` when no such live key exists — either it was never
-/// there, belongs to someone else, or is already revoked. Revoking twice is
-/// not an error worth surfacing, but "no key was revoked" is.
-pub async fn revoke_api_key(pool: &Db, merchant_id: &str, key_id: &str) -> Result<bool> {
+/// The previous implementation called `count_active_api_keys` and then
+/// `revoke_api_key` in two separate statements. Two concurrent revocations of
+/// a merchant's two remaining keys would each read a count of 2, each pass the
+/// guard, and both succeed — locking the merchant out. SQLite's serialised
+/// write path makes it safe to fold the guard into the UPDATE's `WHERE` clause
+/// and inspect `rows_affected`, exactly as `update_payment_status` and
+/// `expire_overdue` do.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RevokeKeyOutcome {
+    /// The key was revoked successfully.
+    Revoked,
+    /// The key exists and is active, but it is the merchant's only remaining
+    /// active key — revoking it would lock them out.
+    LastActiveKey,
+    /// No active key with that id was found for this merchant (never existed,
+    /// wrong merchant, or already revoked).
+    NotFound,
+}
+
+/// Revoke a key atomically. Scoped by merchant so one merchant cannot revoke
+/// another's. The last-active-key guard is embedded in the `WHERE` clause, so
+/// it is enforced under SQLite's serialised write path rather than as a
+/// separate check-then-act pair that concurrent requests can both pass.
+///
+/// Returns:
+/// - [`RevokeKeyOutcome::Revoked`] if the key was revoked.
+/// - [`RevokeKeyOutcome::LastActiveKey`] if the key exists but is the only
+///   remaining active key. The caller should issue a replacement first.
+/// - [`RevokeKeyOutcome::NotFound`] if no active key with that id exists for
+///   this merchant.
+pub async fn revoke_api_key(
+    pool: &Db,
+    merchant_id: &str,
+    key_id: &str,
+) -> Result<RevokeKeyOutcome> {
+    // The subquery `(SELECT COUNT(*) … WHERE … AND revoked_at IS NULL) > 1`
+    // is evaluated atomically with the UPDATE under SQLite's single-writer
+    // serialisation. If it evaluates to false (only one active key left), the
+    // UPDATE matches zero rows — the same outcome as when the key does not
+    // exist. We distinguish the two by checking whether the key is live at all
+    // in a second, read-only query run only when rows_affected == 0.
     let affected = sqlx::query(
         "UPDATE api_keys
-            SET revoked_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-          WHERE id = ? AND merchant_id = ? AND revoked_at IS NULL",
+            SET revoked_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+          WHERE id = ?
+            AND merchant_id = ?
+            AND revoked_at IS NULL
+            AND (SELECT COUNT(*) FROM api_keys
+                  WHERE merchant_id = ? AND revoked_at IS NULL) > 1",
     )
     .bind(key_id)
+    .bind(merchant_id)
     .bind(merchant_id)
     .execute(pool)
     .await?
     .rows_affected();
-    Ok(affected > 0)
+
+    if affected > 0 {
+        return Ok(RevokeKeyOutcome::Revoked);
+    }
+
+    // rows_affected == 0: either the key does not exist, or it is the last
+    // active key. Distinguish the two with a read query.
+    let is_last: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM api_keys
+              WHERE id = ? AND merchant_id = ? AND revoked_at IS NULL
+         )",
+    )
+    .bind(key_id)
+    .bind(merchant_id)
+    .fetch_one(pool)
+    .await?;
+
+    if is_last {
+        Ok(RevokeKeyOutcome::LastActiveKey)
+    } else {
+        Ok(RevokeKeyOutcome::NotFound)
+    }
 }
 
-/// Number of usable keys a merchant has, so the API can refuse to revoke the
-/// last one and lock them out.
+/// Number of usable keys a merchant has. Retained for callers that need a
+/// count for informational purposes; the revocation guard itself is now
+/// embedded atomically inside [`revoke_api_key`] (issue #247).
 pub async fn count_active_api_keys(pool: &Db, merchant_id: &str) -> Result<i64> {
     let n: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM api_keys WHERE merchant_id = ? AND revoked_at IS NULL",

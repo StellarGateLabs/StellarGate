@@ -608,6 +608,41 @@ impl Config {
             ));
         }
 
+        let webhook_allow_private_targets: bool =
+            parse_env("WEBHOOK_ALLOW_PRIVATE_TARGETS", false)?;
+
+        // Refuse to boot on a public-network deployment with the SSRF guard
+        // disabled. With WEBHOOK_ALLOW_PRIVATE_TARGETS=true any authenticated
+        // merchant can craft a webhook_url that reaches cloud instance-metadata
+        // endpoints (169.254.169.254), services bound to loopback, or hosts on
+        // the internal network — and get a response oracle back through
+        // GET /payments/:id/webhooks (issue #246).
+        if network == "public" && webhook_allow_private_targets {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_ALLOW_PRIVATE_TARGETS must not be enabled when \
+                 STELLAR_NETWORK=public. It disables the SSRF guard, letting any \
+                 merchant's webhook_url reach cloud metadata endpoints \
+                 (169.254.169.254) and internal services. This flag is only for \
+                 local development and tests — remove it before deploying to \
+                 production."
+            ));
+        }
+
+        // Warn on any network so the flag cannot be left on unnoticed on a
+        // staging or development host that shares configuration with production
+        // (issue #246).
+        if webhook_allow_private_targets {
+            tracing::warn!(
+                "WEBHOOK_ALLOW_PRIVATE_TARGETS=true: the SSRF guard is disabled. \
+                 Webhook targets may reach loopback, link-local, and private-range \
+                 addresses. This flag is only for local development and tests — \
+                 never enable it in a deployment that handles real payments."
+            );
+        }
+
+        let admin_provisioning_secret =
+            Self::validate_admin_secret(std::env::var("ADMIN_PROVISIONING_SECRET"))?;
+
         let config = Self {
             port: parse_env("PORT", 3000)?,
             database_url,
@@ -653,8 +688,8 @@ impl Config {
             listener_mode: ListenerMode::parse(
                 &std::env::var("STELLAR_LISTENER_MODE").unwrap_or_default(),
             )?,
-            webhook_allow_private_targets: parse_env("WEBHOOK_ALLOW_PRIVATE_TARGETS", false)?,
-            admin_provisioning_secret: env_or("ADMIN_PROVISIONING_SECRET", ""),
+            webhook_allow_private_targets,
+            admin_provisioning_secret,
             request_timeout_secs: parse_env("REQUEST_TIMEOUT_SECS", 30)?,
             stream_idle_timeout_secs: parse_env("STREAM_IDLE_TIMEOUT_SECS", 30)?,
             trusted_proxy_cidrs: parse_cidrs(
@@ -1184,6 +1219,72 @@ impl Config {
         if secret.len() < 32 {
             return Err(anyhow::anyhow!(
                 "WEBHOOK_SECRET must be at least 32 characters long (got {})",
+                secret.len()
+            ));
+        }
+
+        Ok(secret)
+    }
+
+    /// Validate `ADMIN_PROVISIONING_SECRET` (issue #245).
+    ///
+    /// * Empty / absent → provisioning disabled; log at `info` and return `""`.
+    /// * Non-empty but short (< 32 chars) → abort boot.
+    /// * Non-empty but a known placeholder → abort boot.
+    /// * Otherwise → return the secret unchanged.
+    ///
+    /// The asymmetry with `validate_webhook_secret` (which requires the
+    /// variable to be present) is intentional: an empty `ADMIN_PROVISIONING_SECRET`
+    /// is a valid configuration choice that disables the `POST /merchants`
+    /// endpoint entirely. A non-empty but weak value is always a mistake,
+    /// because `require_admin_secret` guards merchant provisioning and the
+    /// whole API-key lifecycle.
+    fn validate_admin_secret(raw_secret: Result<String, std::env::VarError>) -> Result<String> {
+        let secret = match raw_secret {
+            Ok(s) => s,
+            // Absent is treated the same as empty: provisioning disabled.
+            Err(_) => String::new(),
+        };
+
+        if secret.is_empty() {
+            tracing::info!(
+                "ADMIN_PROVISIONING_SECRET is not set — \
+                 merchant provisioning is disabled (POST /merchants returns 401). \
+                 Set the variable to a strong random value to enable it."
+            );
+            return Ok(String::new());
+        }
+
+        // Reject placeholder values that an operator might copy from documentation
+        // or a template without changing.
+        const ADMIN_PLACEHOLDERS: &[&str] = &[
+            "admin",
+            "secret",
+            "changeme",
+            "password",
+            "test",
+            "admin123",
+            "your_admin_provisioning_secret",
+            "REPLACE_ME_admin_provisioning_secret",
+        ];
+        if ADMIN_PLACEHOLDERS.contains(&secret.as_str())
+            || secret.starts_with("REPLACE_ME_")
+            || secret.to_ascii_lowercase() == "admin"
+            || secret.to_ascii_lowercase() == "secret"
+            || secret.to_ascii_lowercase() == "changeme"
+        {
+            return Err(anyhow::anyhow!(
+                "ADMIN_PROVISIONING_SECRET is set to a known placeholder value. \
+                 Replace it with a strong, randomly-generated secret \
+                 (e.g. `openssl rand -hex 32`)."
+            ));
+        }
+
+        if secret.len() < 32 {
+            return Err(anyhow::anyhow!(
+                "ADMIN_PROVISIONING_SECRET must be at least 32 characters long \
+                 (got {}). Use a randomly-generated value \
+                 (e.g. `openssl rand -hex 32`).",
                 secret.len()
             ));
         }
@@ -2783,6 +2884,179 @@ mod tests {
             || {
                 let err = Config::from_env().unwrap_err().to_string();
                 assert!(err.contains("HORIZON_PAGE_LIMIT"), "got: {err}");
+            },
+        );
+    }
+
+    // ── issue #246: WEBHOOK_ALLOW_PRIVATE_TARGETS on public network ───────────
+
+    /// The flag must be rejected at boot when STELLAR_NETWORK=public (issue #246).
+    #[test]
+    fn private_targets_on_public_network_aborts_boot() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("public")),
+                ("CORS_ALLOWED_ORIGINS", Some("https://example.com")),
+                ("WEBHOOK_ALLOW_PRIVATE_TARGETS", Some("true")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("WEBHOOK_ALLOW_PRIVATE_TARGETS"),
+                    "error must name the offending variable; got: {err}"
+                );
+                assert!(
+                    err.contains("STELLAR_NETWORK=public"),
+                    "error must mention the network constraint; got: {err}"
+                );
+            },
+        );
+    }
+
+    /// The flag is allowed on testnet (development use-case). Boot must succeed.
+    #[test]
+    fn private_targets_on_testnet_is_allowed() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("testnet")),
+                ("WEBHOOK_ALLOW_PRIVATE_TARGETS", Some("true")),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert!(
+                    cfg.webhook_allow_private_targets,
+                    "flag should be set on testnet"
+                );
+            },
+        );
+    }
+
+    // ── issue #245: ADMIN_PROVISIONING_SECRET validation ──────────────────────
+
+    /// An empty (unset) admin secret disables provisioning — boot must succeed.
+    #[test]
+    fn admin_secret_empty_disables_provisioning() {
+        let result = Config::validate_admin_secret(Err(std::env::VarError::NotPresent));
+        assert!(result.is_ok(), "absent secret should succeed; got: {:?}", result);
+        assert_eq!(result.unwrap(), "");
+    }
+
+    /// An explicitly empty env var is the same as absent.
+    #[test]
+    fn admin_secret_explicit_empty_string_disables_provisioning() {
+        let result = Config::validate_admin_secret(Ok(String::new()));
+        assert!(result.is_ok(), "empty string should succeed; got: {:?}", result);
+        assert_eq!(result.unwrap(), "");
+    }
+
+    /// A value shorter than 32 characters is rejected.
+    #[test]
+    fn admin_secret_too_short_aborts_boot() {
+        let result = Config::validate_admin_secret(Ok("short".into()));
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("at least 32 characters"),
+            "error must mention the length requirement; got: {err}"
+        );
+    }
+
+    /// Exactly 31 characters is one under the limit.
+    #[test]
+    fn admin_secret_31_chars_is_rejected() {
+        let result = Config::validate_admin_secret(Ok("a".repeat(31)));
+        assert!(
+            result.is_err(),
+            "31-char secret should be rejected; got: {:?}",
+            result
+        );
+    }
+
+    /// Exactly 32 characters is the boundary — must be accepted.
+    #[test]
+    fn admin_secret_32_chars_is_accepted() {
+        let result = Config::validate_admin_secret(Ok("a".repeat(32)));
+        assert!(
+            result.is_ok(),
+            "32-char secret should be accepted; got: {:?}",
+            result
+        );
+    }
+
+    /// Known placeholder values are rejected regardless of length.
+    #[test]
+    fn admin_secret_placeholder_admin_is_rejected() {
+        let result = Config::validate_admin_secret(Ok("admin".into()));
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("placeholder"),
+            "error must mention placeholder; got: {err}"
+        );
+    }
+
+    #[test]
+    fn admin_secret_placeholder_changeme_is_rejected() {
+        let result = Config::validate_admin_secret(Ok("changeme".into()));
+        assert!(result.is_err(), "changeme should be rejected");
+    }
+
+    #[test]
+    fn admin_secret_placeholder_replace_me_prefix_is_rejected() {
+        let result =
+            Config::validate_admin_secret(Ok("REPLACE_ME_admin_provisioning_secret".into()));
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("placeholder"),
+            "error must mention placeholder; got: {err}"
+        );
+    }
+
+    /// A strong, randomly-generated secret must be accepted.
+    #[test]
+    fn admin_secret_strong_value_is_accepted() {
+        let strong = "a3f8b2c1d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1";
+        let result = Config::validate_admin_secret(Ok(strong.into()));
+        assert!(
+            result.is_ok(),
+            "strong secret should be accepted; got: {:?}",
+            result
+        );
+        assert_eq!(result.unwrap(), strong);
+    }
+
+    /// The whole from_env path must accept a strong admin secret.
+    #[test]
+    fn admin_secret_from_env_strong_value_is_accepted() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("ADMIN_PROVISIONING_SECRET", Some(
+                    "a3f8b2c1d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1",
+                )),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert!(!cfg.admin_provisioning_secret.is_empty());
+            },
+        );
+    }
+
+    /// A short admin secret must abort boot through from_env.
+    #[test]
+    fn admin_secret_from_env_short_value_aborts_boot() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("ADMIN_PROVISIONING_SECRET", Some("tooshort")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("ADMIN_PROVISIONING_SECRET")
+                        || err.contains("at least 32 characters"),
+                    "error must indicate the secret is too short; got: {err}"
+                );
             },
         );
     }
