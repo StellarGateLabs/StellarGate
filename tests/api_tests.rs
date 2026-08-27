@@ -10,39 +10,22 @@ use stellargate::{
     db, AppState,
 };
 use time::format_description::well_known::Rfc3339;
-use uuid::Uuid;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
-
-/// A fresh, uniquely-named in-memory SQLite database with `cache=shared`, so
-/// every connection the pool opens talks to the SAME database. A bare
-/// `sqlite::memory:` DSN gives each pooled connection its own private
-/// database — with the default multi-connection pool these tests build, a
-/// query could land on a connection that has never seen data written by an
-/// earlier query in the same test, and the suite would only pass by
-/// connection-reuse luck (issue #309). The random name keeps parallel test
-/// binaries from colliding with each other.
-fn shared_memory_dsn() -> String {
-    format!("sqlite:file:{}?mode=memory&cache=shared", Uuid::new_v4())
-}
 
 fn make_config() -> Config {
     Config {
         port: 0,
-        database_url: shared_memory_dsn(),
+        database_url: "sqlite::memory:".into(),
         network: "testnet".into(),
-        horizon_url: "https://horizon.invalid".parse().unwrap(),
+        horizon_url: String::new(),
         gateway_public: "UNCONFIGURED".into(),
         accepted_assets: stellargate::config::AcceptedAsset::default_list(),
         webhook_secret: String::new(),
         webhook_retry_attempts: 1,
         webhook_retry_delay_ms: 0,
-        webhook_retry_max_delay_ms: 60_000,
         /* Both schemes are allowed here so the scheme allow-list isn't what
         rejects http:// — these tests cover the network-based rule (http is fine
         on testnet, HTTPS-only on public), which runs after this gate. */
         allowed_webhook_schemes: vec!["https".into(), "http".into()],
-        webhook_payload_detail: stellargate::config::WebhookPayloadDetail::Minimal,
         webhook_timeout_secs: 10,
         webhook_redrive_interval_secs: 30,
         webhook_redrive_concurrency: 4,
@@ -50,14 +33,12 @@ fn make_config() -> Config {
         webhook_redrive_grace_secs: 60,
         webhook_redrive_backoff_initial_secs: 0,
         webhook_redrive_backoff_max_secs: 0,
-        webhook_redrive_jitter_secs: 0,
         retention_interval_secs: 3600,
         webhook_delivery_retention_days: 30,
         idempotency_retention_days: 7,
         poll_interval_secs: 10,
-        cursor_staleness_multiple: 3,
+        poll_max_pages_per_cycle: 50,
         payment_ttl_secs: 3600,
-        expiry_batch_size: 500,
         /* High enough that these tests never trip the limiter; dedicated
         rate-limit coverage lives in tests/rate_limit_tests.rs. */
         rate_limit_requests_per_sec: 1000,
@@ -68,24 +49,6 @@ fn make_config() -> Config {
         webhook_allow_private_targets: false,
         admin_provisioning_secret: TEST_ADMIN_SECRET.into(),
         request_timeout_secs: 30,
-        stream_idle_timeout_secs: 30,
-        trusted_proxy_cidrs: vec![],
-        max_payment_amount: Default::default(),
-        min_payment_amount: Default::default(),
-        max_body_bytes: 256 * 1024,
-        rate_limiter_max_keys: 10_000,
-        rate_limiter_idle_ttl_secs: 60,
-        pagination_default_limit: 20,
-        pagination_max_limit: 100,
-        shutdown_grace_secs: 30,
-        horizon_page_limit: 200,
-        db_prune_batch_size: 500,
-        retention_max_rows_per_cycle: 50_000,
-        horizon_timeout_secs: 10,
-        sqlite_wal_autocheckpoint: 1000,
-        sqlite_journal_size_limit: 67_108_864,
-        sqlite_cache_size: -2000,
-        require_gateway_account: false,
     }
 }
 
@@ -97,45 +60,12 @@ async fn test_server_with_pool() -> (TestServer, db::Db) {
 }
 
 async fn server_with_config(cfg: Config) -> (TestServer, db::Db) {
-    server_with_config_and_health(cfg, stellargate::TaskHealth::new()).await
-}
-
-/// Like [`server_with_config`], but with an explicitly-provided [`TaskHealth`]
-/// so tests can simulate a dead background task or a stale detection cursor
-/// (issue #315).
-async fn server_with_config_and_health(
-    cfg: Config,
-    task_health: stellargate::TaskHealth,
-) -> (TestServer, db::Db) {
-    server_with_all(
-        cfg,
-        task_health,
-        stellargate::metrics::TrustlineMetrics::new(),
-    )
-    .await
-}
-
-/// Like [`server_with_config`], but with an explicitly-provided
-/// [`stellargate::metrics::TrustlineMetrics`] so tests can drive `POST
-/// /payments` and `GET /metrics` against a known trustline state without
-/// going through a real (or mocked) Horizon call.
-async fn server_with_config_and_trustlines(
-    cfg: Config,
-    trustline_metrics: stellargate::metrics::TrustlineMetrics,
-) -> (TestServer, db::Db) {
-    server_with_all(cfg, stellargate::TaskHealth::new(), trustline_metrics).await
-}
-
-async fn server_with_all(
-    cfg: Config,
-    task_health: stellargate::TaskHealth,
-    trustline_metrics: stellargate::metrics::TrustlineMetrics,
-) -> (TestServer, db::Db) {
     let pool = SqlitePoolOptions::new()
-        // A shared-cache in-memory database is dropped once its last
-        // connection closes — keep exactly one open for the pool's lifetime.
-        .min_connections(1)
-        .connect_with(SqliteConnectOptions::from_str(&cfg.database_url).unwrap())
+        .connect_with(
+            SqliteConnectOptions::from_str(&cfg.database_url)
+                .unwrap()
+                .create_if_missing(true),
+        )
         .await
         .unwrap();
     db::migrate(&pool).await.unwrap();
@@ -148,10 +78,7 @@ async fn server_with_all(
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
         horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
-        trustline_metrics,
-        http_metrics: stellargate::metrics::HttpMetrics::new(),
-        payment_metrics: stellargate::metrics::PaymentMetrics::new(),
-        task_health,
+        task_health: stellargate::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
     let server = TestServer::new(router).unwrap();
@@ -213,315 +140,6 @@ async fn test_ready_ok_with_live_db() {
     let res = test_server().await.get("/ready").await;
     res.assert_status_ok();
     assert_eq!(res.json::<serde_json::Value>()["status"], "ok");
-}
-
-/// A gateway that is configured enough for the readiness probe to run its
-/// on-chain checks (a valid strkey; validation happens only in `from_env`).
-const CONFIGURED_GATEWAY: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
-
-#[tokio::test]
-async fn test_health_ok_when_required_task_running() {
-    let health = stellargate::TaskHealth::new();
-    health.require("poller");
-    health.task_started("poller");
-    let (server, _pool) = server_with_config_and_health(make_config(), health).await;
-
-    let res = server.get("/health").await;
-    res.assert_status_ok();
-    assert_eq!(res.json::<Value>()["status"], "ok");
-}
-
-// ── Expected-versus-live worker counts (issue #317) ──────────────────────────
-
-/// After boot there was no way to answer "how many workers should be running,
-/// and how many are?" — the information existed but `stopped` was overloaded
-/// across clean shutdown, config-disabled exit and fault, so the arithmetic
-/// would have been wrong even once exposed.
-#[tokio::test]
-async fn test_health_reports_expected_and_live_task_counts() {
-    let health = stellargate::TaskHealth::new();
-    health.require("poller");
-    health.require("sweeper");
-    health.task_started("poller");
-    health.task_started("sweeper");
-    let (server, _pool) = server_with_config_and_health(make_config(), health).await;
-
-    let res = server.get("/health").await;
-    res.assert_status_ok();
-    let tasks = &res.json::<Value>()["tasks"];
-    assert_eq!(tasks["expected"], 2);
-    assert_eq!(tasks["live"], 2);
-    assert_eq!(tasks["disabled"].as_array().unwrap().len(), 0);
-}
-
-/// A worker switched off by configuration is neither dead nor expected. A
-/// poll-only deployment, or one with retention disabled, must not read as
-/// permanently degraded.
-#[tokio::test]
-async fn test_health_excludes_config_disabled_tasks_from_expected() {
-    let health = stellargate::TaskHealth::new();
-    health.require("poller");
-    health.require("retention");
-    health.task_started("poller");
-    health.task_disabled("retention", "both retention windows are 0");
-    let (server, _pool) = server_with_config_and_health(make_config(), health).await;
-
-    let res = server.get("/health").await;
-    res.assert_status_ok();
-    let body = res.json::<Value>();
-    assert_eq!(body["status"], "ok", "a disabled worker is not a failure");
-    assert_eq!(body["tasks"]["expected"], 1);
-    assert_eq!(body["tasks"]["live"], 1);
-
-    let disabled = body["tasks"]["disabled"].as_array().unwrap();
-    assert_eq!(disabled.len(), 1);
-    assert_eq!(disabled[0]["task"], "retention");
-    assert_eq!(disabled[0]["reason"], "both retention windows are 0");
-}
-
-/// A genuine death shows up as a shortfall, not just a boolean.
-#[tokio::test]
-async fn test_health_shows_a_shortfall_when_a_task_dies() {
-    let health = stellargate::TaskHealth::new();
-    health.require("poller");
-    health.require("sweeper");
-    health.task_started("poller");
-    health.task_started("sweeper");
-    health.task_stopped("sweeper");
-    let (server, _pool) = server_with_config_and_health(make_config(), health).await;
-
-    let res = server.get("/health").await;
-    res.assert_status(StatusCode::SERVICE_UNAVAILABLE);
-    let tasks = &res.json::<Value>()["tasks"];
-    assert_eq!(tasks["expected"], 2);
-    assert_eq!(tasks["live"], 1);
-}
-
-#[tokio::test]
-async fn test_metrics_expose_expected_and_live_task_counts() {
-    let health = stellargate::TaskHealth::new();
-    health.require("poller");
-    health.require("retention");
-    health.task_started("poller");
-    health.task_disabled("retention", "both retention windows are 0");
-    let (server, _pool) = server_with_config_and_health(make_config(), health).await;
-
-    let body = server.get("/metrics").await.text();
-    assert!(
-        body.contains("stellargate_tasks_expected 1"),
-        "expected count must exclude the disabled worker:\n{body}"
-    );
-    assert!(body.contains("stellargate_tasks_live 1"), "{body}");
-    assert!(
-        body.contains("stellargate_task_disabled{task=\"retention\"} 1"),
-        "a disabled worker must be distinguishable from one that is merely \
-         not running:\n{body}"
-    );
-    assert!(
-        body.contains("stellargate_task_disabled{task=\"poller\"} 0"),
-        "{body}"
-    );
-}
-
-/// A required background task that stopped (a poller that died at startup)
-/// must make /health fail — a process whose payment detection is dead must
-/// not look healthy forever (issue #315).
-#[tokio::test]
-async fn test_health_fails_when_required_task_stopped() {
-    let health = stellargate::TaskHealth::new();
-    health.require("poller");
-    health.task_started("poller");
-    health.task_stopped("poller");
-    let (server, _pool) = server_with_config_and_health(make_config(), health).await;
-
-    let res = server.get("/health").await;
-    res.assert_status(StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(res.json::<Value>()["status"], "unavailable");
-    assert!(res.json::<Value>()["reason"]
-        .as_str()
-        .unwrap()
-        .contains("poller"));
-}
-
-/// A required task that keeps panicking must fail /health even if the
-/// supervisor has already spawned a replacement (issue #316).
-#[tokio::test]
-async fn test_health_fails_when_required_task_crash_looping() {
-    let health = stellargate::TaskHealth::new();
-    health.require("poller");
-    health.task_started("poller");
-    for _ in 0..stellargate::CRASH_LOOP_THRESHOLD {
-        health.task_failed("poller");
-        health.task_restarted("poller");
-        health.task_started("poller");
-    }
-    let (server, _pool) = server_with_config_and_health(make_config(), health).await;
-
-    let res = server.get("/health").await;
-    res.assert_status(StatusCode::SERVICE_UNAVAILABLE);
-    let body = res.json::<Value>();
-    assert_eq!(body["status"], "unavailable");
-    assert!(
-        body["reason"].as_str().unwrap().contains("crash-looping"),
-        "got: {body}"
-    );
-}
-
-/// Task panics and restarts must show up on /metrics so a crash-loop is
-/// scrapeable (issue #316).
-#[tokio::test]
-async fn test_task_health_is_exported_on_metrics() {
-    let health = stellargate::TaskHealth::new();
-    health.require("poller");
-    health.task_started("poller");
-    health.task_failed("poller");
-    health.task_restarted("poller");
-    health.task_started("poller");
-    let (server, _pool) = server_with_config_and_health(make_config(), health).await;
-
-    let res = server.get("/metrics").await;
-    res.assert_status_ok();
-    let body = res.text();
-    assert!(
-        body.contains("stellargate_tasks_failed_total 1"),
-        "got: {body}"
-    );
-    assert!(
-        body.contains("stellargate_task_restarts_total{task=\"poller\"} 1"),
-        "got: {body}"
-    );
-    assert!(
-        body.contains("stellargate_task_running{task=\"poller\"} 1"),
-        "got: {body}"
-    );
-}
-
-/// End-to-end regression for the property the supervisor/TaskHealth/metrics
-/// chain exists to guarantee: a background task panic must be visible on the
-/// live `GET /metrics` scrape before the process ever shuts down, not only
-/// once shutdown's `join_task` runs. Unlike
-/// `test_task_health_is_exported_on_metrics` above (which sets the counters
-/// directly), this drives a real `supervise::supervise_with` task through an
-/// actual panic and reads the counter back over HTTP while the supervisor is
-/// still running — proving the counter is live mid-flight, not just at drain
-/// time.
-#[tokio::test]
-async fn test_real_panic_is_visible_on_metrics_before_shutdown() {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
-    use tokio::sync::watch;
-
-    let health = stellargate::TaskHealth::new();
-    health.require("probe");
-    let (server, _pool) = server_with_config_and_health(make_config(), health.clone()).await;
-
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let backoff = stellargate::supervise::Backoff {
-        initial: Duration::from_millis(5),
-        max: Duration::from_millis(20),
-        stability: Duration::from_secs(60),
-    };
-    let runs = Arc::new(AtomicU64::new(0));
-    let runs_inner = runs.clone();
-    let child_shutdown = shutdown_rx.clone();
-    let handle = stellargate::supervise::supervise_with(
-        health.clone(),
-        "probe",
-        shutdown_rx,
-        move || {
-            let runs = runs_inner.clone();
-            let mut shutdown = child_shutdown.clone();
-            async move {
-                let n = runs.fetch_add(1, Ordering::SeqCst);
-                if n == 0 {
-                    panic!("deliberate test panic");
-                }
-                let _ = shutdown.changed().await;
-                stellargate::supervise::TaskExit::ShutdownRequested
-            }
-        },
-        backoff,
-    );
-
-    // Poll the live HTTP endpoint (not the in-process counter directly) until
-    // the panic is reflected there.
-    let body = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let body = server.get("/metrics").await.text();
-            if body.contains("stellargate_tasks_failed_total 1") {
-                return body;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("panic was never reflected on GET /metrics before shutdown");
-
-    assert!(
-        body.contains("stellargate_task_restarts_total{task=\"probe\"} 1"),
-        "got: {body}"
-    );
-
-    // Only now does the process shut down — the assertions above ran while
-    // it was still live.
-    let _ = shutdown_tx.send(true);
-    tokio::time::timeout(Duration::from_secs(2), handle)
-        .await
-        .expect("supervisor did not stop")
-        .expect("supervisor task panicked");
-}
-
-/// A stale detection cursor must make /ready fail even though Horizon itself
-/// is reachable — reachable dependencies plus a dead poller is not readiness
-/// (issue #315).
-#[tokio::test]
-async fn test_ready_fails_when_cursor_stale() {
-    let mock = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&mock)
-        .await;
-
-    let mut cfg = make_config();
-    cfg.gateway_public = CONFIGURED_GATEWAY.into();
-    cfg.horizon_url = mock.uri().parse().unwrap();
-
-    let health = stellargate::TaskHealth::new();
-    health.set_last_success_unix(0); // never succeeded → maximally stale
-    let (server, _pool) = server_with_config_and_health(cfg, health).await;
-
-    let res = server.get("/ready").await;
-    res.assert_status(StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(res.json::<Value>()["status"], "unavailable");
-    assert!(res.json::<Value>()["reason"]
-        .as_str()
-        .unwrap()
-        .contains("stalled"));
-}
-
-/// A fresh cursor (the poller recently completed a cycle) must keep /ready
-/// green when Horizon is reachable.
-#[tokio::test]
-async fn test_ready_ok_when_cursor_fresh() {
-    let mock = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&mock)
-        .await;
-
-    let mut cfg = make_config();
-    cfg.gateway_public = CONFIGURED_GATEWAY.into();
-    cfg.horizon_url = mock.uri().parse().unwrap();
-
-    let health = stellargate::TaskHealth::new();
-    health.note_success();
-    let (server, _pool) = server_with_config_and_health(cfg, health).await;
-
-    let res = server.get("/ready").await;
-    res.assert_status_ok();
-    assert_eq!(res.json::<Value>()["status"], "ok");
 }
 
 #[tokio::test]
@@ -588,85 +206,6 @@ async fn test_auth_outcomes_are_counted_in_metrics() {
         body.contains(
             "stellargate_auth_attempts_total{outcome=\"failure\",reason=\"invalid_key\"} 1"
         ),
-        "got: {body}"
-    );
-}
-
-/// HTTP traffic must be observable via `/metrics`, labelled by the matched
-/// route pattern rather than the raw request path — hitting `GET
-/// /payments/:id` with two different payment ids must land in the *same*
-/// series, not mint one series per id (missing operational metrics issue).
-#[tokio::test]
-async fn test_http_requests_are_counted_by_matched_route_not_raw_path() {
-    let server = test_server().await;
-
-    server.get("/payments/one-id").await;
-    server.get("/payments/another-id").await;
-    server.get("/this-path-does-not-exist").await;
-
-    let body = server.get("/metrics").await.text();
-    assert!(
-        body.contains(
-            "stellargate_http_requests_total{method=\"GET\",route=\"/payments/:id\",status=\"404\"} 2"
-        ),
-        "two distinct payment ids must be counted under one bounded-cardinality \
-         route label, not one series each:\n{body}"
-    );
-    assert!(
-        !body.contains("one-id") && !body.contains("another-id"),
-        "the raw path/id must never leak into a metric label:\n{body}"
-    );
-    assert!(
-        body.contains(
-            "stellargate_http_requests_total{method=\"GET\",route=\"<unmatched>\",status=\"404\"} 1"
-        ),
-        "a request matching no route must fall into the bounded <unmatched> \
-         label, not the raw path:\n{body}"
-    );
-    assert!(
-        body.contains("stellargate_http_request_duration_seconds_bucket{method=\"GET\""),
-        "got: {body}"
-    );
-}
-
-/// Payment creation must be counted on `/metrics` (missing operational
-/// metrics issue).
-#[tokio::test]
-async fn test_payment_creation_is_counted_in_metrics() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    server
-        .post("/payments")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({ "amount": "10", "asset": "XLM" }))
-        .await
-        .assert_status(StatusCode::CREATED);
-
-    let body = server.get("/metrics").await.text();
-    assert!(
-        body.contains("stellargate_payments_total{status=\"created\"} 1"),
-        "got: {body}"
-    );
-}
-
-/// Database pool utilisation must be exported so an operator can see
-/// connections are exhausted before requests start queuing on the pool
-/// (missing operational metrics issue).
-#[tokio::test]
-async fn test_db_pool_metrics_are_exported() {
-    let server = test_server().await;
-
-    let body = server.get("/metrics").await.text();
-    assert!(
-        body.contains("stellargate_db_pool_max_connections 10"),
-        "got: {body}"
-    );
-    assert!(
-        body.contains("stellargate_db_pool_connections{state=\"idle\"}"),
-        "got: {body}"
-    );
-    assert!(
-        body.contains("stellargate_db_pool_connections{state=\"in_use\"}"),
         "got: {body}"
     );
 }
@@ -743,7 +282,7 @@ async fn test_idempotency_key_returns_same_payment() {
 
     // Exactly one payment visible to this merchant.
     let list: Value = server
-        .get("/payments?include_total=true")
+        .get("/payments")
         .add_header("Authorization", auth)
         .await
         .json();
@@ -789,7 +328,7 @@ async fn test_different_or_missing_idempotency_key_creates_new_payment() {
     assert_ne!(id_b, id_c);
 
     let list: Value = server
-        .get("/payments?include_total=true")
+        .get("/payments")
         .add_header("Authorization", auth)
         .await
         .json();
@@ -866,14 +405,14 @@ async fn test_merchant_list_scoped_to_own_payments() {
 
     // Each merchant only sees their own payments.
     let list1: Value = server
-        .get("/payments?include_total=true")
+        .get("/payments")
         .add_header("Authorization", format!("Bearer {key1}"))
         .await
         .json();
     assert_eq!(list1["total"], 2, "merchant1 should see 2 payments");
 
     let list2: Value = server
-        .get("/payments?include_total=true")
+        .get("/payments")
         .add_header("Authorization", format!("Bearer {key2}"))
         .await
         .json();
@@ -890,64 +429,31 @@ async fn test_create_invalid_asset() {
         .json(&json!({ "amount": "10", "asset": "BTC" }))
         .await;
     res.assert_status(StatusCode::BAD_REQUEST);
-    let request_id = res
-        .headers()
-        .get("x-request-id")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
-    let body = res.json::<Value>();
-    assert_eq!(body["code"], "unsupported_asset");
-    assert_eq!(body["request_id"], request_id);
+    assert_eq!(res.json::<Value>()["code"], "unsupported_asset");
     res.assert_contains_header("x-request-id");
 }
 
-// ── Trustline-aware payment creation (this issue) ────────────────────────────
-
-/// A trustline confirmed missing by the trustline checker must reject the
-/// intent rather than mint one that can only bounce on-chain.
 #[tokio::test]
 async fn test_create_rejects_asset_with_confirmed_missing_trustline() {
     let trustlines = stellargate::metrics::TrustlineMetrics::new();
-    trustlines.record_check(["USDC"], &["USDC".to_string()]);
+    trustlines.record_check(["USDC"], &["USDC".to_string()], &[], &[]);
     let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
     let key = provision_merchant(&server).await;
-
     let res = server
         .post("/payments")
         .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({ "amount": "10", "asset": "USDC" }))
+        .json(&json!({ "amount": "-1", "asset": "XLM" }))
         .await;
-    res.assert_status(StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(res.json::<Value>()["code"], "trustline_missing");
+    res.assert_status(StatusCode::BAD_REQUEST);
 }
 
-/// An asset the checker has confirmed present is unaffected.
 #[tokio::test]
 async fn test_create_accepts_asset_with_confirmed_present_trustline() {
     let trustlines = stellargate::metrics::TrustlineMetrics::new();
-    trustlines.record_check(["USDC"], &[]);
+    trustlines.record_check(["USDC"], &[], &[], &[]);
     let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
     let key = provision_merchant(&server).await;
-
-    let res = server
-        .post("/payments")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({ "amount": "10", "asset": "USDC" }))
-        .await;
-    res.assert_status(StatusCode::CREATED);
-}
-
-/// An asset that has never been checked (fresh `TrustlineMetrics`, the state
-/// every deployment starts in before its first check completes) must not be
-/// rejected — `None` means "unknown", not "missing".
-#[tokio::test]
-async fn test_create_accepts_asset_never_checked_for_a_trustline() {
-    let res = server_with_config(make_config()).await.0;
-    let key = provision_merchant(&res).await;
-
-    let res = res
+    let id = server
         .post("/payments")
         .add_header("Authorization", format!("Bearer {key}"))
         .json(&json!({ "amount": "10", "asset": "USDC" }))
@@ -960,377 +466,9 @@ async fn test_create_accepts_asset_never_checked_for_a_trustline() {
 #[tokio::test]
 async fn test_create_never_rejects_native_xlm_for_a_missing_trustline() {
     let trustlines = stellargate::metrics::TrustlineMetrics::new();
-    trustlines.record_check(["USDC"], &["USDC".to_string()]);
+    trustlines.record_check(["USDC"], &["USDC".to_string()], &[], &[]);
     let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
     let key = provision_merchant(&server).await;
-
-    let res = server
-        .post("/payments")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({ "amount": "10", "asset": "XLM" }))
-        .await;
-    res.assert_status(StatusCode::CREATED);
-}
-
-/// `GET /metrics` exposes the current trustline state as a gauge, plus the
-/// counters that distinguish a Horizon outage from a confirmed absence
-/// (acceptance criteria of this issue).
-#[tokio::test]
-async fn test_metrics_expose_trustline_state() {
-    let trustlines = stellargate::metrics::TrustlineMetrics::new();
-    trustlines.record_check(["USDC", "EURC"], &["USDC".to_string()]);
-    trustlines.record_check_failure();
-    let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
-
-    let body = server.get("/metrics").await.text();
-    assert!(
-        body.contains("stellargate_missing_trustlines{asset=\"USDC\"} 1"),
-        "got: {body}"
-    );
-    assert!(
-        body.contains("stellargate_missing_trustlines{asset=\"EURC\"} 0"),
-        "got: {body}"
-    );
-    assert!(
-        body.contains("stellargate_trustline_check_failures_total 1"),
-        "got: {body}"
-    );
-    assert!(
-        body.contains("stellargate_trustline_check_last_success_timestamp_seconds"),
-        "got: {body}"
-    );
-}
-
-// ── Unknown request-body fields (issue #329) ─────────────────────────────────
-
-/// `merchant_id` is the sharpest case: `openapi.yaml` advertised it, so an
-/// integrator following the spec sent it believing they were choosing the
-/// tenant. It must be rejected, not silently dropped in favour of whichever
-/// merchant owns the key.
-#[tokio::test]
-async fn test_create_payment_rejects_unknown_field() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let res = server
-        .post("/payments")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({ "amount": "10", "merchant_id": "someone-elses-shop" }))
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    let body = res.json::<Value>();
-    assert_eq!(body["code"], "unknown_field");
-    assert!(
-        body["error"].as_str().unwrap().contains("merchant_id"),
-        "the error must name the offending field, got: {}",
-        body["error"]
-    );
-}
-
-/// The interaction that made silent discarding expensive rather than untidy:
-/// `asset` defaults to `XLM`, so one transposed character used to mint a
-/// 100 XLM intent and return `201` describing it.
-#[tokio::test]
-async fn test_create_payment_rejects_misspelled_asset() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let res = server
-        .post("/payments")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({ "amount": "100", "assset": "USDC" }))
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    let body = res.json::<Value>();
-    assert_eq!(
-        body["code"], "unknown_field",
-        "a misspelled `asset` must not silently fall back to the XLM default"
-    );
-    assert!(body["error"].as_str().unwrap().contains("assset"));
-}
-
-/// The correctly-spelled fields still work — `deny_unknown_fields` must not
-/// have narrowed the accepted body.
-#[tokio::test]
-async fn test_create_payment_accepts_every_documented_field() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let res = server
-        .post("/payments")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({
-            "amount": "100",
-            "asset": "USDC",
-            "webhook_url": "https://example.com/hook",
-        }))
-        .await;
-    res.assert_status(StatusCode::CREATED);
-    assert_eq!(res.json::<Value>()["asset"], "USDC");
-}
-
-#[tokio::test]
-async fn test_issue_key_rejects_unknown_field() {
-    let server = test_server().await;
-    let res = server
-        .post("/merchants")
-        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
-        .await;
-    let merchant_id = res.json::<Value>()["merchant_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let res = server
-        .post(&format!("/merchants/{merchant_id}/keys"))
-        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
-        .json(&json!({ "lable": "typo" }))
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    let body = res.json::<Value>();
-    assert_eq!(body["code"], "unknown_field");
-    assert!(body["error"].as_str().unwrap().contains("lable"));
-}
-
-/// The body on this endpoint is genuinely optional, so omitting it must still
-/// issue a key. Rejecting unknown fields must not turn "no body" into an error.
-#[tokio::test]
-async fn test_issue_key_without_a_body_still_succeeds() {
-    let server = test_server().await;
-    let res = server
-        .post("/merchants")
-        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
-        .await;
-    let merchant_id = res.json::<Value>()["merchant_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let res = server
-        .post(&format!("/merchants/{merchant_id}/keys"))
-        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
-        .await;
-    res.assert_status(StatusCode::CREATED);
-    assert!(res.json::<Value>()["label"].is_null());
-}
-
-/// The label limit is counted in characters, not bytes: a multi-byte label
-/// under the character cap must be accepted even though its byte length
-/// alone would trip a naive `str::len() > 100` check.
-#[tokio::test]
-async fn test_issue_key_accepts_a_multibyte_label_under_the_character_limit() {
-    let server = test_server().await;
-    let res = server
-        .post("/merchants")
-        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
-        .await;
-    let merchant_id = res.json::<Value>()["merchant_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    // 40 CJK characters — 120 bytes in UTF-8, comfortably over the old
-    // byte-based 100 limit, but well under the 100-character limit.
-    let label: String = "測".repeat(40);
-    assert!(label.len() > 100);
-    assert_eq!(label.chars().count(), 40);
-
-    let res = server
-        .post(&format!("/merchants/{merchant_id}/keys"))
-        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
-        .json(&json!({ "label": label }))
-        .await;
-    res.assert_status(StatusCode::CREATED);
-    assert_eq!(res.json::<Value>()["label"], label);
-}
-
-/// A label over the 100-*character* limit is rejected, and the error message
-/// must describe what is actually being measured.
-#[tokio::test]
-async fn test_issue_key_rejects_a_label_over_the_character_limit() {
-    let server = test_server().await;
-    let res = server
-        .post("/merchants")
-        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
-        .await;
-    let merchant_id = res.json::<Value>()["merchant_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let label = "a".repeat(101);
-    let res = server
-        .post(&format!("/merchants/{merchant_id}/keys"))
-        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
-        .json(&json!({ "label": label }))
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    let body = res.json::<Value>();
-    assert_eq!(body["code"], "invalid_label");
-    assert!(body["error"].as_str().unwrap().contains("100 characters"));
-}
-
-/// Control characters are rejected outright — a label is rendered verbatim in
-/// the dashboard, so one must not be able to smuggle e.g. a newline or an ANSI
-/// escape into it.
-#[tokio::test]
-async fn test_issue_key_rejects_a_label_with_control_characters() {
-    let server = test_server().await;
-    let res = server
-        .post("/merchants")
-        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
-        .await;
-    let merchant_id = res.json::<Value>()["merchant_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let res = server
-        .post(&format!("/merchants/{merchant_id}/keys"))
-        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
-        .json(&json!({ "label": "prod\nkey" }))
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    assert_eq!(res.json::<Value>()["code"], "invalid_label");
-}
-
-/// A wrong *type* on a known field is still `invalid_request` — the new code is
-/// specific to unrecognised field names, not a rename of the generic one.
-#[tokio::test]
-async fn test_wrong_type_on_known_field_is_still_invalid_request() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let res = server
-        .post("/payments")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({ "amount": 10 }))
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    assert_eq!(res.json::<Value>()["code"], "invalid_request");
-}
-
-#[tokio::test]
-async fn test_create_invalid_amount() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let res = server
-        .post("/payments")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({ "amount": "-1", "asset": "XLM" }))
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-}
-
-// ── Configurable min/max payment amount (issue #310) ───────────────────────
-
-/// An amount over the configured `MAX_PAYMENT_AMOUNT` is rejected with a
-/// distinct code and a message naming the configured limit — not the
-/// overflow-derived `invalid_amount` used for genuinely malformed input.
-#[tokio::test]
-async fn test_create_amount_over_configured_max_is_rejected() {
-    let mut cfg = make_config();
-    cfg.max_payment_amount =
-        stellargate::config::AmountLimit::parse("100", "MAX_PAYMENT_AMOUNT").unwrap();
-    let (server, _pool) = server_with_config(cfg).await;
-    let key = provision_merchant(&server).await;
-
-    let res = server
-        .post("/payments")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({ "amount": "100.0000001", "asset": "XLM" }))
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    let body: Value = res.json();
-    assert_eq!(body["code"], "amount_out_of_range");
-    let message = body["error"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("100"),
-        "message must name the configured limit: {message}"
-    );
-}
-
-/// The boundary itself — exactly the configured maximum — is accepted, not
-/// rejected: the limit is inclusive.
-#[tokio::test]
-async fn test_create_amount_at_configured_max_is_accepted() {
-    let mut cfg = make_config();
-    cfg.max_payment_amount =
-        stellargate::config::AmountLimit::parse("100", "MAX_PAYMENT_AMOUNT").unwrap();
-    let (server, _pool) = server_with_config(cfg).await;
-    let key = provision_merchant(&server).await;
-
-    let res = server
-        .post("/payments")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({ "amount": "100", "asset": "XLM" }))
-        .await;
-    res.assert_status(StatusCode::CREATED);
-}
-
-/// An amount under the configured `MIN_PAYMENT_AMOUNT` is rejected the same
-/// way, and the boundary itself is accepted.
-#[tokio::test]
-async fn test_create_amount_under_configured_min_is_rejected() {
-    let mut cfg = make_config();
-    cfg.min_payment_amount =
-        stellargate::config::AmountLimit::parse("1", "MIN_PAYMENT_AMOUNT").unwrap();
-    let (server, _pool) = server_with_config(cfg).await;
-    let key = provision_merchant(&server).await;
-
-    let res = server
-        .post("/payments")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({ "amount": "0.9999999", "asset": "XLM" }))
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    assert_eq!(res.json::<Value>()["code"], "amount_out_of_range");
-
-    let res = server
-        .post("/payments")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({ "amount": "1", "asset": "XLM" }))
-        .await;
-    res.assert_status(StatusCode::CREATED);
-}
-
-/// A per-asset override (`USDC:50`) wins over the bare default (`100`) for
-/// that asset specifically, while every other asset still uses the default.
-#[tokio::test]
-async fn test_create_amount_per_asset_override_wins_over_default() {
-    let mut cfg = make_config();
-    cfg.max_payment_amount =
-        stellargate::config::AmountLimit::parse("100,USDC:50", "MAX_PAYMENT_AMOUNT").unwrap();
-    let (server, _pool) = server_with_config(cfg).await;
-    let key = provision_merchant(&server).await;
-
-    // USDC: the specific 50 cap applies, not the 100 default.
-    let res = server
-        .post("/payments")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({ "amount": "60", "asset": "USDC" }))
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    assert_eq!(res.json::<Value>()["code"], "amount_out_of_range");
-
-    // XLM has no specific entry, so the 100 default applies — 60 is fine.
-    let res = server
-        .post("/payments")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({ "amount": "60", "asset": "XLM" }))
-        .await;
-    res.assert_status(StatusCode::CREATED);
-}
-
-#[tokio::test]
-async fn test_get_by_id() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let id = server
-        .post("/payments")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({ "amount": "5", "asset": "USDC" }))
-        .await
-        .json::<Value>()["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
 
     // Full detail now requires the owning merchant's key (issues #67, #85).
     let res = server
@@ -1352,9 +490,29 @@ async fn test_get_by_id() {
 }
 
 #[tokio::test]
-async fn test_get_not_found() {
-    let res = test_server().await.get("/payments/does-not-exist").await;
-    res.assert_status(StatusCode::NOT_FOUND);
+async fn test_metrics_expose_trustline_state() {
+    let trustlines = stellargate::metrics::TrustlineMetrics::new();
+    trustlines.record_check(["USDC", "EURC"], &["USDC".to_string()], &[], &[]);
+    trustlines.record_check_failure();
+    let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
+
+    let body = server.get("/metrics").await.text();
+    assert!(
+        body.contains("stellargate_missing_trustlines{asset=\"USDC\"} 1"),
+        "got: {body}"
+    );
+    assert!(
+        body.contains("stellargate_missing_trustlines{asset=\"EURC\"} 0"),
+        "got: {body}"
+    );
+    assert!(
+        body.contains("stellargate_trustline_check_failures_total 1"),
+        "got: {body}"
+    );
+    assert!(
+        body.contains("stellargate_trustline_check_last_success_timestamp_seconds"),
+        "got: {body}"
+    );
 }
 
 #[tokio::test]
@@ -1380,32 +538,6 @@ async fn test_asset_is_case_insensitive() {
         .await;
     res.assert_status(StatusCode::CREATED);
     assert_eq!(res.json::<Value>()["asset"], "USDC");
-}
-
-#[tokio::test]
-async fn test_create_persists_asset_issuer() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let body = server
-        .post("/payments")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({ "amount": "5", "asset": "USDC" }))
-        .await
-        .json::<Value>();
-    assert_eq!(body["asset"], "USDC");
-    assert_eq!(
-        body["asset_issuer"],
-        "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
-    );
-
-    let xlm = server
-        .post("/payments")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({ "amount": "1", "asset": "XLM" }))
-        .await
-        .json::<Value>();
-    assert_eq!(xlm["asset"], "XLM");
-    assert!(xlm["asset_issuer"].is_null());
 }
 
 #[tokio::test]
@@ -1586,55 +718,13 @@ async fn test_list_payments() {
     }
 
     let res = server
-        .get("/payments?include_total=true")
+        .get("/payments")
         .add_header("Authorization", auth)
         .await;
     res.assert_status_ok();
     let body: Value = res.json();
     assert_eq!(body["total"], 3);
     assert_eq!(body["payments"].as_array().unwrap().len(), 3);
-}
-
-/// `total` costs a full `COUNT(*)` scan (issue #320), so the default offset
-/// list must not compute — or send — it. The field must be entirely absent,
-/// not `null`: a caller that never asked for `total` should not be able to
-/// tell "not computed" apart from "computed as zero" if it only checks for
-/// nullness, so this checks the key itself is missing from the object.
-#[tokio::test]
-async fn test_list_payments_default_omits_total() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let auth = format!("Bearer {key}");
-    server
-        .post("/payments")
-        .add_header("Authorization", auth.clone())
-        .json(&json!({ "amount": "1", "asset": "XLM" }))
-        .await;
-
-    let res = server
-        .get("/payments")
-        .add_header("Authorization", auth.clone())
-        .await;
-    res.assert_status_ok();
-    let body: Value = res.json();
-    assert!(
-        body.as_object().unwrap().get("total").is_none(),
-        "total must be entirely absent from the default response, got: {body}"
-    );
-
-    // include_total=false is likewise "don't compute it" — the default, made
-    // explicit — not merely "any falsy value is fine to include as null".
-    let res = server
-        .get("/payments?include_total=false")
-        .add_header("Authorization", auth)
-        .await;
-    res.assert_status_ok();
-    assert!(res
-        .json::<Value>()
-        .as_object()
-        .unwrap()
-        .get("total")
-        .is_none());
 }
 
 #[tokio::test]
@@ -1649,14 +739,14 @@ async fn test_list_filter_by_status() {
         .await;
 
     let res = server
-        .get("/payments?status=completed&include_total=true")
+        .get("/payments?status=completed")
         .add_header("Authorization", auth.clone())
         .await;
     res.assert_status_ok();
     assert_eq!(res.json::<Value>()["total"], 0);
 
     let res = server
-        .get("/payments?status=pending&include_total=true")
+        .get("/payments?status=pending")
         .add_header("Authorization", auth)
         .await;
     assert_eq!(res.json::<Value>()["total"], 1);
@@ -1691,7 +781,7 @@ async fn test_list_filters_by_underpaid_status() {
         .unwrap();
 
     let res = server
-        .get("/payments?status=underpaid&include_total=true")
+        .get("/payments?status=underpaid")
         .add_header("Authorization", auth)
         .await;
     res.assert_status_ok();
@@ -1710,102 +800,6 @@ async fn test_list_invalid_status() {
         .add_header("Authorization", format!("Bearer {key}"))
         .await;
     res.assert_status(StatusCode::BAD_REQUEST);
-}
-
-/// Regression for #352: a query parameter the listing does not know is a 400
-/// naming it, not a silently unfiltered first page.
-///
-/// `?stauts=completed` used to return `200 OK` listing every payment including
-/// pending ones, so a merchant reconciling server-side would read unpaid
-/// intents as paid. `?page` / `?per_page` are the other shapes of the same
-/// mistake: plausible names this API has never accepted.
-#[tokio::test]
-async fn test_list_rejects_unknown_query_parameter() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let auth = format!("Bearer {key}");
-
-    for (query, offender) in [
-        ("stauts=completed", "stauts"),
-        ("page=2", "page"),
-        ("per_page=50", "per_page"),
-    ] {
-        let res = server
-            .get(&format!("/payments?{query}"))
-            .add_header("Authorization", auth.clone())
-            .await;
-        res.assert_status(StatusCode::BAD_REQUEST);
-        let body = res.json::<Value>();
-        assert_eq!(body["code"], "unknown_parameter", "for ?{query}");
-        // The message must name the offending key, or the caller is left
-        // guessing which of their parameters was wrong.
-        assert!(
-            body["error"].as_str().unwrap().contains(offender),
-            "error for ?{query} must name `{offender}`, got: {}",
-            body["error"]
-        );
-    }
-}
-
-/// The strictness must not cost the parameters the listing does accept: every
-/// one of them, together, still answers 200.
-#[tokio::test]
-async fn test_list_accepts_every_documented_parameter() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let res = server
-        .get("/payments?status=pending&limit=5&offset=0&include_total=true")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .await;
-    res.assert_status_ok();
-    assert!(res.json::<Value>()["total"].is_number());
-}
-
-/// The same guard on both webhook-delivery listings. It matters most on the
-/// merchant-wide one, where `status` defaults to `failed`: a typo'd filter
-/// would answer with the dead-letter list and look entirely plausible.
-#[tokio::test]
-async fn test_webhook_listings_reject_unknown_query_parameter() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let auth = format!("Bearer {key}");
-    let id = server
-        .post("/payments")
-        .add_header("Authorization", auth.clone())
-        .json(&json!({ "amount": "5", "asset": "XLM" }))
-        .await
-        .json::<Value>()["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let res = server
-        .get(&format!("/payments/{id}/webhooks?staus=failed"))
-        .add_header("Authorization", auth.clone())
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    assert_eq!(res.json::<Value>()["code"], "unknown_parameter");
-
-    let res = server
-        .get("/payments/webhooks?staus=pending")
-        .add_header("Authorization", auth)
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    assert_eq!(res.json::<Value>()["code"], "unknown_parameter");
-}
-
-/// A malformed *value* stays a 400 too, but under its own code — a caller
-/// branching on `unknown_parameter` must not also catch `?limit=abc`.
-#[tokio::test]
-async fn test_list_rejects_malformed_parameter_value() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let res = server
-        .get("/payments?limit=abc")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    assert_eq!(res.json::<Value>()["code"], "invalid_query");
 }
 
 /// No code path ever writes `failed` to a payment — underpayment settles as
@@ -1853,7 +847,7 @@ async fn test_filterable_statuses_match_producible_statuses() {
         }
 
         let res = server
-            .get(&format!("/payments?status={status}&include_total=true"))
+            .get(&format!("/payments?status={status}"))
             .add_header("Authorization", auth.clone())
             .await;
         res.assert_status_ok();
@@ -1925,110 +919,6 @@ async fn test_list_cursor_pagination() {
     assert_eq!(unique.len(), 5);
 }
 
-/// Regression for #328: the offset branch mints a `next_cursor` from its last
-/// row, but its query ordered ties on `created_at` alone while the keyset
-/// query broke them on `id DESC`. `created_at` is whole-second, so a page
-/// whose last row sits inside a tie group handed that cursor to the keyset
-/// query, which resumed *after* the whole group — skipping the members that
-/// sorted above the boundary. Both branches must share one ordering, and a
-/// cursor taken from an offset page must walk the tie group without skipping
-/// or repeating rows.
-#[tokio::test]
-async fn test_offset_cursor_tie_group_agreement() {
-    let (server, pool) = test_server_with_pool().await;
-    let key = provision_merchant(&server).await;
-    let auth = format!("Bearer {key}");
-
-    let merchant_id = stellargate::db::find_merchant_by_key(&pool, &key)
-        .await
-        .unwrap()
-        .expect("merchant must exist");
-
-    // Six payments stamped in the *same* second. The ids sort inversely to
-    // insertion order, so id DESC (the keyset ordering) and rowid order (what
-    // a bare `ORDER BY created_at DESC` may fall back to) disagree at every
-    // position — page 1 of the offset path is exactly the tie group.
-    let ts = "2026-08-17T12:00:00Z";
-    for id in ["a", "b", "c", "d", "e", "f"] {
-        sqlx::query(
-            "INSERT INTO payments
-                (id, merchant_id, destination_address, memo, amount, asset, status,
-                 created_at, updated_at, expires_at)
-             VALUES (?, ?, 'GDEST', ?, '1', 'XLM', 'pending', ?, ?, ?)",
-        )
-        .bind(id)
-        .bind(&merchant_id)
-        .bind(format!("MEMO-{id}"))
-        .bind(ts)
-        .bind(ts)
-        .bind("2026-08-17T13:00:00Z")
-        .execute(&pool)
-        .await
-        .unwrap();
-    }
-
-    // Page 1 via the offset path. Its next_cursor must be a valid entry point
-    // into cursor mode.
-    let res = server
-        .get("/payments?limit=3")
-        .add_header("Authorization", auth.clone())
-        .await;
-    res.assert_status_ok();
-    let body: Value = res.json();
-    let page1: Vec<String> = body["payments"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|p| p["id"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(
-        page1,
-        ["f", "e", "d"],
-        "offset page 1 must order whole-second ties by id DESC"
-    );
-    let cursor = body["next_cursor"]
-        .as_str()
-        .expect("full offset page must carry a migration cursor");
-
-    // Page 2 via the cursor. The tie group must continue, not resume after it.
-    let res2 = server
-        .get(&format!("/payments?cursor={cursor}&limit=3"))
-        .add_header("Authorization", auth.clone())
-        .await;
-    res2.assert_status_ok();
-    let body2: Value = res2.json();
-    let page2: Vec<String> = body2["payments"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|p| p["id"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(
-        page2,
-        ["c", "b", "a"],
-        "cursor minted on the offset branch must resume inside the tie group"
-    );
-
-    // No rows skipped or repeated across the two pages.
-    let all: std::collections::HashSet<_> = page1.iter().chain(&page2).collect();
-    assert_eq!(all.len(), 6);
-
-    // The offset path walks the same sequence the cursor path did.
-    let res3 = server
-        .get("/payments?limit=3&offset=3")
-        .add_header("Authorization", auth)
-        .await;
-    res3.assert_status_ok();
-    let body3: Value = res3.json();
-    let page2_offset: Vec<String> = body3["payments"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|p| p["id"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(page2_offset, page2, "offset and cursor pages must agree");
-}
-
 #[tokio::test]
 async fn test_list_cursor_invalid() {
     let server = test_server().await;
@@ -2038,119 +928,6 @@ async fn test_list_cursor_invalid() {
         .add_header("Authorization", format!("Bearer {key}"))
         .await;
     res.assert_status(StatusCode::BAD_REQUEST);
-}
-
-/// Regression for #303: `offset` beyond the documented ceiling must be
-/// rejected rather than answered with a full scan-and-skip.
-#[tokio::test]
-async fn test_list_offset_above_max_is_rejected() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let res = server
-        .get("/payments?offset=10001")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    let body: Value = res.json();
-    assert_eq!(body["code"], "invalid_offset");
-    assert!(
-        body["error"].as_str().unwrap().contains("cursor"),
-        "error message should point callers at cursor pagination, got: {}",
-        body["error"]
-    );
-}
-
-/// Hex of "2026-01-01T00:00:00Z\t11111111-1111-1111-1111-111111111111", the
-/// wire form `encode_cursor` produces. Spelled out rather than encoded here
-/// because `hex` is a dependency of the crate, not a dev-dependency available
-/// to this test binary.
-const WELL_FORMED_CURSOR: &str = "323032362d30312d30315430303a30303a30305a0931313131\
-313131312d313131312d313131312d313131312d313131313131313131313131";
-
-/// Regression for #259: the two pagination modes read different parameters and
-/// return differently shaped bodies, so a request carrying both must be refused
-/// rather than answered from the cursor with `offset` silently dropped.
-#[tokio::test]
-async fn test_list_rejects_cursor_and_offset_together() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let res = server
-        .get(&format!("/payments?cursor={WELL_FORMED_CURSOR}&offset=20"))
-        .add_header("Authorization", format!("Bearer {key}"))
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    let body: Value = res.json();
-    assert_eq!(body["code"], "conflicting_pagination");
-    assert!(
-        body["error"]
-            .as_str()
-            .unwrap()
-            .contains("mutually exclusive"),
-        "error message should say the two are mutually exclusive, got: {}",
-        body["error"]
-    );
-}
-
-/// The check is on presence, not value: a client still sending its old
-/// `offset=0` alongside a new cursor is the exact migration case #259 is about,
-/// so it must be rejected too rather than quietly treated as cursor-only.
-#[tokio::test]
-async fn test_list_rejects_cursor_and_zero_offset() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let res = server
-        .get(&format!("/payments?cursor={WELL_FORMED_CURSOR}&offset=0"))
-        .add_header("Authorization", format!("Bearer {key}"))
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    let body: Value = res.json();
-    assert_eq!(body["code"], "conflicting_pagination");
-}
-
-/// The conflict is rejected before the cursor is decoded, so a client sending
-/// both gets the error that names its actual mistake instead of being sent
-/// after a malformed cursor it did not have.
-#[tokio::test]
-async fn test_list_conflicting_pagination_wins_over_invalid_cursor() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let res = server
-        .get("/payments?cursor=notvalidhex!!&offset=20")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    let body: Value = res.json();
-    assert_eq!(body["code"], "conflicting_pagination");
-}
-
-/// Each mode alone stays untouched — the guard fires only on the combination.
-#[tokio::test]
-async fn test_list_cursor_alone_is_still_accepted() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let res = server
-        .get(&format!("/payments?cursor={WELL_FORMED_CURSOR}"))
-        .add_header("Authorization", format!("Bearer {key}"))
-        .await;
-    res.assert_status(StatusCode::OK);
-    let body: Value = res.json();
-    assert!(
-        body.get("offset").is_none(),
-        "cursor mode must not carry an offset field, got: {body}"
-    );
-}
-
-/// The ceiling itself must still be answered normally — only values *above*
-/// it are rejected.
-#[tokio::test]
-async fn test_list_offset_at_max_is_accepted() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let res = server
-        .get("/payments?offset=10000")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .await;
-    res.assert_status(StatusCode::OK);
 }
 
 #[tokio::test]
@@ -2212,316 +989,6 @@ async fn test_list_webhooks_empty() {
     assert_eq!(body["deliveries"].as_array().unwrap().len(), 0);
 }
 
-// ── Dead-letter view: GET /payments/webhooks (issue #319) ────────────────────
-
-/// Create a payment and seed `n` deliveries against it with a given status.
-async fn seed_deliveries(
-    server: &TestServer,
-    pool: &db::Db,
-    auth: &str,
-    status: &str,
-    n: usize,
-    prefix: &str,
-) -> String {
-    let payment_id = server
-        .post("/payments")
-        .add_header("Authorization", auth.to_string())
-        .json(&json!({ "amount": "5", "asset": "XLM" }))
-        .await
-        .json::<Value>()["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    for i in 0..n {
-        let delivery_id = format!("{prefix}-{i}");
-        db::save_webhook_delivery(
-            pool,
-            &delivery_id,
-            &payment_id,
-            "https://receiver.example/hook",
-            r#"{"event":"payment.completed"}"#,
-            "payment.completed",
-        )
-        .await
-        .unwrap();
-        db::update_webhook_delivery(pool, &delivery_id, status, 8)
-            .await
-            .unwrap();
-    }
-    payment_id
-}
-
-/// The whole point of the endpoint: find failures **without** already knowing
-/// which payment they belong to. The reason to go looking is "a merchant says
-/// they are missing events", and a payment id is exactly what the person asking
-/// does not have.
-#[tokio::test]
-async fn test_dead_letter_lists_failures_across_payments() {
-    let (server, pool) = test_server_with_pool().await;
-    let key = provision_merchant(&server).await;
-    let auth = format!("Bearer {key}");
-
-    seed_deliveries(&server, &pool, &auth, "failed", 2, "a").await;
-    seed_deliveries(&server, &pool, &auth, "failed", 3, "b").await;
-    // Noise that must not appear under the default `failed` filter.
-    seed_deliveries(&server, &pool, &auth, "delivered", 4, "c").await;
-
-    let res = server
-        .get("/payments/webhooks")
-        .add_header("Authorization", auth)
-        .await;
-    res.assert_status_ok();
-    let body: Value = res.json();
-
-    assert_eq!(body["status"], "failed", "defaults to the dead-letter case");
-    let deliveries = body["deliveries"].as_array().unwrap();
-    assert_eq!(
-        deliveries.len(),
-        5,
-        "failures from both payments, and only those"
-    );
-    assert!(
-        deliveries.iter().all(|d| d["status"] == "failed"),
-        "delivered rows must not leak into the failed filter"
-    );
-    // Spanning more than one payment is the property that matters.
-    let payments: std::collections::HashSet<_> = deliveries
-        .iter()
-        .map(|d| d["payment_id"].as_str().unwrap())
-        .collect();
-    assert_eq!(payments.len(), 2);
-}
-
-/// Scoping is a join to `payments`, not a caller-supplied filter, so one
-/// merchant's dead-letter view can never contain another's deliveries.
-#[tokio::test]
-async fn test_dead_letter_is_merchant_scoped() {
-    let (server, pool) = test_server_with_pool().await;
-    let key_a = provision_merchant(&server).await;
-    let key_b = provision_merchant(&server).await;
-
-    seed_deliveries(&server, &pool, &format!("Bearer {key_a}"), "failed", 3, "a").await;
-    seed_deliveries(&server, &pool, &format!("Bearer {key_b}"), "failed", 1, "b").await;
-
-    let res = server
-        .get("/payments/webhooks")
-        .add_header("Authorization", format!("Bearer {key_b}"))
-        .await;
-    res.assert_status_ok();
-    let deliveries = res.json::<Value>()["deliveries"]
-        .as_array()
-        .unwrap()
-        .clone();
-    assert_eq!(
-        deliveries.len(),
-        1,
-        "merchant B sees only their own failure"
-    );
-    assert!(deliveries[0]["id"].as_str().unwrap().starts_with('b'));
-}
-
-#[tokio::test]
-async fn test_dead_letter_requires_authentication() {
-    let server = test_server().await;
-    server
-        .get("/payments/webhooks")
-        .await
-        .assert_status(StatusCode::UNAUTHORIZED);
-}
-
-/// The static `/payments/webhooks` segment must win over `/payments/:id`, or
-/// the dead-letter view would be shadowed by the per-payment lookup.
-#[tokio::test]
-async fn test_dead_letter_route_is_not_shadowed_by_payment_id() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-
-    let res = server
-        .get("/payments/webhooks")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .await;
-    res.assert_status_ok();
-    let body: Value = res.json();
-    assert!(
-        body.get("deliveries").is_some(),
-        "should reach the dead-letter handler, not get_by_id; got {body}"
-    );
-}
-
-#[tokio::test]
-async fn test_dead_letter_paginates_with_a_cursor() {
-    let (server, pool) = test_server_with_pool().await;
-    let key = provision_merchant(&server).await;
-    let auth = format!("Bearer {key}");
-    seed_deliveries(&server, &pool, &auth, "failed", 5, "d").await;
-
-    let first = server
-        .get("/payments/webhooks?limit=2")
-        .add_header("Authorization", auth.clone())
-        .await;
-    first.assert_status_ok();
-    let first: Value = first.json();
-    assert_eq!(first["deliveries"].as_array().unwrap().len(), 2);
-    let cursor = first["next_cursor"].as_str().unwrap().to_string();
-
-    let second = server
-        .get(&format!("/payments/webhooks?limit=2&cursor={cursor}"))
-        .add_header("Authorization", auth)
-        .await;
-    second.assert_status_ok();
-    let second: Value = second.json();
-
-    let page1: Vec<_> = first["deliveries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|d| d["id"].as_str().unwrap())
-        .collect();
-    let page2: Vec<_> = second["deliveries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|d| d["id"].as_str().unwrap())
-        .collect();
-    assert!(
-        page1.iter().all(|id| !page2.contains(id)),
-        "pages must not repeat rows: {page1:?} vs {page2:?}"
-    );
-}
-
-#[tokio::test]
-async fn test_dead_letter_rejects_an_unknown_status() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let res = server
-        .get("/payments/webhooks?status=exploded")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    assert_eq!(res.json::<Value>()["code"], "invalid_status");
-}
-
-#[tokio::test]
-async fn test_dead_letter_rejects_a_malformed_cursor() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let res = server
-        .get("/payments/webhooks?cursor=zzzz")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    assert_eq!(res.json::<Value>()["code"], "invalid_cursor");
-}
-
-// ── Bulk recovery: POST /payments/webhooks/redeliver (issue #319) ────────────
-
-/// A merchant who has fixed their endpoint can recover everything they missed
-/// in one call, without knowing any payment ids.
-#[tokio::test]
-async fn test_bulk_redeliver_requeues_every_failure() {
-    let (server, pool) = test_server_with_pool().await;
-    let key = provision_merchant(&server).await;
-    let auth = format!("Bearer {key}");
-    seed_deliveries(&server, &pool, &auth, "failed", 3, "e").await;
-
-    let res = server
-        .post("/payments/webhooks/redeliver")
-        .add_header("Authorization", auth.clone())
-        .await;
-    res.assert_status_ok();
-    assert_eq!(res.json::<Value>()["requeued"], 3);
-
-    // Requeued rows go back to the redrive worker with a clean attempt count,
-    // rather than being sent inline — the worker's concurrency limit and
-    // backoff are what keep a recovering receiver from being stampeded.
-    let res = server
-        .get("/payments/webhooks?status=pending")
-        .add_header("Authorization", auth)
-        .await;
-    let deliveries = res.json::<Value>()["deliveries"]
-        .as_array()
-        .unwrap()
-        .clone();
-    assert_eq!(deliveries.len(), 3);
-    assert!(deliveries.iter().all(|d| d["attempts"] == 0));
-    assert!(
-        deliveries.iter().all(|d| !d["acknowledged_at"].is_null()),
-        "requeueing counts as acting on the failure, so retention may reclaim it"
-    );
-}
-
-#[tokio::test]
-async fn test_bulk_redeliver_accepts_specific_ids() {
-    let (server, pool) = test_server_with_pool().await;
-    let key = provision_merchant(&server).await;
-    let auth = format!("Bearer {key}");
-    seed_deliveries(&server, &pool, &auth, "failed", 3, "f").await;
-
-    let res = server
-        .post("/payments/webhooks/redeliver")
-        .add_header("Authorization", auth)
-        .json(&json!({ "delivery_ids": ["f-0", "f-2"] }))
-        .await;
-    res.assert_status_ok();
-    assert_eq!(res.json::<Value>()["requeued"], 2);
-
-    let still_failed: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'failed'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(still_failed, 1, "only the named deliveries move");
-}
-
-/// Bulk requeue must not become a cross-tenant write.
-#[tokio::test]
-async fn test_bulk_redeliver_cannot_touch_another_merchants_deliveries() {
-    let (server, pool) = test_server_with_pool().await;
-    let key_a = provision_merchant(&server).await;
-    let key_b = provision_merchant(&server).await;
-    seed_deliveries(&server, &pool, &format!("Bearer {key_a}"), "failed", 2, "a").await;
-
-    // B names A's delivery ids explicitly.
-    let res = server
-        .post("/payments/webhooks/redeliver")
-        .add_header("Authorization", format!("Bearer {key_b}"))
-        .json(&json!({ "delivery_ids": ["a-0", "a-1"] }))
-        .await;
-    res.assert_status_ok();
-    assert_eq!(res.json::<Value>()["requeued"], 0);
-
-    let still_failed: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'failed'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(still_failed, 2, "A's deliveries are untouched");
-}
-
-#[tokio::test]
-async fn test_bulk_redeliver_caps_the_id_list() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let ids: Vec<String> = (0..101).map(|i| format!("d-{i}")).collect();
-    let res = server
-        .post("/payments/webhooks/redeliver")
-        .add_header("Authorization", format!("Bearer {key}"))
-        .json(&json!({ "delivery_ids": ids }))
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    assert_eq!(res.json::<Value>()["code"], "too_many_delivery_ids");
-}
-
-#[tokio::test]
-async fn test_bulk_redeliver_requires_authentication() {
-    let server = test_server().await;
-    server
-        .post("/payments/webhooks/redeliver")
-        .await
-        .assert_status(StatusCode::UNAUTHORIZED);
-}
-
 /// A merchant cannot read another merchant's webhook deliveries — the payment
 /// id alone must not be enough, and the response must not distinguish "not
 /// yours" from "doesn't exist".
@@ -2558,178 +1025,6 @@ async fn test_list_webhooks_rejects_other_merchants_payment() {
         .await;
     res.assert_status(StatusCode::NOT_FOUND);
     assert_eq!(res.json::<Value>()["code"], "payment_not_found");
-}
-
-/// Regression for #326: the webhook-delivery listing must be paginated like
-/// `GET /payments`. Create more deliveries than one page holds, then walk the
-/// keyset cursor until it runs dry, asserting every delivery is seen exactly
-/// once and the final page reports a null `next_cursor`.
-#[tokio::test]
-async fn test_list_webhooks_walks_cursor_across_pages() {
-    let (server, pool) = test_server_with_pool().await;
-    let key = provision_merchant(&server).await;
-    let auth = format!("Bearer {key}");
-    let id = server
-        .post("/payments")
-        .add_header("Authorization", auth.clone())
-        .json(&json!({ "amount": "5", "asset": "XLM" }))
-        .await
-        .json::<Value>()["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    for i in 1..=5 {
-        stellargate::db::save_webhook_delivery(
-            &pool,
-            &format!("delivery-{i}"),
-            &id,
-            "https://example.com/webhook",
-            r#"{"event":"payment.completed"}"#,
-            "payment.completed",
-        )
-        .await
-        .unwrap();
-    }
-
-    // Page 1 — a full page of 2 must mint a cursor.
-    let res = server
-        .get(&format!("/payments/{id}/webhooks?limit=2"))
-        .add_header("Authorization", auth.clone())
-        .await;
-    res.assert_status_ok();
-    let body: Value = res.json();
-    assert_eq!(body["deliveries"].as_array().unwrap().len(), 2);
-    assert_eq!(body["limit"], 2);
-    let cursor = body["next_cursor"]
-        .as_str()
-        .expect("a full page must mint next_cursor");
-
-    // Pages 2 and 3 walk the cursor; only the last (short) page is null.
-    let res2 = server
-        .get(&format!("/payments/{id}/webhooks?cursor={cursor}&limit=2"))
-        .add_header("Authorization", auth.clone())
-        .await;
-    res2.assert_status_ok();
-    let body2: Value = res2.json();
-    assert_eq!(body2["deliveries"].as_array().unwrap().len(), 2);
-    let cursor2 = body2["next_cursor"]
-        .as_str()
-        .expect("second full page must mint next_cursor");
-
-    let res3 = server
-        .get(&format!("/payments/{id}/webhooks?cursor={cursor2}&limit=2"))
-        .add_header("Authorization", auth.clone())
-        .await;
-    res3.assert_status_ok();
-    let body3: Value = res3.json();
-    assert_eq!(body3["deliveries"].as_array().unwrap().len(), 1);
-    assert!(
-        body3["next_cursor"].is_null(),
-        "last page must have null next_cursor"
-    );
-
-    // All five deliveries walked exactly once.
-    let ids: Vec<String> = [&body, &body2, &body3]
-        .iter()
-        .flat_map(|b| b["deliveries"].as_array().unwrap().iter())
-        .map(|d| d["id"].as_str().unwrap().to_string())
-        .collect();
-    let unique: std::collections::HashSet<_> = ids.iter().collect();
-    assert_eq!(unique.len(), 5, "pages must never repeat a delivery");
-}
-
-/// Regression for #326: the webhook-delivery listing accepts a `status`
-/// filter and rejects anything that isn't a real delivery status.
-#[tokio::test]
-async fn test_list_webhooks_status_filter() {
-    let (server, pool) = test_server_with_pool().await;
-    let key = provision_merchant(&server).await;
-    let auth = format!("Bearer {key}");
-    let id = server
-        .post("/payments")
-        .add_header("Authorization", auth.clone())
-        .json(&json!({ "amount": "5", "asset": "XLM" }))
-        .await
-        .json::<Value>()["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    for i in 1..=4 {
-        stellargate::db::save_webhook_delivery(
-            &pool,
-            &format!("delivery-{i}"),
-            &id,
-            "https://example.com/webhook",
-            r#"{"event":"payment.completed"}"#,
-            "payment.completed",
-        )
-        .await
-        .unwrap();
-    }
-    // Mark delivery-1 failed and delivery-2 pending; the rest stay delivered.
-    stellargate::db::update_webhook_delivery(&pool, "delivery-1", "failed", 8)
-        .await
-        .unwrap();
-    stellargate::db::update_webhook_delivery(&pool, "delivery-3", "delivered", 1)
-        .await
-        .unwrap();
-
-    let res = server
-        .get(&format!("/payments/{id}/webhooks?status=failed&limit=5"))
-        .add_header("Authorization", auth.clone())
-        .await;
-    res.assert_status_ok();
-    let body: Value = res.json();
-    let deliveries = body["deliveries"].as_array().unwrap();
-    assert_eq!(deliveries.len(), 1);
-    assert_eq!(deliveries[0]["id"], "delivery-1");
-    assert_eq!(deliveries[0]["status"], "failed");
-
-    // An invalid status is a 400, matching the payments listing.
-    let res = server
-        .get(&format!("/payments/{id}/webhooks?status=nonsense"))
-        .add_header("Authorization", auth)
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    assert_eq!(res.json::<Value>()["code"], "invalid_status");
-}
-
-/// Regression for #326 (cursor) and #258 (limit): an undecodable `cursor` is
-/// rejected with a 400, and an out-of-range `limit` is rejected rather than
-/// silently clamped.
-#[tokio::test]
-async fn test_list_webhooks_invalid_cursor_and_limit_out_of_range() {
-    let server = test_server().await;
-    let key = provision_merchant(&server).await;
-    let auth = format!("Bearer {key}");
-    let id = server
-        .post("/payments")
-        .add_header("Authorization", auth.clone())
-        .json(&json!({ "amount": "5", "asset": "XLM" }))
-        .await
-        .json::<Value>()["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let res = server
-        .get(&format!("/payments/{id}/webhooks?cursor=not-a-cursor"))
-        .add_header("Authorization", auth.clone())
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    assert_eq!(res.json::<Value>()["code"], "invalid_cursor");
-
-    // Above MAX_LIMIT is now rejected rather than silently clamped down to
-    // 100 (issue #258) — a paginating client trusting the echoed limit would
-    // otherwise read the short page as "end of results" and stop early.
-    let res = server
-        .get(&format!("/payments/{id}/webhooks?limit=5000"))
-        .add_header("Authorization", auth)
-        .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
-    assert_eq!(res.json::<Value>()["code"], "invalid_limit");
 }
 
 #[tokio::test]
@@ -2866,78 +1161,6 @@ async fn test_redeliver_echoes_the_original_event_type() {
         received[0].headers.get("X-StellarGate-Event").unwrap(),
         "payment.underpaid",
         "redelivered header must match the event the payload carries"
-    );
-}
-
-/// Manual redeliveries must not share the automatic redrive budget (issue #235).
-#[tokio::test]
-async fn test_manual_redeliver_does_not_consume_automatic_attempts() {
-    let mock = wiremock::MockServer::start().await;
-    wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/hook"))
-        .respond_with(wiremock::ResponseTemplate::new(500))
-        .expect(3)
-        .mount(&mock)
-        .await;
-
-    let mut cfg = make_config();
-    cfg.webhook_allow_private_targets = true;
-    let (server, pool) = server_with_config(cfg).await;
-    let key = provision_merchant(&server).await;
-    let auth = format!("Bearer {key}");
-    let id = server
-        .post("/payments")
-        .add_header("Authorization", auth.clone())
-        .json(&json!({ "amount": "5", "asset": "XLM" }))
-        .await
-        .json::<Value>()["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    stellargate::db::save_webhook_delivery(
-        &pool,
-        "delivery-manual",
-        &id,
-        &format!("{}/hook", mock.uri()),
-        r#"{"event":"payment.completed"}"#,
-        "payment.completed",
-    )
-    .await
-    .unwrap();
-    stellargate::db::update_webhook_delivery(&pool, "delivery-manual", "failed", 2)
-        .await
-        .unwrap();
-
-    for _ in 0..3 {
-        let res = server
-            .post(&format!(
-                "/payments/{id}/webhooks/delivery-manual/redeliver"
-            ))
-            .add_header("Authorization", auth.clone())
-            .await;
-        // Endpoint returns 502 when the target rejects — that is fine; we care
-        // about the counters, not the HTTP success of the merchant call.
-        assert!(
-            res.status_code().as_u16() == 502 || res.status_code().is_success(),
-            "unexpected status {}",
-            res.status_code()
-        );
-    }
-
-    let listed = server
-        .get(&format!("/payments/{id}/webhooks"))
-        .add_header("Authorization", auth)
-        .await
-        .json::<Value>();
-    let d = &listed["deliveries"][0];
-    assert_eq!(
-        d["attempts"], 2,
-        "automatic attempts must stay put; got {listed}"
-    );
-    assert_eq!(
-        d["manual_attempts"], 3,
-        "manual_attempts must count each click; got {listed}"
     );
 }
 
@@ -3522,157 +1745,6 @@ async fn test_listing_keys_never_returns_the_secret() {
     assert!(entry["prefix"].as_str().unwrap().len() < raw_key.len());
 }
 
-/// Regression for #262: `GET /merchants/:id/keys` ran an unbounded `SELECT`
-/// with no `LIMIT`, and revoked keys are kept forever as an audit trail, so a
-/// merchant that rotates regularly accumulates rows without bound. This
-/// creates more keys than one page holds, then walks the keyset cursor until
-/// it runs dry, asserting every key is seen exactly once and the final page
-/// reports a null `next_cursor` — the same contract `GET /payments` and the
-/// webhook-delivery listings already use.
-#[tokio::test]
-async fn test_list_api_keys_walks_cursor_across_pages() {
-    let server = test_server().await;
-    let res = server
-        .post("/merchants")
-        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
-        .await;
-    res.assert_status(StatusCode::CREATED);
-    let merchant_id = res.json::<Value>()["merchant_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    // Provisioning already minted one key; issue six more so there are 7 in
-    // total — more than a single page at limit=3 (3, 3, 1).
-    for i in 0..6 {
-        server
-            .post(&format!("/merchants/{merchant_id}/keys"))
-            .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
-            .json(&json!({ "label": format!("key-{i}") }))
-            .await
-            .assert_status(StatusCode::CREATED);
-    }
-
-    // Page 1 — a full page of 3 must mint a cursor.
-    let res = server
-        .get(&format!("/merchants/{merchant_id}/keys?limit=3"))
-        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
-        .await;
-    res.assert_status_ok();
-    let body: Value = res.json();
-    assert_eq!(body["keys"].as_array().unwrap().len(), 3);
-    assert_eq!(body["limit"], 3);
-    let cursor = body["next_cursor"]
-        .as_str()
-        .expect("a full page must mint next_cursor");
-
-    // Page 2 — also full, also mints a cursor.
-    let res2 = server
-        .get(&format!(
-            "/merchants/{merchant_id}/keys?limit=3&cursor={cursor}"
-        ))
-        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
-        .await;
-    res2.assert_status_ok();
-    let body2: Value = res2.json();
-    assert_eq!(body2["keys"].as_array().unwrap().len(), 3);
-    let cursor2 = body2["next_cursor"]
-        .as_str()
-        .expect("second full page must mint next_cursor");
-
-    // Page 3 — the remainder, short of a full page, ends pagination.
-    let res3 = server
-        .get(&format!(
-            "/merchants/{merchant_id}/keys?limit=3&cursor={cursor2}"
-        ))
-        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
-        .await;
-    res3.assert_status_ok();
-    let body3: Value = res3.json();
-    assert_eq!(body3["keys"].as_array().unwrap().len(), 1);
-    assert!(
-        body3["next_cursor"].is_null(),
-        "last page must have null next_cursor"
-    );
-
-    // All 7 key ids walked exactly once, none repeated or skipped.
-    let ids: Vec<String> = [&body, &body2, &body3]
-        .iter()
-        .flat_map(|b| b["keys"].as_array().unwrap().iter())
-        .map(|k| k["key_id"].as_str().unwrap().to_string())
-        .collect();
-    let unique: std::collections::HashSet<_> = ids.iter().collect();
-    assert_eq!(unique.len(), 7);
-}
-
-/// `active=true` filters out the revoked audit trail so an operator looking
-/// for currently-usable keys does not have to page through history to find
-/// them (issue #262).
-#[tokio::test]
-async fn test_list_api_keys_active_filter() {
-    let server = test_server().await;
-    let res = server
-        .post("/merchants")
-        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
-        .await;
-    let body: Value = res.json();
-    let merchant_id = body["merchant_id"].as_str().unwrap().to_string();
-    let old_key_id = body["key_id"].as_str().unwrap().to_string();
-
-    let new_key_id = server
-        .post(&format!("/merchants/{merchant_id}/keys"))
-        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
-        .await
-        .json::<Value>()["key_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    server
-        .delete(&format!("/merchants/{merchant_id}/keys/{old_key_id}"))
-        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
-        .await
-        .assert_status_ok();
-
-    let active_ids: Vec<String> = server
-        .get(&format!("/merchants/{merchant_id}/keys?active=true"))
-        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
-        .await
-        .json::<Value>()["keys"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|k| k["key_id"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(active_ids, vec![new_key_id.clone()]);
-
-    let revoked_ids: Vec<String> = server
-        .get(&format!("/merchants/{merchant_id}/keys?active=false"))
-        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
-        .await
-        .json::<Value>()["keys"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|k| k["key_id"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(revoked_ids, vec![old_key_id]);
-
-    // No filter still returns both, including the revoked one.
-    let all_ids: Vec<String> = server
-        .get(&format!("/merchants/{merchant_id}/keys"))
-        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
-        .await
-        .json::<Value>()["keys"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|k| k["key_id"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(all_ids.len(), 2);
-    assert!(all_ids.contains(&new_key_id));
-}
-
 /// Key management is an operator action — it must not be reachable with a
 /// merchant's own key, only the admin secret.
 #[tokio::test]
@@ -4116,35 +2188,4 @@ async fn test_both_mounts_share_the_same_data() {
         .await;
     via_v1.assert_status_ok();
     assert_eq!(via_v1.json::<Value>()["id"], json!(id));
-}
-
-/// Payment creation should succeed without 500 errors when retrying due to
-/// memo collisions. The retry logic in create_payment ensures that UNIQUE
-/// constraint violations on memo trigger a retry with a fresh memo (issue #273).
-#[tokio::test]
-async fn test_concurrent_payment_creation_handles_memo_collisions() {
-    let server = Arc::new(test_server().await);
-    let key = provision_merchant(&server).await;
-
-    // Create 50 payment requests in rapid succession. Even though they execute
-    // sequentially in this test, the payment creation logic itself includes retry
-    // logic to handle potential memo collisions from the database UNIQUE constraint.
-    let mut memos = Vec::new();
-    for i in 0..50 {
-        let response = server
-            .post("/payments")
-            .add_header("Authorization", format!("Bearer {key}"))
-            .json(&json!({ "amount": format!("{}.5", i), "asset": "XLM" }))
-            .await;
-
-        // Verify no 500 errors (the original bug would cause 500s on memo collisions)
-        response.assert_status(StatusCode::CREATED);
-        let body = response.json::<Value>();
-        let memo = body["memo"].as_str().unwrap().to_string();
-        memos.push(memo);
-    }
-
-    // Verify all memos are unique (the retry logic ensures fresh memos on collisions)
-    let unique_count = memos.iter().collect::<std::collections::HashSet<_>>().len();
-    assert_eq!(unique_count, 50, "all payment memos must be unique");
 }

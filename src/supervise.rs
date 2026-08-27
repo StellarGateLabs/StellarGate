@@ -469,4 +469,206 @@ mod tests {
         let _ = tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
     }
+
+    // ── New targeted tests (issue #438) ─────────────────────────────────────
+
+    #[test]
+    fn backoff_default_has_documented_values() {
+        // The README and code comments document: initial=1s, max=60s,
+        // stability=5s.  A future change to these values must be intentional.
+        let b = Backoff::default();
+        assert_eq!(b.initial, Duration::from_secs(1));
+        assert_eq!(b.max, Duration::from_secs(60));
+        assert_eq!(b.stability, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn shutdown_before_first_run_exits_without_starting_child() {
+        // Send `true` on the channel before calling `supervise_with`.  The
+        // supervisor checks `*shutdown.borrow()` at the top of its loop and
+        // must return immediately without ever calling `make()`.
+        let health = TaskHealth::new();
+        health.require("probe");
+
+        let (tx, rx) = watch::channel(false);
+        // Signal shutdown NOW, before the supervisor even starts.
+        tx.send(true).unwrap();
+
+        let runs = Arc::new(AtomicU64::new(0));
+        let runs_inner = runs.clone();
+
+        // Use a synchronous (non-async) test with `tokio::runtime::Runtime`
+        // so we can drive the future to completion inline.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let handle = supervise_with(
+                health.clone(),
+                "probe",
+                rx,
+                move || {
+                    runs_inner.fetch_add(1, Ordering::SeqCst);
+                    async move { TaskExit::ShutdownRequested }
+                },
+                fast_backoff(),
+            );
+            tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("supervisor should exit immediately on pre-set shutdown")
+                .expect("supervisor panicked");
+
+            assert_eq!(
+                runs.load(Ordering::SeqCst),
+                0,
+                "child must never run when shutdown is set before supervise_with is called"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn supervise_public_fn_works_with_shutdown_requested() {
+        // `supervise` is the public wrapper that uses `Backoff::default()`.
+        // Verify it terminates cleanly when the worker returns ShutdownRequested.
+        let health = TaskHealth::new();
+        health.require("probe");
+        let (tx, rx) = watch::channel(false);
+
+        let handle = supervise(
+            health.clone(),
+            "probe",
+            rx,
+            move || async move { TaskExit::ShutdownRequested },
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("supervise did not terminate after ShutdownRequested")
+            .expect("supervisor task panicked");
+
+        assert_eq!(health.failed(), 0);
+        assert_eq!(health.restarts("probe"), 0);
+        let _ = tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn multiple_fatal_exits_increment_restarts_correctly() {
+        // A worker that returns Fatal twice then parks must record at least
+        // 2 restarts in health.restarts("probe").
+        let health = TaskHealth::new();
+        health.require("probe");
+        let (tx, rx) = watch::channel(false);
+
+        let (handle, runs) = supervise_returning(
+            health.clone(),
+            rx,
+            vec![
+                TaskExit::Fatal("first failure".into()),
+                TaskExit::Fatal("second failure".into()),
+            ],
+        );
+
+        // Wait until the worker has run at least 3 times (2 fatals + 1 park).
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runs.load(Ordering::SeqCst) < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("worker did not complete two fatal exits");
+
+        assert!(
+            health.restarts("probe") >= 2,
+            "expected at least 2 restarts, got {}",
+            health.restarts("probe")
+        );
+
+        let _ = tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn disabled_by_config_reduces_expected_tasks_by_one() {
+        // After a DisabledByConfig exit, expected_tasks() must drop by 1.
+        // The existing test covers the combined case; this one asserts the
+        // delta explicitly.
+        let health = TaskHealth::new();
+        health.require("alpha");
+        health.require("beta");
+        let (tx, rx) = watch::channel(false);
+
+        // Start alpha normally (parks until shutdown).
+        let shutdown_for_alpha = rx.clone();
+        let _alpha = supervise_with(
+            health.clone(),
+            "alpha",
+            rx.clone(),
+            move || {
+                let mut sd = shutdown_for_alpha.clone();
+                async move {
+                    let _ = sd.changed().await;
+                    TaskExit::ShutdownRequested
+                }
+            },
+            fast_backoff(),
+        );
+
+        let expected_before = {
+            // Wait briefly for alpha to start.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            health.expected_tasks()
+        };
+        assert_eq!(expected_before, 2);
+
+        // Beta exits with DisabledByConfig.
+        let (beta_handle, _) = supervise_returning(
+            health.clone(),
+            rx.clone(),
+            vec![TaskExit::DisabledByConfig("test disabled")],
+        );
+        tokio::time::timeout(Duration::from_secs(2), beta_handle)
+            .await
+            .expect("beta supervisor did not finish")
+            .unwrap();
+
+        assert_eq!(
+            health.expected_tasks(),
+            1,
+            "expected_tasks must drop by 1 after DisabledByConfig"
+        );
+
+        let _ = tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn fatal_exit_does_not_increment_failed() {
+        // `health.failed()` counts panics (via task_failed), not Fatal exits.
+        // A Fatal exit goes through task_stopped + task_restarted only.
+        let health = TaskHealth::new();
+        health.require("probe");
+        let (tx, rx) = watch::channel(false);
+
+        let (handle, runs) = supervise_returning(
+            health.clone(),
+            rx,
+            vec![TaskExit::Fatal("non-panic failure".into())],
+        );
+
+        // Wait for the second run (one Fatal + one park).
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runs.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("worker did not restart after Fatal exit");
+
+        assert_eq!(
+            health.failed(),
+            0,
+            "a Fatal exit must not increment health.failed() — that counter is for panics"
+        );
+        assert_eq!(health.restarts("probe"), 1);
+
+        let _ = tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
 }

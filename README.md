@@ -118,6 +118,10 @@ tests/             Integration tests (API, concurrency, rate limits, webhooks, t
 
 **Two independent listeners** run concurrently. The SSE stream gives near-real-time settlement; the interval poller re-scans from a persisted cursor and acts as a reconciler for anything missed during a reconnect. Both converge on the same idempotent settlement path, so a payment observed twice settles once.
 
+**Both listeners resume from a persisted cursor across restarts**, under separate `kv_state` keys (`horizon_stream_cursor` and `horizon_payment_cursor`) so neither drags the other backwards. A deploy therefore does not cost the stream its ~1 s settlement latency: it reconnects from the last event it handled and works forward through whatever landed while the process was down, rather than re-baselining at the live edge and leaving the gap to the poller. Only a genuinely fresh database — no cursor under either key — starts at the live edge. Re-seeing records the other listener already handled is harmless; settlement is idempotent through `processed_transactions`.
+
+**Shutdown is observed mid-catch-up.** A poll cycle checks the shutdown signal at every page boundary, right after it checkpoints its cursor, so `SIGTERM` during a long backlog drain is honoured in one page rather than after the whole backlog (or, worse, by being killed mid-page once the 30 s shutdown grace expires). `POLL_MAX_PAGES_PER_CYCLE` bounds a single cycle for the same reason.
+
 ### Tech Stack
 
 | Layer | Choice |
@@ -280,8 +284,14 @@ Current trustline state is on `GET /metrics`, so it's alertable rather than
 grep-only:
 
 ```
-# a confirmed-missing trustline
+# a confirmed-missing or unauthorized trustline
 stellargate_missing_trustlines{asset="USDC"} 1
+
+# trustline exists but is_authorized=false (issuer revoked authorization)
+stellargate_trustline_unauthorized{asset="USDC"} 1
+
+# remaining capacity in stroops (limit - balance); alert when near your typical payment size
+stellargate_trustline_headroom_stroops{asset="USDC"} 9223372036854775807
 
 # how many checks have failed to reach Horizon at all — distinct from a
 # confirmed-absent trustline, which only ever comes from a check that
@@ -293,6 +303,20 @@ stellargate_trustline_check_failures_total 0
 # until this is nonzero
 stellargate_trustline_check_last_success_timestamp_seconds 1732000000
 ```
+
+`stellargate_missing_trustlines=1` covers two distinct cases — both cause payments
+to bounce on-chain:
+
+- **No trustline** — the account has no balance line for this asset. Add one with `changeTrust`.
+- **Unauthorized trustline** — the balance line exists but `is_authorized=false`. The issuer uses
+  `AUTH_REQUIRED` and has not yet granted (or has revoked) authorization. Contact the issuer.
+
+`stellargate_trustline_unauthorized` distinguishes the second case from the first, so an alert can
+recommend the right action.
+
+`stellargate_trustline_headroom_stroops` is the remaining capacity (`limit - balance`). A payment
+that would push the balance past `limit` fails on-chain just like a missing trustline. Alert when
+this approaches your typical payment size.
 
 A Horizon outage during a check only increments
 `stellargate_trustline_check_failures_total`; it leaves the last confirmed
@@ -348,6 +372,7 @@ XLM free to cover one per asset.
 | `STELLAR_LISTENER_MODE` | `stream` (SSE + poller reconciler) or `poll` (interval only) | `stream` |
 | `POLL_INTERVAL_SECS` | How often the poller reconciles | `10` |
 | `CURSOR_STALENESS_MULTIPLE` | Multiplier on `POLL_INTERVAL_SECS` that may elapse without a successful poll/stream event before `/ready` reports the detection cursor stale (`503`). A healthy poller cycles on the poll interval, so this only trips when the poller died or the stream wedged. | `3` |
+| `POLL_MAX_PAGES_PER_CYCLE` | Maximum Horizon pages (200 records each) one poll cycle walks before yielding to the next tick. Bounds how long a catch-up can monopolise the poller; the cursor is checkpointed at every page boundary, so the next cycle resumes exactly where this one stopped. `0` = unlimited. | `50` |
 | `PAYMENT_TTL_SECS` | How long an intent stays `pending` before expiring, from `created_at` | `3600` |
 | `EXPIRY_BATCH_SIZE` | Maximum overdue intents the expiry sweeper transitions per sweep | `500` |
 
@@ -713,6 +738,7 @@ later would silently change the behaviour of requests that appeared to work.
 | `invalid_label` | `400` | Key label exceeds 100 characters |
 | `delivery_not_found` | `404` | No such delivery for that payment |
 | `webhook_target_blocked` | `400` | Redelivery target rejected by the SSRF guard |
+| `already_delivered` | `409` | Delivery was already successfully delivered; pass `?force=true` to redeliver anyway |
 | `webhook_delivery_failed` | `502` | Receiver returned a non-success response |
 | `rate_limit_exceeded` | `429` | Per-IP bucket limit exceeded |
 | `idempotency_conflict` | `409` | Concurrent creates raced on one idempotency key; retry |
@@ -868,7 +894,7 @@ Create a payment intent. Requires a merchant API key; the merchant is taken from
 | Field | Type | Required | Constraints |
 |---|---|---|---|
 | `amount` | string | ✅ | Positive decimal, ≤ 7 decimal places |
-| `asset` | string | ❌ | Must be in `ACCEPTED_ASSETS`. Defaults to `XLM`. |
+| `asset` | string | ❌ | Must be in `ACCEPTED_ASSETS`. Defaults to `XLM`. The issuer configured for that code is resolved at creation time and returned as `asset_issuer`; it is not accepted in the request. |
 | `webhook_url` | string | ❌ | ≤ 2048 chars; scheme must be allowed; HTTPS required on `public`; SSRF-checked |
 
 Any other field is rejected with `400` `unknown_field` — see [Error
@@ -1296,6 +1322,7 @@ Every on-chain payment matched by memo, destination, and asset resolves as follo
 | Top-up reaching exactly the total | `completed` | `payment.completed` | — |
 | Top-up exceeding the total | `completed` | `payment.overpaid` | cumulative excess |
 | TTL elapsed, unpaid | `expired` | `payment.expired` | — |
+| Payment after `completed` or `expired` | unchanged | `payment.unexpected` | unexpected amount to refund |
 
 **Overpayment** fulfils the intent. The `delta` field carries the excess; refunding it is the merchant's responsibility — the gateway cannot send funds.
 
@@ -1304,8 +1331,7 @@ Every on-chain payment matched by memo, destination, and asset resolves as follo
 **Limitations to be aware of:**
 
 - Only a **single** top-up is tracked per underpaid intent. If more is needed, the payer should send the full remaining `delta` in one transaction.
-- Once an intent is `completed`, further payments to the same address and memo are **not** tracked and fire no webhooks.
-- Failed on-chain transactions are ignored entirely.
+- Once an intent is `completed`, further payments to the same address and memo fire a `payment.unexpected` webhook so the merchant can refund them, but the intent's `completed` status is not changed.
 
 ---
 
@@ -1321,6 +1347,7 @@ When a payment reaches a terminal state, StellarGate POSTs a signed JSON event t
 | `payment.overpaid` | Cumulative received exceeds it (`delta` = excess, `full` detail only) |
 | `payment.underpaid` | Payment received but short (`delta` = shortfall, `full` detail only) |
 | `payment.expired` | TTL elapsed with no payment |
+| `payment.unexpected` | Payment received after intent is already `completed` or `expired` (`delta` = the unexpected amount the merchant must refund) |
 
 ### Payload detail
 
@@ -1502,6 +1529,11 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 | `stellargate_db_pool_connections` | gauge | SQLite connection pool size, labelled by `state` (`idle`, `in_use`) |
 | `stellargate_db_pool_max_connections` | gauge | Configured maximum pool size |
 | `stellargate_db_file_size_bytes` | gauge | On-disk size of the SQLite database files, labelled by `file` (`main`, `wal`, `shm`); absent for an in-memory database |
+| `stellargate_missing_trustlines` | gauge | `1` if the gateway account has no usable trustline for this asset (absent or unauthorized); `0` if confirmed usable |
+| `stellargate_trustline_unauthorized` | gauge | `1` if the trustline exists but `is_authorized=false` (issuer revoked/has not granted authorization) |
+| `stellargate_trustline_headroom_stroops` | gauge | Remaining trustline capacity in stroops (`limit - balance`); alert when near your typical payment size |
+| `stellargate_trustline_check_failures_total` | counter | Trustline checks that failed to reach Horizon (does not affect `stellargate_missing_trustlines`) |
+| `stellargate_trustline_check_last_success_timestamp_seconds` | gauge | Unix timestamp of the last confirmed trustline check; `0` until first success |
 
 **Alert on `stellargate_tasks_live < stellargate_tasks_expected`.** That
 comparison was not previously possible: `stellargate_tasks_stopped_total` was
@@ -1602,6 +1634,7 @@ Schema is applied at startup by `db::migrate` in [`src/db.rs`](src/db.rs), calle
 - Tables and indexes are created with `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`.
 - New columns on existing tables are added by probing `pragma_table_info(...)` first, then `ALTER TABLE ... ADD COLUMN`.
 - A few one-time data backfills (populating `processed_transactions` from legacy rows, filling `asset_issuer` from `ACCEPTED_ASSETS`, normalising pre-RFC 3339 timestamps) run alongside them.
+- `payments.asset_issuer` is the one backfill that does *not* run on every boot: it reconstructs the issuer of pre-existing rows from the configured allow-list, so re-running it after an `ACCEPTED_ASSETS` edit would rewrite history a second time. It runs once per database, guarded by a `kv_state` marker, from `db::backfill_asset_issuers` — and rows created before it are best-effort by nature, since the issuer they were priced in was never recorded.
 
 Every statement is written to be safe to re-run, because **all of them run on every boot**. There is no version table, nothing is recorded as applied, and the whole sequence is not wrapped in a transaction.
 

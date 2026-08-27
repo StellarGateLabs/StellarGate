@@ -13,11 +13,11 @@ jobs:
     name: fmt / clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@master
 
-      - uses: actions/cache@v6
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -38,14 +38,14 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
           components: clippy
 
-      - uses: actions/cache@v6
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -67,13 +67,13 @@ jobs:
       matrix:
         rust: [1.88, stable]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
 
-      - uses: actions/cache@v6
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -95,7 +95,7 @@ jobs:
     name: openapi lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
@@ -113,10 +113,60 @@ jobs:
     name: deploy asset consistency
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       # Catches Dockerfile/compose port or healthcheck drift, and a real
       # secret slipping into deploy/stellargate.env.example, before it merges
       # rather than at deploy time (issues #444, #447).
       - name: Check deploy assets against Dockerfile
         run: bash scripts/check-deploy-consistency.sh
+
+  # Belt-and-suspenders alongside supply-chain.yml: running cargo audit
+  # directly in CI ensures every PR gets a RustSec advisory scan even without
+  # the scheduled weekly supply-chain workflow. Mirrors the same RUSTSEC ignore
+  # list kept in supply-chain.yml — see that file for the full triage rationale.
+  audit:
+    name: cargo audit (RustSec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run cargo audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2023-0071
+
+  # Coverage report uploaded as an artifact for inspection.
+  # A hard numeric gate can be added here once a baseline is established.
+  coverage:
+    name: coverage (tarpaulin)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-coverage-
+
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin --locked
+
+      - name: Generate coverage report
+        run: cargo tarpaulin --locked --out Xml --output-dir coverage/
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/

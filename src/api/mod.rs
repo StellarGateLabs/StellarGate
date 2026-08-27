@@ -1,50 +1,48 @@
-use crate::api::payments::{
-    decode_cursor, encode_cursor, validate_limit, AppError, JsonBody, OptionalJsonBody,
-};
+use crate::api::payments::{AppError, JsonBody};
 use crate::{db, AppState};
 use axum::{
-    body::{to_bytes, Body},
-    extract::{ConnectInfo, MatchedPath, Path, Query, Request, State},
-    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
+    extract::{ConnectInfo, Path, Request, State},
+    http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::IntoResponse,
     routing::{get, post},
     Json,
 };
-use tracing::Instrument;
-use governor::clock::{Clock, DefaultClock};
-use governor::middleware::StateInformationMiddleware;
-use ipnet::IpNet;
 use moka::sync::Cache;
 use serde_json::{json, Value};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tower_http::{
     cors::CorsLayer,
     limit::RequestBodyLimitLayer,
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
-    set_header::SetResponseHeaderLayer,
     timeout::TimeoutLayer,
     trace::TraceLayer,
 };
 
 mod payments;
 
+/// Reject request bodies larger than this (256 KiB) before they hit a handler.
+const MAX_BODY_BYTES: usize = 256 * 1024;
+
 /// The authenticated merchant ID injected by the auth middleware.
 #[derive(Clone)]
 pub struct AuthenticatedMerchant(pub String);
 
+/// Maximum number of distinct IP+bucket keys tracked at once.
+/// Once this is reached, moka evicts the least-recently-used entry,
+/// bounding resident memory regardless of key cardinality.
+const RATE_LIMITER_MAX_KEYS: u64 = 10_000;
+
+/// How long a per-key limiter is retained after its last access.
+/// Keys for IPs that go quiet are automatically reclaimed.
+const RATE_LIMITER_IDLE_TTL: Duration = Duration::from_secs(60);
+
 #[derive(Clone)]
 struct RateLimitState {
     requests_per_sec: u32,
-    /// Trusted proxies from `TRUSTED_PROXY_CIDRS`. Forwarding headers
-    /// (`X-Forwarded-For` / `X-Real-IP`) are honoured only when the socket
-    /// peer is one of these; every other peer is bucketed by its own address
-    /// and its headers are ignored (issue #330). Empty means no proxy is
-    /// trusted and the headers are always ignored.
-    trusted_proxies: Vec<IpNet>,
     /// Bounded, TTL-evicting cache of per-(bucket, IP) rate limiters.
     ///
     /// Replaces the previous `Mutex<HashMap<...>>`:
@@ -54,80 +52,17 @@ struct RateLimitState {
     ///   so limiter state for quiet IPs is automatically reclaimed.
     /// - moka uses internal sharding, eliminating the single global lock that
     ///   the old `Mutex` imposed.
-    ///
-    /// Built `with_middleware::<StateInformationMiddleware>` so a successful
-    /// `check()` returns a `StateSnapshot` rather than `()`. That snapshot is
-    /// where `X-RateLimit-Remaining` comes from; without it the limiter can
-    /// only answer "allowed or not", and a client has no way to pace itself
-    /// before being throttled (issue #327).
-    limiters: Cache<String, Arc<governor::DefaultDirectRateLimiter<StateInformationMiddleware>>>,
+    limiters: Cache<String, Arc<governor::DefaultDirectRateLimiter>>,
 }
-
-/// Rate-limit headers. Named here so the CORS `expose_headers` list and the
-/// middleware cannot drift apart — a header a browser client can't read is the
-/// same as one that was never sent.
-const X_RATELIMIT_LIMIT: HeaderName = HeaderName::from_static("x-ratelimit-limit");
-const X_RATELIMIT_REMAINING: HeaderName = HeaderName::from_static("x-ratelimit-remaining");
-const X_RATELIMIT_RESET: HeaderName = HeaderName::from_static("x-ratelimit-reset");
 
 impl RateLimitState {
-    /// `requests_per_sec` is used as-is: `Config::validate_timing` rejects
-    /// `RATE_LIMIT_REQUESTS_PER_SEC == 0` at boot, so silently clamping it up
-    /// here (as this used to, to `1`) would make the effective rate diverge
-    /// from the configured one for every other value too — the clamp only
-    /// *looked* harmless because it never fired (issue #276).
-    fn new(
-        requests_per_sec: u32,
-        trusted_proxies: Vec<IpNet>,
-        max_keys: u64,
-        idle_ttl: Duration,
-    ) -> Self {
+    fn new(requests_per_sec: u32) -> Self {
         let limiters = Cache::builder()
-            .max_capacity(max_keys)
-            .time_to_idle(idle_ttl)
+            .max_capacity(RATE_LIMITER_MAX_KEYS)
+            .time_to_idle(RATE_LIMITER_IDLE_TTL)
             .build();
         Self {
-            requests_per_sec,
-            trusted_proxies,
-            limiters,
-        }
-    }
-}
-
-/// The default per-merchant quota is this multiple of the configured base
-/// `rate_limit_requests_per_sec`, matching the outer IP limiter's own
-/// "default" (read) bucket multiplier. A merchant's authenticated traffic is
-/// a mix of writes and polling reads, so it needs at least that much room to
-/// avoid throttling well-behaved integrators (issue: rate limiter keyed on
-/// IP, not identity).
-const MERCHANT_DEFAULT_QUOTA_MULTIPLIER: u32 = 5;
-
-/// Per-merchant quota state for the authenticated rate limiter. Unlike
-/// [`RateLimitState`], this is keyed on [`AuthenticatedMerchant`] alone —
-/// independent of source IP — so a merchant's quota is a property of who
-/// they are, not where they connect from.
-#[derive(Clone)]
-struct MerchantRateLimitState {
-    pool: db::Db,
-    /// Fallback quota for a merchant with no `rate_limit_per_sec` override.
-    default_rps: u32,
-    limiters: Cache<String, Arc<governor::DefaultDirectRateLimiter<StateInformationMiddleware>>>,
-}
-
-impl MerchantRateLimitState {
-    fn new(pool: db::Db, default_rps: u32, max_keys: u64, idle_ttl: Duration) -> Self {
-        let limiters = Cache::builder()
-            .max_capacity(max_keys)
-            // A time-to-live (rather than only idle eviction) bounds how long
-            // a busy merchant can keep serving a stale, cached quota after an
-            // operator changes `rate_limit_per_sec` — a merchant that never
-            // goes idle would otherwise never pick up the new value.
-            .time_to_live(idle_ttl)
-            .time_to_idle(idle_ttl)
-            .build();
-        Self {
-            pool,
-            default_rps: default_rps.max(1),
+            requests_per_sec: requests_per_sec.max(1),
             limiters,
         }
     }
@@ -135,26 +70,7 @@ impl MerchantRateLimitState {
 
 pub fn router(state: Arc<AppState>) -> axum::Router {
     let cors = build_cors(&state.config);
-    let rate_limiter_idle_ttl = Duration::from_secs(state.config.rate_limiter_idle_ttl_secs);
-    let rate_limit = RateLimitState::new(
-        state.config.rate_limit_requests_per_sec,
-        state.config.trusted_proxy_cidrs.clone(),
-        state.config.rate_limiter_max_keys,
-        rate_limiter_idle_ttl,
-    );
-    /* Built once and shared (moka `Cache` clones point at the same underlying
-    store) across both mounts of `api_v1` below. Built per-call instead, a
-    merchant could double its effective quota by splitting traffic between
-    `/payments` and `/v1/payments` — each mount would track it separately. */
-    let merchant_rate_limit = MerchantRateLimitState::new(
-        state.pool.clone(),
-        state
-            .config
-            .rate_limit_requests_per_sec
-            .saturating_mul(MERCHANT_DEFAULT_QUOTA_MULTIPLIER),
-        state.config.rate_limiter_max_keys,
-        rate_limiter_idle_ttl,
-    );
+    let rate_limit = RateLimitState::new(state.config.rate_limit_requests_per_sec);
     let request_timeout = Duration::from_secs(state.config.request_timeout_secs);
 
     axum::Router::new()
@@ -176,14 +92,13 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         exists to prevent (issue #121). Legacy responses carry `Deprecation`
         and `Link` headers pointing at their `/v1` equivalent, so a client can
         discover the move from a response it already parses. */
-        .nest("/v1", api_v1(&state, merchant_rate_limit.clone()))
-        .merge(api_v1(&state, merchant_rate_limit).layer(middleware::from_fn(mark_deprecated)))
+        .nest("/v1", api_v1(&state))
+        .merge(api_v1(&state).layer(middleware::from_fn(mark_deprecated)))
         .fallback(not_found)
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(TraceLayer::new_for_http())
-        .layer(middleware::from_fn(request_id_context))
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-        .layer(RequestBodyLimitLayer::new(state.config.max_body_bytes))
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(
             rate_limit,
             rate_limit_middleware,
@@ -193,168 +108,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             StatusCode::REQUEST_TIMEOUT,
             request_timeout,
         ))
-        /* Outer to every layer that can answer with a bare, framework-generated
-        405/413/408 (the router's own method-not-allowed fallback, the
-        `RequestBodyLimitLayer` short-circuit on a known-oversized
-        Content-Length, and the timeout above), so it sees and rewrites all of
-        them into the documented JSON envelope (issue #256). */
-        .layer(middleware::from_fn(json_error_envelope_middleware))
-        /* Outermost so it measures the complete request lifecycle — including
-        a 429 from the rate limiter or a 408 from the timeout above — and
-        records the true final status and total latency (issue: missing
-        operational metrics). */
-        .layer(middleware::from_fn_with_state(
-            state.http_metrics.clone(),
-            http_metrics_middleware,
-        ))
-        /* Baseline security headers on every response, not just the static
-        dashboard assets. Every JSON response — a payment record, a freshly
-        minted API key, a webhook URL — was previously sent with no headers
-        at all, leaving it MIME-sniffable, cacheable, and free to leak ids
-        through referrers. Applied outermost so they also cover responses the
-        inner layers generate (rate-limit 429s, timeout 408s, and the router's
-        404/405 fallbacks).
-
-        `nosniff` and `referrer-policy` override any inner value because a
-        stricter setting elsewhere is never correct (payment ids travel in
-        URLs). `cache-control` is `if_not_present` so a handler that
-        legitimately opts in to caching is not blindly clobbered, while the
-        API endpoints — which return a plaintext key once, or payment detail —
-        get `no-store` by default. Only `Strict-Transport-Security` is
-        conditional: TLS is terminated at Caddy and the app cannot assert HSTS
-        with any confidence on a testnet where that termination is absent
-        (issue: baseline security headers). The dashboard's Content-Security-Policy
-        is left untouched. */
-        .layer(SetResponseHeaderLayer::overriding(
-            header::X_CONTENT_TYPE_OPTIONS,
-            HeaderValue::from_static("nosniff"),
-        ))
-        .layer(SetResponseHeaderLayer::overriding(
-            header::REFERRER_POLICY,
-            HeaderValue::from_static("no-referrer"),
-        ))
-        .layer(SetResponseHeaderLayer::if_not_present(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("no-store"),
-        ))
-        .layer(SetResponseHeaderLayer::if_not_present(
-            header::HeaderName::from_static("strict-transport-security"),
-            hsts_value(&state.config.network),
-        ))
         .with_state(state)
-}
-
-/// The `Strict-Transport-Security` header value, or none on non-public
-/// networks. TLS is terminated by the reverse proxy in front of the app, so
-/// asserting HSTS is only meaningful where that termination is guaranteed to
-/// exist — on a `public` network deployment. On testnet (no enforced TLS) a
-/// `max-age` HSTS header would be sent to browsers over plain HTTP, where it
-/// is ignored but still misleading; returning `None` lets the caller keep the
-/// header absent entirely.
-fn hsts_value(network: &str) -> Option<HeaderValue> {
-    (network == "public")
-        .then(|| HeaderValue::from_static("max-age=63072000; includeSubDomains"))
-}
-
-/// Attaches the current request's `X-Request-Id` to a tracing span and, for
-/// error responses, embeds it in the JSON body under `request_id`. Without
-/// this, an operator correlating a dashboard error with a server log line
-/// would have to guess the id from the response headers — and the headers may
-/// not survive a proxy — while the server already generated the id.
-async fn request_id_context(req: Request, next: Next) -> Response {
-    let request_id = req
-        .headers()
-        .get(header::HeaderName::from_static("x-request-id"))
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
-        .unwrap_or_else(|| "missing".to_string());
-    let span = tracing::info_span!("http_request", request_id = %request_id);
-    let response = next.run(req).instrument(span).await;
-
-    add_request_id_to_error(response, &request_id).await
-}
-
-async fn add_request_id_to_error(response: Response, request_id: &str) -> Response {
-    if !(response.status().is_client_error() || response.status().is_server_error()) {
-        return response;
-    }
-
-    let (parts, body) = response.into_parts();
-    let is_json = parts
-        .headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("application/json"));
-    if !is_json {
-        return Response::from_parts(parts, body);
-    }
-
-    let Ok(bytes) = to_bytes(body, 1024 * 1024).await else {
-        return Response::from_parts(parts, Body::empty());
-    };
-    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return Response::from_parts(parts, Body::from(bytes));
-    };
-    if let Some(object) = value.as_object_mut() {
-        object.insert(
-            "request_id".to_string(),
-            serde_json::Value::String(request_id.to_string()),
-        );
-        if let Ok(body) = serde_json::to_vec(&value) {
-            let mut parts = parts;
-            if let Ok(content_length) = HeaderValue::from_str(&body.len().to_string()) {
-                parts.headers.insert(header::CONTENT_LENGTH, content_length);
-            }
-            return Response::from_parts(parts, Body::from(body));
-        }
-    }
-
-    Response::from_parts(parts, Body::from(bytes))
-}
-
-/// Rewrites the bare, empty-body responses axum and `tower_http` generate for
-/// `405 Method Not Allowed`, `413 Payload Too Large`, and `408 Request
-/// Timeout` into the documented `{"error": "...", "code": "..."}` envelope
-/// (issue #256). Without this, a client parsing the documented contract gets
-/// a JSON decode failure instead of an error it can act on — the dashboard's
-/// own `api()` helper illustrates the cost, falling back to `res.json().catch(()
-/// => ({}))` and reporting just the bare status.
-///
-/// Applied outer to the router, CORS, the rate limiters, `RequestBodyLimitLayer`
-/// and `TimeoutLayer`, so it sees every response those can produce. A response
-/// that already carries a JSON body (an oversized body caught by `JsonBody`'s
-/// own rejection handling, for instance — see issue #257) is left untouched
-/// rather than risk overwriting it.
-async fn json_error_envelope_middleware(req: Request, next: Next) -> axum::response::Response {
-    let mut res = next.run(req).await;
-
-    let (code, message) = match res.status() {
-        StatusCode::METHOD_NOT_ALLOWED => ("method_not_allowed", "method not allowed"),
-        StatusCode::PAYLOAD_TOO_LARGE => (
-            "payload_too_large",
-            "request body exceeds the maximum allowed size",
-        ),
-        StatusCode::REQUEST_TIMEOUT => ("request_timeout", "request timed out"),
-        _ => return res,
-    };
-
-    let already_json = res
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.starts_with("application/json"));
-    if already_json {
-        return res;
-    }
-
-    *res.body_mut() = axum::body::Body::from(json!({ "error": message, "code": code }).to_string());
-    let headers = res.headers_mut();
-    headers.remove(header::CONTENT_LENGTH);
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    res
 }
 
 /// The versioned API surface: everything that forms the public contract.
@@ -363,10 +117,7 @@ async fn json_error_envelope_middleware(req: Request, next: Next) -> axum::respo
 /// are deliberately excluded. They are infrastructure rather than contract —
 /// a probe URL that moved with every API revision would break liveness checks
 /// and scrape configs for no benefit.
-fn api_v1(
-    state: &Arc<AppState>,
-    merchant_rate_limit: MerchantRateLimitState,
-) -> axum::Router<Arc<AppState>> {
+fn api_v1(state: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
     /* Merchant provisioning and API key lifecycle. All admin-gated behind
     ADMIN_PROVISIONING_SECRET: this service has no self-service signup, and
     minting or revoking a credential is an operator action. */
@@ -374,10 +125,6 @@ fn api_v1(
         .route("/", post(provision_merchant))
         .route("/:id/keys", post(issue_api_key).get(list_api_keys))
         .route("/:id/keys/:key_id", axum::routing::delete(revoke_api_key))
-        .route(
-            "/:id/rate-limit",
-            axum::routing::put(set_merchant_rate_limit),
-        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_admin_secret,
@@ -389,30 +136,11 @@ fn api_v1(
     both authenticated and anonymous callers — see `payments::get_by_id`. */
     let payments_authed = axum::Router::new()
         .route("/", post(payments::create).get(payments::list))
-        /* The dead-letter view: a merchant's deliveries across *all* their
-        payments (issue #319). Declared before `/:id` and matched ahead of it —
-        `webhooks` is a static segment, and matchit gives static segments
-        priority over parameters, so this can never be shadowed by a payment
-        whose id happens to be the literal string "webhooks". */
-        .route("/webhooks", get(payments::list_merchant_webhooks))
-        .route(
-            "/webhooks/redeliver",
-            post(payments::redeliver_webhooks_bulk),
-        )
         .route("/:id/webhooks", get(payments::list_webhooks))
         .route(
             "/:id/webhooks/:delivery_id/redeliver",
             post(payments::redeliver_webhook),
         )
-        /* Per-merchant quota, added as a `route_layer` *inside* `auth_middleware`
-        (see ordering note there) so it keys on `AuthenticatedMerchant` rather
-        than source IP: a merchant's capacity is theirs regardless of where
-        they connect from, and cannot be multiplied by spreading requests
-        across addresses. */
-        .route_layer(middleware::from_fn_with_state(
-            merchant_rate_limit,
-            merchant_rate_limit_middleware,
-        ))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -463,7 +191,7 @@ async fn auth_middleware(
     mut req: Request,
     next: Next,
 ) -> axum::response::Response {
-    let source_ip = client_ip_key(&req, &state.config.trusted_proxy_cidrs);
+    let source_ip = client_ip_key(&req);
 
     let raw_key = req
         .headers()
@@ -530,12 +258,43 @@ async fn require_admin_secret(
     next: Next,
 ) -> axum::response::Response {
     let configured = &state.config.admin_provisioning_secret;
-    let provided = req
+
+    // An empty configured secret means provisioning is disabled — reject
+    // immediately without touching any caller-supplied value (issue #244).
+    if configured.is_empty() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "missing or invalid admin secret", "code": "unauthorized" })),
+        )
+            .into_response();
+    }
+
+    // Reject a missing or non-UTF-8 header before any comparison.
+    let Some(provided) = req
         .headers()
         .get("x-admin-secret")
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| v.to_str().ok())
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "missing or invalid admin secret", "code": "unauthorized" })),
+        )
+            .into_response();
+    };
 
-    if configured.is_empty() || provided != Some(configured.as_str()) {
+    // Compare SHA-256 digests in constant time (issue #244).
+    //
+    // `str` equality short-circuits on the first differing byte, leaking a
+    // prefix-match oracle. Hashing both sides with SHA-256 normalises them to
+    // fixed-length byte arrays; `==` on `[u8; 32]` uses a fixed-time
+    // comparison in the standard library, removing the oracle. Salting is
+    // unnecessary here — we are comparing a caller-supplied value against a
+    // configured secret, not storing a password.
+    use sha2::{Digest, Sha256};
+    let provided_digest = Sha256::digest(provided.as_bytes());
+    let configured_digest = Sha256::digest(configured.as_bytes());
+
+    if provided_digest != configured_digest {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "missing or invalid admin secret", "code": "unauthorized" })),
@@ -548,70 +307,23 @@ async fn require_admin_secret(
 
 /// `POST /merchants` — provision a new merchant and return its API key once.
 /// Requires the `X-Admin-Secret` header (see `require_admin_secret`).
-///
-/// Accepts an optional `{ "rate_limit_per_sec": <n> }` body to give this
-/// merchant a per-merchant quota override from the start; omitted or `null`
-/// leaves it on the configured default (issue: rate limiter keyed on IP, not
-/// identity).
 async fn provision_merchant(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    OptionalJsonBody(body): OptionalJsonBody<ProvisionMerchantRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let source_ip =
-        client_ip_key_from_parts(Some(peer), &headers, &state.config.trusted_proxy_cidrs);
-    let req_id = request_id(&headers);
-
-    let rate_limit_per_sec = body.and_then(|b| b.rate_limit_per_sec);
-    if let Some(n) = rate_limit_per_sec {
-        if n <= 0 {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(
-                    json!({ "error": "rate_limit_per_sec must be positive", "code": "invalid_rate_limit" }),
-                ),
-            ));
-        }
-    }
-
     let merchant_id = uuid::Uuid::new_v4().to_string();
     let (raw_key, prefix) = db::generate_api_key();
 
-    let key_id = db::create_merchant(
-        &state.pool,
-        &merchant_id,
-        &raw_key,
-        &prefix,
-        rate_limit_per_sec,
-    )
-    .await
-    .map_err(|e| {
-        // Issue #125: swallowing this left an operator with a 500 and no
-        // way to tell a disk error from a UNIQUE collision.
-        tracing::error!(error = %e, "failed to provision merchant");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "internal server error", "code": "internal_error" })),
-        )
-    })?;
-
-    /* Successful provisioning is the single most privileged operation in the
-    system — it mints a credential — and previously left no trace at all
-    while a *failed* one did (issue #305). `audit = true` lets this be routed
-    to a separate sink from ordinary operational logs; see the "Audit events"
-    section of the README for the full field schema. */
-    tracing::info!(
-        audit = true,
-        action = "merchant.provision",
-        actor = "admin",
-        outcome = "created",
-        %merchant_id,
-        %key_id,
-        source_ip = %source_ip,
-        request_id = %req_id,
-        "merchant provisioned"
-    );
+    let key_id = db::create_merchant(&state.pool, &merchant_id, &raw_key, &prefix)
+        .await
+        .map_err(|e| {
+            // Issue #125: swallowing this left an operator with a 500 and no
+            // way to tell a disk error from a UNIQUE collision.
+            tracing::error!(error = %e, "failed to provision merchant");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal server error", "code": "internal_error" })),
+            )
+        })?;
 
     Ok((
         StatusCode::CREATED,
@@ -619,108 +331,8 @@ async fn provision_merchant(
             "merchant_id": merchant_id,
             "api_key": raw_key,
             "key_id": key_id,
-            "rate_limit_per_sec": rate_limit_per_sec,
         })),
     ))
-}
-
-/// The optional `POST /merchants` body.
-///
-/// `deny_unknown_fields` for the same reason as `IssueKeyRequest` — a typo in
-/// the field name should surface as a `400`, not silently fall back to the
-/// default quota.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProvisionMerchantRequest {
-    rate_limit_per_sec: Option<i64>,
-}
-
-/// `PUT /merchants/:id/rate-limit` — set or clear a merchant's per-second
-/// quota override for the authenticated rate limiter. `null` (or an absent
-/// field) clears the override and returns the merchant to the configured
-/// default. Admin-gated, like the rest of `/merchants`.
-async fn set_merchant_rate_limit(
-    State(state): State<Arc<AppState>>,
-    Path(merchant_id): Path<String>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    JsonBody(body): JsonBody<SetRateLimitRequest>,
-) -> Result<impl IntoResponse, AppError> {
-    if let Some(n) = body.rate_limit_per_sec {
-        if n <= 0 {
-            return Err(AppError::bad_request(
-                "invalid_rate_limit",
-                "rate_limit_per_sec must be positive",
-            ));
-        }
-    }
-
-    if !db::set_merchant_rate_limit(&state.pool, &merchant_id, body.rate_limit_per_sec).await? {
-        return Err(AppError::not_found(
-            "merchant_not_found",
-            "merchant not found",
-        ));
-    }
-
-    let source_ip =
-        client_ip_key_from_parts(Some(peer), &headers, &state.config.trusted_proxy_cidrs);
-    tracing::info!(
-        audit = true,
-        action = "merchant.rate_limit.set",
-        actor = "admin",
-        outcome = "updated",
-        %merchant_id,
-        rate_limit_per_sec = ?body.rate_limit_per_sec,
-        source_ip = %source_ip,
-        request_id = %request_id(&headers),
-        "merchant rate limit updated"
-    );
-
-    Ok((
-        StatusCode::OK,
-        Json(json!({
-            "merchant_id": merchant_id,
-            "rate_limit_per_sec": body.rate_limit_per_sec,
-        })),
-    ))
-}
-
-/// The `PUT /merchants/:id/rate-limit` body. `deny_unknown_fields` so a typo
-/// surfaces as a `400` rather than silently doing nothing.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SetRateLimitRequest {
-    rate_limit_per_sec: Option<i64>,
-}
-
-/// A label is human text (rendered as-is in the dashboard), so its limit is
-/// counted in characters, not bytes — `str::len` is a byte count, and bounding
-/// it there means the effective limit depends on the alphabet: 100 ASCII
-/// characters, but only ~33 CJK characters or ~25 emoji (issue: API key label
-/// length-checked in bytes rather than characters). `MAX_LABEL_BYTES` is a
-/// separate, generous byte ceiling so a pathological input (e.g. combining
-/// characters) still can't bloat the stored row despite passing the character
-/// count.
-const MAX_LABEL_CHARS: usize = 100;
-const MAX_LABEL_BYTES: usize = 400;
-
-/// Validate a caller-supplied API key label: bounded in both characters and
-/// bytes, and free of control characters (it is rendered verbatim in the
-/// dashboard).
-fn validate_label(label: &str) -> Result<(), AppError> {
-    if label.chars().any(|c| c.is_control()) {
-        return Err(AppError::bad_request(
-            "invalid_label",
-            "label must not contain control characters",
-        ));
-    }
-    if label.chars().count() > MAX_LABEL_CHARS || label.len() > MAX_LABEL_BYTES {
-        return Err(AppError::bad_request(
-            "invalid_label",
-            format!("label must be at most {MAX_LABEL_CHARS} characters"),
-        ));
-    }
-    Ok(())
 }
 
 /// `POST /merchants/:id/keys` — issue an additional API key.
@@ -732,9 +344,7 @@ fn validate_label(label: &str) -> Result<(), AppError> {
 async fn issue_api_key(
     State(state): State<Arc<AppState>>,
     Path(merchant_id): Path<String>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    OptionalJsonBody(body): OptionalJsonBody<IssueKeyRequest>,
+    body: Option<JsonBody<IssueKeyRequest>>,
 ) -> Result<impl IntoResponse, AppError> {
     if !db::merchant_exists(&state.pool, &merchant_id).await? {
         return Err(AppError::not_found(
@@ -743,9 +353,14 @@ async fn issue_api_key(
         ));
     }
 
-    let label = body.and_then(|b| b.label);
+    let label = body.and_then(|JsonBody(b)| b.label);
     if let Some(l) = &label {
-        validate_label(l)?;
+        if l.len() > 100 {
+            return Err(AppError::bad_request(
+                "invalid_label",
+                "label exceeds max length of 100 characters",
+            ));
+        }
     }
 
     let (raw_key, prefix) = db::generate_api_key();
@@ -758,19 +373,7 @@ async fn issue_api_key(
     )
     .await?;
 
-    let source_ip =
-        client_ip_key_from_parts(Some(peer), &headers, &state.config.trusted_proxy_cidrs);
-    tracing::info!(
-        audit = true,
-        action = "api_key.issue",
-        actor = "admin",
-        outcome = "issued",
-        %merchant_id,
-        %key_id,
-        source_ip = %source_ip,
-        request_id = %request_id(&headers),
-        "api key issued"
-    );
+    tracing::info!(%merchant_id, %key_id, "api key issued");
 
     Ok((
         StatusCode::CREATED,
@@ -783,35 +386,14 @@ async fn issue_api_key(
     ))
 }
 
-/// Query parameters for the key listing. Matches the payments/webhook-delivery
-/// listing conventions: a `limit` (default 20, max 100) and an opaque keyset
-/// `cursor` whose value comes from a previous response's `next_cursor`
-/// (issue #262).
-#[derive(serde::Deserialize)]
-struct ListKeysQuery {
-    /// `true` to see only usable keys, `false` for only revoked ones. Omitted
-    /// (the default) returns both, including the revoked audit trail.
-    active: Option<bool>,
-    limit: Option<i64>,
-    cursor: Option<String>,
-}
-
 /// `GET /merchants/:id/keys` — list a merchant's keys.
 ///
 /// Returns metadata only. The secret is unrecoverable by design, so this can
 /// never leak a usable credential; `prefix` exists so an operator can identify
 /// which key to revoke.
-///
-/// Keyset-paginated like `GET /payments`: revoked keys are kept forever as an
-/// audit trail, so a merchant that rotates regularly accumulates rows without
-/// bound, and this endpoint sat in the admin × 5 rate-limit bucket with no
-/// `LIMIT` at all — an authenticated admin script in a loop could stall the
-/// single-writer database (issue #262). `active=true` skips straight past the
-/// history for the common case of "which keys can I use right now".
 async fn list_api_keys(
     State(state): State<Arc<AppState>>,
     Path(merchant_id): Path<String>,
-    Query(q): Query<ListKeysQuery>,
 ) -> Result<Json<Value>, AppError> {
     if !db::merchant_exists(&state.pool, &merchant_id).await? {
         return Err(AppError::not_found(
@@ -820,35 +402,7 @@ async fn list_api_keys(
         ));
     }
 
-    let limit = validate_limit(
-        q.limit,
-        state.config.pagination_default_limit,
-        state.config.pagination_max_limit,
-    )?;
-
-    let cursor = match q.cursor.as_deref() {
-        Some(raw) => Some(
-            decode_cursor(raw)
-                .ok_or_else(|| AppError::bad_request("invalid_cursor", "invalid cursor"))?,
-        ),
-        None => None,
-    };
-
-    let keys = db::list_api_keys_keyset(
-        &state.pool,
-        &merchant_id,
-        q.active,
-        limit,
-        cursor.as_ref().map(|(ts, id)| (ts.as_str(), id.as_str())),
-    )
-    .await?;
-
-    let next_cursor = if keys.len() == limit as usize {
-        keys.last().map(|k| encode_cursor(&k.created_at, &k.id))
-    } else {
-        None
-    };
-
+    let keys = db::list_api_keys(&state.pool, &merchant_id).await?;
     Ok(Json(json!({
         "merchant_id": merchant_id,
         "keys": keys.iter().map(|k| json!({
@@ -860,8 +414,6 @@ async fn list_api_keys(
             "revoked_at": k.revoked_at,
             "active": k.revoked_at.is_none(),
         })).collect::<Vec<_>>(),
-        "limit": limit,
-        "next_cursor": next_cursor,
     })))
 }
 
@@ -873,8 +425,6 @@ async fn list_api_keys(
 async fn revoke_api_key(
     State(state): State<Arc<AppState>>,
     Path((merchant_id, key_id)): Path<(String, String)>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     if !db::merchant_exists(&state.pool, &merchant_id).await? {
         return Err(AppError::not_found(
@@ -883,265 +433,89 @@ async fn revoke_api_key(
         ));
     }
 
-    if db::count_active_api_keys(&state.pool, &merchant_id).await? <= 1 {
-        return Err(AppError::bad_request(
+    // The guard against revoking the last active key is now enforced atomically
+    // inside the UPDATE via a subquery (issue #247). The previous
+    // check-then-act split (count_active_api_keys → revoke_api_key) could be
+    // bypassed by two concurrent revocations of a merchant's two remaining
+    // keys: both would read a count of 2, both pass the guard, and both
+    // succeed, locking the merchant out. RevokeKeyOutcome::LastActiveKey is
+    // returned when the atomic guard fires.
+    match db::revoke_api_key(&state.pool, &merchant_id, &key_id).await? {
+        db::RevokeKeyOutcome::Revoked => {
+            let source_ip = client_ip_key_from_parts(
+                Some(peer),
+                &headers,
+                &state.config.trusted_proxy_cidrs,
+            );
+            tracing::warn!(
+                audit = true,
+                action = "api_key.revoke",
+                actor = "admin",
+                outcome = "revoked",
+                %merchant_id,
+                %key_id,
+                source_ip = %source_ip,
+                request_id = %request_id(&headers),
+                "api key revoked"
+            );
+            Ok((
+                StatusCode::OK,
+                Json(json!({ "key_id": key_id, "revoked": true })),
+            ))
+        }
+        db::RevokeKeyOutcome::LastActiveKey => Err(AppError::bad_request(
             "last_active_key",
             "cannot revoke a merchant's only active key — issue a replacement first",
-        ));
-    }
-
-    if !db::revoke_api_key(&state.pool, &merchant_id, &key_id).await? {
-        return Err(AppError::not_found(
+        )),
+        db::RevokeKeyOutcome::NotFound => Err(AppError::not_found(
             "key_not_found",
             "no active key with that id for this merchant",
-        ));
+        )),
     }
-
-    let source_ip =
-        client_ip_key_from_parts(Some(peer), &headers, &state.config.trusted_proxy_cidrs);
-    tracing::warn!(
-        audit = true,
-        action = "api_key.revoke",
-        actor = "admin",
-        outcome = "revoked",
-        %merchant_id,
-        %key_id,
-        source_ip = %source_ip,
-        request_id = %request_id(&headers),
-        "api key revoked"
-    );
-    Ok((
-        StatusCode::OK,
-        Json(json!({ "key_id": key_id, "revoked": true })),
-    ))
 }
 
-/// The optional `POST /merchants/:id/keys` body.
-///
-/// `deny_unknown_fields` for the same reason as `CreatePaymentRequest`
-/// (issue #329): a mistyped `lable` should say so rather than quietly issuing
-/// an unlabelled key.
 #[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 struct IssueKeyRequest {
     label: Option<String>,
 }
 
-/// Enforce the per-(bucket, client) quota and describe it to the caller.
-///
-/// Every response — throttled or not — carries `X-RateLimit-Limit`,
-/// `X-RateLimit-Remaining` and `X-RateLimit-Reset`, so a client can pace itself
-/// *before* being throttled rather than discovering the limit by hitting it
-/// (issue #327).
-///
-/// On a rejection, `Retry-After` is derived from the limiter's own state.
-/// `governor` computes exactly this value — `check()` returns
-/// `Err(NotUntil<_>)`, whose `wait_time_from` is the duration until the request
-/// would be permitted — and the previous code discarded it in favour of a
-/// hard-coded `1`. That constant was wrong in both directions: too short and a
-/// well-behaved client that honours it retries straight into another `429`,
-/// generating exactly the load the limiter is shedding; too long and throughput
-/// is left on the table. It only looked right because the default quota is
-/// per-second, and grew steadily more wrong as `RATE_LIMIT_REQUESTS_PER_SEC`
-/// was tuned.
 async fn rate_limit_middleware(
     State(rate_limit): State<RateLimitState>,
     req: Request,
     next: Next,
 ) -> axum::response::Response {
-    let Some(bucket) = rate_limited_bucket(&req) else {
-        return next.run(req).await;
-    };
-
-    let key = rate_limit_key(bucket, &req, &rate_limit.trusted_proxies);
-    let base_rps = rate_limit.requests_per_sec;
-    let effective_rps = base_rps
-        .saturating_mul(bucket_rate_multiplier(bucket))
-        .max(1);
-    /* `get_with` clones the `Arc` out of the cache rather than handing back a
-    guard, so nothing borrowed from the cache is held across the `.await`
-    below. */
-    let limiter = rate_limit.limiters.get_with(key, || {
-        Arc::new(
-            governor::RateLimiter::direct(governor::Quota::per_second(
-                // SAFETY: `.max(1)` above ensures effective_rps >= 1, so
-                // NonZeroU32::new can never return None here.
+    if let Some(bucket) = rate_limited_bucket(&req) {
+        let key = rate_limit_key(bucket, &req);
+        let base_rps = rate_limit.requests_per_sec;
+        let effective_rps = base_rps
+            .saturating_mul(bucket_rate_multiplier(bucket))
+            .max(1);
+        /* `get_with` clones the `Arc` out of the cache rather than handing back a
+        guard, so nothing borrowed from the cache is held across the `.await`
+        below. */
+        let limiter = rate_limit.limiters.get_with(key, || {
+            Arc::new(governor::RateLimiter::direct(governor::Quota::per_second(
                 NonZeroU32::new(effective_rps).unwrap(),
-            ))
-            .with_middleware::<StateInformationMiddleware>(),
-        )
-    });
+            )))
+        });
 
-    match limiter.check() {
-        Ok(snapshot) => {
-            let remaining = snapshot.remaining_burst_capacity();
-            let reset = reset_secs(snapshot.quota(), remaining, Duration::ZERO);
-            let mut res = next.run(req).await;
-            set_rate_limit_headers(res.headers_mut(), effective_rps, remaining, reset);
-            res
-        }
-        Err(not_until) => {
-            let wait = not_until.wait_time_from(DefaultClock::default().now());
-            let retry_after = retry_after_secs(wait);
-            let reset = reset_secs(not_until.quota(), 0, wait);
-
-            let mut res = (
+        if limiter.check().is_err() {
+            return (
                 StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, HeaderValue::from_static("1"))],
                 Json(json!({
                     "error": "rate limit exceeded",
                     "code": "rate_limit_exceeded"
                 })),
             )
                 .into_response();
-
-            let headers = res.headers_mut();
-            if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
-                headers.insert(header::RETRY_AFTER, value);
-            }
-            set_rate_limit_headers(headers, effective_rps, 0, reset);
-            res
         }
     }
+
+    next.run(req).await
 }
 
-/// Enforces a per-merchant quota, independent of client IP, so one merchant
-/// can never exhaust another's capacity and a merchant cannot multiply its
-/// own quota by spreading requests across source addresses.
-///
-/// A `route_layer` mounted *inside* `auth_middleware` (see `api_v1`), so it
-/// runs only once a request is attributed to an [`AuthenticatedMerchant`] and
-/// keys purely on that identity. The coarse IP limiter above it still runs
-/// first and is left untouched — cheap flood rejection before touching the
-/// database is the right instinct, this just adds the identity-aware layer
-/// the issue calls for on top of it.
-///
-/// Requests that clear the quota pass through unmodified; the success-path
-/// `X-RateLimit-*` headers stay owned by the outer IP limiter, which already
-/// sets them on every response. On a rejection, this builds its own `429`
-/// carrying the merchant-scoped `Retry-After` and `X-RateLimit-*` values —
-/// `set_rate_limit_headers` only fills headers that aren't already present,
-/// so the outer layer cannot overwrite them on the way back out.
-async fn merchant_rate_limit_middleware(
-    State(rate_limit): State<MerchantRateLimitState>,
-    req: Request,
-    next: Next,
-) -> axum::response::Response {
-    let Some(AuthenticatedMerchant(merchant_id)) =
-        req.extensions().get::<AuthenticatedMerchant>().cloned()
-    else {
-        // No authenticated merchant in scope for this route — nothing to key
-        // on, so defer entirely to the outer IP limiter.
-        return next.run(req).await;
-    };
-
-    let limiter = match rate_limit.limiters.get(&merchant_id) {
-        Some(limiter) => limiter,
-        None => {
-            let rps = merchant_quota_rps(&rate_limit, &merchant_id).await;
-            let fresh = Arc::new(
-                governor::RateLimiter::direct(governor::Quota::per_second(
-                    // SAFETY: `merchant_quota_rps` always returns a value >= 1:
-                    // `default_rps` is guarded by `.max(1)` in
-                    // `MerchantRateLimitState::new`, and the custom override path
-                    // only accepts `custom > 0`.
-                    NonZeroU32::new(rps).unwrap(),
-                ))
-                .with_middleware::<StateInformationMiddleware>(),
-            );
-            rate_limit
-                .limiters
-                .insert(merchant_id.clone(), fresh.clone());
-            fresh
-        }
-    };
-
-    match limiter.check() {
-        Ok(_) => next.run(req).await,
-        Err(not_until) => {
-            let wait = not_until.wait_time_from(DefaultClock::default().now());
-            let retry_after = retry_after_secs(wait);
-            let reset = reset_secs(not_until.quota(), 0, wait);
-            let limit = not_until.quota().burst_size().get();
-
-            let mut res = (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({
-                    "error": "merchant rate limit exceeded",
-                    "code": "merchant_rate_limit_exceeded"
-                })),
-            )
-                .into_response();
-
-            let headers = res.headers_mut();
-            if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
-                headers.insert(header::RETRY_AFTER, value);
-            }
-            set_rate_limit_headers(headers, limit, 0, reset);
-            res
-        }
-    }
-}
-
-/// Resolve the quota a merchant's limiter should be built with: its own
-/// `rate_limit_per_sec` override if an operator has set one, otherwise the
-/// configured default. A lookup failure falls back to the default rather than
-/// failing the request — an operator-set override is an optimization, not a
-/// safety property this path needs to be strict about.
-async fn merchant_quota_rps(rate_limit: &MerchantRateLimitState, merchant_id: &str) -> u32 {
-    match db::get_merchant_rate_limit(&rate_limit.pool, merchant_id).await {
-        Ok(Some(custom)) if custom > 0 => custom.min(u32::MAX as i64) as u32,
-        Ok(_) => rate_limit.default_rps,
-        Err(e) => {
-            tracing::error!(%merchant_id, error = %e, "merchant rate limit lookup failed; using default quota");
-            rate_limit.default_rps
-        }
-    }
-}
-
-/// `Retry-After`, in delta-seconds per RFC 9110.
-///
-/// Rounded *up*, with a floor of 1. Truncating would hand back a value the
-/// limiter has not actually reached — a 1.4s wait reported as `1` is a
-/// guaranteed second rejection — and `0` would tell a client honouring the
-/// header to retry immediately, i.e. to hot-loop.
-fn retry_after_secs(wait: Duration) -> u64 {
-    wait.as_secs_f64().ceil().max(1.0) as u64
-}
-
-/// Seconds until the bucket is back to full capacity.
-///
-/// `wait_for_next` is the delay before the *first* cell becomes available (zero
-/// when the request was allowed); the remaining cells refill one per
-/// `replenish_interval` after that. Reported as a delta rather than an epoch
-/// timestamp so a client with a skewed clock still gets a usable answer.
-fn reset_secs(quota: governor::Quota, remaining: u32, wait_for_next: Duration) -> u64 {
-    let missing = quota.burst_size().get().saturating_sub(remaining);
-    let refill = quota.replenish_interval().saturating_mul(missing);
-    // `wait_for_next` already covers the first missing cell on the throttled
-    // path, so it replaces one interval rather than adding to the total.
-    let total = refill.max(wait_for_next);
-    total.as_secs_f64().ceil() as u64
-}
-
-/// Sets a header only if it isn't already present. The per-merchant limiter
-/// (issue: rate limiter keyed on IP, not identity) runs *inside* this one and
-/// sets these same header names on its own rejections first; using `entry`
-/// here means the outer IP-bucket layer never clobbers the more specific,
-/// identity-bound values with its own.
-fn set_rate_limit_headers(headers: &mut HeaderMap, limit: u32, remaining: u32, reset: u64) {
-    for (name, value) in [
-        (X_RATELIMIT_LIMIT, limit as u64),
-        (X_RATELIMIT_REMAINING, remaining as u64),
-        (X_RATELIMIT_RESET, reset),
-    ] {
-        if let Ok(value) = HeaderValue::from_str(&value.to_string()) {
-            headers.entry(name).or_insert(value);
-        }
-    }
-}
-
-/// Identifies which rate-limit bucket a request falls into, or `None` to
-/// exempt it from the limiter entirely.
+/// Identifies which rate-limit bucket a request falls into.
 ///
 /// Every request is assigned a bucket so all routes are protected by default.
 /// Write and sensitive routes use named buckets that receive the base quota
@@ -1149,30 +523,11 @@ fn set_rate_limit_headers(headers: &mut HeaderMap, limit: u32, remaining: u32, r
 /// which receives a more generous quota (`requests_per_sec × 5`) to avoid
 /// throttling normal polling.
 ///
-/// `/health`, `/ready` and `/metrics` are exempt rather than sharing the
-/// `"default"` bucket with merchant API traffic. They used to share it, which
-/// created a feedback loop under load: a traffic spike exhausts the per-IP
-/// quota, the orchestrator's liveness probe — same source IP, same bucket —
-/// gets a `429`, `curl -f` treats that as a failed check, and the instance is
-/// restarted or pulled from rotation right when it's under the most load.
-/// Restarting this service is not free (the poller re-baselines and the
-/// redrive worker runs a full pass on start), so that restart concentrates
-/// load on the remaining instances instead of relieving it. Probes are also
-/// the wrong thing to protect: they're cheap, they come from a trusted
-/// orchestrator rather than the public internet, and their entire purpose is
-/// to stay answerable when the system is stressed. If unauthenticated abuse
-/// of these paths ever becomes a real concern, give them their own generous
-/// bucket rather than folding them back into `"default"`.
-///
 /// Redelivery is bucketed by shape rather than by path: the URL carries a
 /// payment and delivery id, and keying on those would let every id mint its
 /// own limiter entry — both an unbounded map and a trivially bypassed limit.
-pub fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
-    let raw_path = req.uri().path();
-    let path = raw_path.strip_prefix("/v1").unwrap_or(raw_path);
-    if path == "/health" || path == "/ready" || path == "/metrics" {
-        return None;
-    }
+fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
+    let path = req.uri().path();
     if req.method() == axum::http::Method::POST {
         return match path {
             "/payments" => Some("payments"),
@@ -1180,8 +535,21 @@ pub fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
             _ if path.starts_with("/payments/") && path.ends_with("/redeliver") => {
                 Some("redeliver")
             }
+            // Key issuance: POST /merchants/:id/keys — credential lifecycle
+            // belongs in the "merchants" write bucket, not the default read
+            // bucket that gives it 5× the quota (issue #243).
+            _ if path.starts_with("/merchants/") => Some("merchants"),
             _ => Some("default"),
         };
+    }
+    // DELETE is a write/destructive operation. Key revocation
+    // (DELETE /merchants/:id/keys/:key_id) must be treated as a write like
+    // POST /merchants, not as cheap read-only traffic (issue #243).
+    if req.method() == axum::http::Method::DELETE
+        && path.starts_with("/merchants/")
+        && path.contains("/keys/")
+    {
+        return Some("merchants");
     }
     // All other non-POST requests (GET, etc.) fall into the default bucket so
     // that payment enumeration and webhook listing are covered by a baseline
@@ -1193,7 +561,7 @@ pub fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
 ///
 /// Write/sensitive buckets get the base rate (× 1). Read-only traffic gets a
 /// higher allowance (× 5) so normal API consumers aren't throttled by polling.
-pub fn bucket_rate_multiplier(bucket: &str) -> u32 {
+fn bucket_rate_multiplier(bucket: &str) -> u32 {
     match bucket {
         "payments" | "merchants" | "redeliver" => 1,
         _ => 5,
@@ -1203,155 +571,25 @@ pub fn bucket_rate_multiplier(bucket: &str) -> u32 {
 /// Keyed by bucket + client so each bucket is rate-limited independently —
 /// provisioning a merchant should never eat into a client's payment quota (or
 /// vice versa).
-fn rate_limit_key(bucket: &str, req: &Request, trusted_proxies: &[IpNet]) -> String {
-    format!("{bucket}:{}", client_ip_key(req, trusted_proxies))
+fn rate_limit_key(bucket: &str, req: &Request) -> String {
+    format!("{bucket}:{}", client_ip_key(req))
 }
 
-/// Client key used when a request carries no peer address at all (the router
-/// is served without `into_make_service_with_connect_info`). Fail-closed:
-/// every such request shares this one key rather than trusting client-supplied
-/// forwarding headers (issue #330).
-const CLIENT_IP_UNKNOWN: &str = "unknown";
-
-/// Resolve the client IP used for rate-limit bucketing and auth-log source
-/// attribution.
-///
-/// `X-Forwarded-For` and `X-Real-IP` are client-supplied, so they are honoured
-/// ONLY when the socket peer is a configured trusted proxy
-/// (`TRUSTED_PROXY_CIDRS`). In every other case the peer's own address is used
-/// and the headers are ignored entirely:
-///
-/// - Untrusted peer (or no trusted proxies configured): the peer address wins,
-///   so a caller cannot rotate a header per request to evade rate limiting or
-///   poison the auth logs.
-/// - Trusted peer: the rightmost `X-Forwarded-For` hop that is not itself a
-///   trusted proxy is taken as the client, falling back to `X-Real-IP` and
-///   then the peer address. This preserves per-client attribution behind a
-///   reverse proxy without letting the proxy chain be forged.
-/// - No peer address available: fail closed to a single shared key
-///   ([`CLIENT_IP_UNKNOWN`]) with a one-time warning, regardless of headers.
-fn client_ip_key(req: &Request, trusted_proxies: &[IpNet]) -> String {
-    let peer = req
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(addr)| *addr);
-    client_ip_key_from_parts(peer, req.headers(), trusted_proxies)
-}
-
-/// The part of [`client_ip_key`] that doesn't need a whole [`Request`] —
-/// split out so handlers that only have a [`ConnectInfo`] extractor and a
-/// [`HeaderMap`] (rather than the raw request) can compute the same
-/// attributed source IP for audit logging (issue #305).
-pub(crate) fn client_ip_key_from_parts(
-    peer: Option<SocketAddr>,
-    headers: &HeaderMap,
-    trusted_proxies: &[IpNet],
-) -> String {
-    let Some(addr) = peer else {
-        warn_missing_connect_info_once();
-        return CLIENT_IP_UNKNOWN.to_string();
-    };
-
-    let peer_ip = addr.ip();
-
-    // Untrusted peer: the forwarding headers are ignored entirely.
-    if !trusted_proxies.iter().any(|net| net.contains(&peer_ip)) {
-        return peer_ip.to_string();
+fn client_ip_key(req: &Request) -> String {
+    if let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
+        return addr.ip().to_string();
     }
 
-    // Trusted peer: walk X-Forwarded-For from the rightmost hop, skipping hops
-    // that are themselves trusted proxies, and take the first remaining value.
-    if let Some(value) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        for hop in value.split(',').map(str::trim).rev() {
-            if hop.is_empty() {
-                continue;
-            }
-            match hop.parse::<IpAddr>() {
-                // A hop that is itself a trusted proxy was added by a proxy we
-                // trust — keep walking left toward the real client.
-                Ok(ip) if trusted_proxies.iter().any(|net| net.contains(&ip)) => continue,
-                // First hop that is not a trusted proxy: this is the client.
-                Ok(ip) => return ip.to_string(),
-                // Unparseable value: cannot be a trusted proxy, so treat it as
-                // the client rather than guessing.
-                Err(_) => return hop.to_string(),
+    for name in ["x-forwarded-for", "x-real-ip"] {
+        if let Some(value) = req.headers().get(name).and_then(|v| v.to_str().ok()) {
+            if let Some(first) = value.split(',').map(str::trim).find(|s| !s.is_empty()) {
+                return first.to_string();
             }
         }
     }
 
-    // No X-Forwarded-For, or every hop was a trusted proxy: fall back to the
-    // single-value X-Real-IP header, also gated on the trusted peer.
-    if let Some(value) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        if let Ok(ip) = value.trim().parse::<IpAddr>() {
-            if !trusted_proxies.iter().any(|net| net.contains(&ip)) {
-                return ip.to_string();
-            }
-        }
-    }
-
-    peer_ip.to_string()
+    "local".to_string()
 }
-
-/// Extracts `X-Request-Id`, set on every request by `SetRequestIdLayer`
-/// before it reaches a handler. Falls back to `"-"` for the (untestable in
-/// production, but real in unit tests that call a handler directly) case
-/// where the layer didn't run.
-pub(crate) fn request_id(headers: &HeaderMap) -> String {
-    headers
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-")
-        .to_string()
-}
-
-/// Warn once (per process) when a request has no peer address, i.e. the router
-/// is being served without `into_make_service_with_connect_info`. From then on
-/// every such request shares a single fail-closed client key, so an operator
-/// embedding the router sees exactly one warning instead of one per request.
-fn warn_missing_connect_info_once() {
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| {
-        tracing::warn!(
-            "no ConnectInfo peer address on request: forwarding headers are ignored and all \
-             such requests share one client key. Serve the router with \
-             into_make_service_with_connect_info to restore per-client attribution."
-        );
-    });
-}
-
-/// The HTTP methods the strict CORS layer permits from a browser.
-///
-/// This is the complete set any mounted route responds to — `GET`, `POST`, and
-/// `DELETE` (`DELETE /merchants/:id/keys/:key_id`, key revocation) — plus
-/// `OPTIONS` for the preflight itself. `DELETE` was previously absent, so key
-/// revocation failed preflight in every browser on a strict deployment (#281).
-///
-/// `tests/cors_tests.rs` checks this against the live router: the methods the
-/// router's routes use must be exactly the non-`OPTIONS` methods here, so
-/// dropping one — or adding a route whose method is missing here — fails CI.
-const CORS_ALLOWED_METHODS: [Method; 4] =
-    [Method::GET, Method::POST, Method::DELETE, Method::OPTIONS];
-
-/// Request headers a browser may send. `content-type`/`authorization` cover a
-/// JSON body and bearer auth; `idempotency-key` (safe retry of `POST /payments`)
-/// and `x-admin-secret` (admin routes) are read by specific handlers and must
-/// clear preflight too — without them, idempotent creation and all merchant/key
-/// provisioning were unreachable from a browser on a strict deployment (#281).
-///
-/// Header names must be lowercase: `HeaderName::from_static` panics otherwise.
-const CORS_ALLOWED_REQUEST_HEADERS: [&str; 4] = [
-    "content-type",
-    "authorization",
-    "idempotency-key",
-    "x-admin-secret",
-];
-
-/// Response headers a browser client is allowed to *read*. Without these on
-/// `Access-Control-Expose-Headers` a browser can see the status but not the
-/// header value. `x-request-id` is for support correlation; `deprecation`/`link`
-/// are how a legacy (unprefixed) response advertises its `/v1` successor, which
-/// exists specifically so a client can discover the move (#281).
-const CORS_EXPOSED_HEADERS: [&str; 3] = ["x-request-id", "deprecation", "link"];
 
 fn build_cors(cfg: &crate::config::Config) -> CorsLayer {
     use axum::http::HeaderName;
@@ -1380,7 +618,7 @@ fn build_cors(cfg: &crate::config::Config) -> CorsLayer {
             o.parse().unwrap_or_else(|e| {
                 // Origins are validated in Config::from_env, so this branch is
                 // unreachable in production. Treat it as a programming error.
-                unreachable!("BUG: unparseable CORS origin {o:?} reached build_cors: {e}")
+                panic!("BUG: unparseable CORS origin {o:?} reached build_cors: {e}")
             })
         })
         .collect();
@@ -1395,17 +633,6 @@ fn build_cors(cfg: &crate::config::Config) -> CorsLayer {
         .allow_headers([
             HeaderName::from_static("content-type"),
             HeaderName::from_static("authorization"),
-        ])
-        /* Without this a browser client can see the 429 but not the headers
-        explaining it: the CORS spec hides every response header outside the
-        safelist unless it is named here, and `Retry-After` is not on that
-        safelist. Emitting a self-pacing contract the browser cannot read would
-        be the same as not emitting it (issue #327). */
-        .expose_headers([
-            header::RETRY_AFTER,
-            X_RATELIMIT_LIMIT,
-            X_RATELIMIT_REMAINING,
-            X_RATELIMIT_RESET,
         ])
 }
 
@@ -1440,78 +667,18 @@ async fn root(headers: axum::http::HeaderMap) -> impl IntoResponse {
     }
 }
 
-/// Liveness probe — cheap by design, and fails only on conditions a restart
-/// would fix: an expected background task is no longer running (issue #315),
-/// or a required task is crash-looping under the supervisor (issue #316).
-/// A poller or listener that died at startup must not leave the process
-/// looking healthy forever, so this checks [`TaskHealth`](crate::TaskHealth)
-/// rather than just returning a hard-coded ok.
-async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let dead = state.task_health.dead_required_tasks();
-    let looping = state.task_health.crash_looping_required_tasks();
-
-    /* Expected-versus-live, so the probe answers "how many workers should be
-    running, and how many are?" rather than only "is anything wrong?"
-    (issue #317). `expected` already excludes workers configuration has
-    deliberately switched off, so a poll-only deployment does not read as
-    permanently degraded. */
-    let expected = state.task_health.expected_tasks();
-    let live = state.task_health.live_tasks();
-    let disabled: Vec<_> = state
-        .task_health
-        .snapshot()
-        .into_iter()
-        .filter_map(|s| {
-            s.disabled_reason
-                .map(|r| json!({ "task": s.name, "reason": r }))
-        })
-        .collect();
-
-    if dead.is_empty() && looping.is_empty() {
-        return Json(json!({
-            "status": "ok",
-            "tasks": { "expected": expected, "live": live, "disabled": disabled },
-        }))
-        .into_response();
-    }
-
-    let mut reasons = Vec::new();
-    if !dead.is_empty() {
-        reasons.push(format!(
-            "background task(s) not running: {}",
-            dead.join(", ")
-        ));
-    }
-    if !looping.is_empty() {
-        reasons.push(format!(
-            "background task(s) crash-looping: {}",
-            looping.join(", ")
-        ));
-    }
-
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({
-            "status": "unavailable",
-            "reason": reasons.join("; "),
-            "tasks": { "expected": expected, "live": live, "disabled": disabled },
-        })),
-    )
-        .into_response()
+async fn health() -> impl IntoResponse {
+    Json(json!({ "status": "ok" }))
 }
 
-/// Readiness probe — returns 200 only when the database AND Horizon are
-/// reachable AND the payment-detection cursor is advancing. A pod that cannot
-/// reach Horizon cannot detect on-chain payments; routing traffic to it is
-/// worse than routing it elsewhere (issue #172). And a reachable Horizon plus
-/// a dead poller is indistinguishable from a healthy system, so the probe also
-/// requires a successful poll (or stream event) within a configurable window
-/// (issue #315).
+/// Readiness probe — returns 200 only when both the database AND Horizon are
+/// reachable. A pod that cannot reach Horizon cannot detect on-chain payments;
+/// routing traffic to it is worse than routing it elsewhere (issue #172).
 ///
 /// Uses a 3-second timeout on the Horizon check so a slow node never hangs
-/// the probe. Both the Horizon probe and the cursor-freshness check are
-/// skipped when no gateway is configured (STELLAR_GATEWAY_PUBLIC=UNCONFIGURED)
-/// since without a gateway there is no on-chain work to do.
+/// the probe. The check is skipped when no gateway is configured
+/// (STELLAR_GATEWAY_PUBLIC=UNCONFIGURED) since without a gateway there is no
+/// on-chain work to do.
 async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // 1. Database must respond.
     if db::ping(&state.pool).await.is_err() {
@@ -1522,8 +689,7 @@ async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             .into_response();
     }
 
-    // 2. Horizon must respond and the detection cursor must be fresh (only
-    //    when a gateway wallet is configured).
+    // 2. Horizon must respond (only when a gateway wallet is configured).
     if state.config.gateway_configured() {
         if let Err(reason) = check_horizon_ready(&state).await {
             return (
@@ -1532,44 +698,20 @@ async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             )
                 .into_response();
         }
-
-        /* The poller/stream must have made progress recently. Horizon being
-        reachable says nothing about whether a worker is actually watching it
-        (issue #315): a poller that exited at startup leaves /ready green
-        forever without this check. The window is POLL_INTERVAL_SECS ×
-        CURSOR_STALENESS_MULTIPLE, so a healthy poller — which cycles on the
-        poll interval — always clears it. */
-        let staleness_limit =
-            state.config.poll_interval_secs as i64 * state.config.cursor_staleness_multiple as i64;
-        let cursor_age = state.task_health.last_success_age_secs();
-        if cursor_age > staleness_limit {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "status": "unavailable",
-                    "reason": format!(
-                        "payment detection stalled: no successful poll or stream event in \
-                         {cursor_age}s (limit {staleness_limit}s)"
-                    ),
-                })),
-            )
-                .into_response();
-        }
     }
 
     (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response()
 }
 
-/// Probe Horizon with a 3-second timeout (or the configured horizon timeout,
-/// whichever is shorter). Returns Ok(()) when reachable (any non-5xx response),
-/// or an error string.
+/// Probe Horizon with a hard 3-second timeout.
+/// Returns Ok(()) when reachable (any non-5xx response), or an error string.
 async fn check_horizon_ready(state: &Arc<AppState>) -> Result<(), String> {
-    let timeout_millis = std::cmp::min(3_000, state.config.horizon_timeout_secs * 1_000);
+    let url = state.config.horizon_url.trim_end_matches('/').to_string();
     let result = tokio::time::timeout(
-        Duration::from_millis(timeout_millis),
+        Duration::from_millis(3_000),
         state
             .http
-            .get(state.config.horizon_url.clone())
+            .get(&url)
             .header("Accept", "application/json")
             .send(),
     )
@@ -1582,60 +724,12 @@ async fn check_horizon_ready(state: &Arc<AppState>) -> Result<(), String> {
     }
 }
 
-/// Records one completed HTTP request's method, matched route, status, and
-/// latency into [`crate::metrics::HttpMetrics`].
-///
-/// Labelled by the *matched route pattern* (`MatchedPath`, e.g.
-/// `/v1/payments/:id`), never the raw request URI — using the raw path would
-/// let every distinct payment or merchant id mint its own label series, which
-/// is exactly the unbounded-cardinality failure mode Prometheus labels must
-/// avoid. A request that matched no route at all (a genuine 404 on an
-/// unmapped path) is labelled `<unmatched>` for the same reason.
-///
-/// Applied as the outermost layer in [`router`] so the recorded status and
-/// latency reflect the complete request lifecycle, including rejections from
-/// the rate limiter or timeout layers beneath it.
-async fn http_metrics_middleware(
-    State(http_metrics): State<crate::metrics::HttpMetrics>,
-    req: Request,
-    next: Next,
-) -> axum::response::Response {
-    let method = req.method().as_str().to_string();
-    let route = req
-        .extensions()
-        .get::<MatchedPath>()
-        .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|| "<unmatched>".to_string());
-
-    let start = Instant::now();
-    let response = next.run(req).await;
-    let elapsed_ms = start.elapsed().as_millis() as u64;
-
-    http_metrics.record(&method, &route, response.status().as_u16(), elapsed_ms);
-    response
-}
-
 /// `GET /metrics` — Prometheus-compatible plain-text metrics snapshot.
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let (main_bytes, wal_bytes, shm_bytes) = db::file_sizes(&state.config.database_url);
-    let db_snapshot = crate::metrics::DbSnapshot {
-        pool_size: state.pool.size(),
-        pool_idle: state.pool.num_idle() as u32,
-        pool_max: state.config.db_pool_max_connections,
-        main_bytes,
-        wal_bytes,
-        shm_bytes,
-    };
-
     let body = crate::metrics::render(
         &state.webhook_metrics,
         &state.auth_metrics,
-        &state.task_health,
         &state.horizon_metrics,
-        &state.http_metrics,
-        &state.payment_metrics,
-        &db_snapshot,
-        &state.trustline_metrics,
     );
     (
         StatusCode::OK,
@@ -1954,6 +1048,21 @@ mod tests {
                 Method::POST,
                 "/v1/payments/x/webhooks/y/redeliver",
                 Some("redeliver"),
+            ),
+            // Key issuance: POST to /merchants/:id/keys must be in the
+            // write "merchants" bucket, not the 5× read default (issue #243).
+            (Method::POST, "/merchants/abc/keys", Some("merchants")),
+            (Method::POST, "/v1/merchants/abc/keys", Some("merchants")),
+            // Key revocation: DELETE is a destructive write, same bucket (issue #243).
+            (
+                Method::DELETE,
+                "/merchants/abc/keys/key-id",
+                Some("merchants"),
+            ),
+            (
+                Method::DELETE,
+                "/v1/merchants/abc/keys/key-id",
+                Some("merchants"),
             ),
             (Method::GET, "/health", None),
             (Method::GET, "/v1/health", None),
