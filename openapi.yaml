@@ -1723,6 +1723,16 @@ components:
         asset:
           type: string
           enum: [XLM, USDC]
+        asset_issuer:
+          type: string
+          nullable: true
+          description: >-
+            Issuer account of `asset`, recorded when the intent was created.
+            `null` for the native asset (XLM), which has no issuer. Persisted
+            with the intent, so it always reflects the asset the payment was
+            priced in even if the gateway's accepted-asset configuration
+            changes later.
+          example: GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5
         status:
           $ref: "#/components/schemas/PaymentStatus"
         tx_hash:

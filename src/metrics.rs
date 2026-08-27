@@ -9,9 +9,8 @@
 //! `GET /metrics` returns a plain-text Prometheus-compatible snapshot so any
 //! standard scraper can ingest the data with zero configuration.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Histogram buckets for webhook delivery latency (milliseconds).
 /// Covers the range from sub-10 ms fast paths up to the 10 s default timeout.
@@ -208,49 +207,20 @@ impl Default for AuthMetrics {
     }
 }
 
-/// Outcome counters for the Horizon poller's cycles, so throttling or
-/// sustained failure is a queryable fact on the `/metrics` scrape rather than
-/// only a `warn!` line indistinguishable from a one-off blip (issue #313).
+/// Counters for Horizon record handling that would otherwise only be visible in
+/// logs. Currently tracks records the reconciler refused to credit.
 #[derive(Clone)]
 pub struct HorizonMetrics {
     inner: Arc<HorizonMetricsInner>,
 }
 
+#[derive(Default)]
 struct HorizonMetricsInner {
-    /// Cycles that completed without error (whether or not anything settled).
-    success: AtomicU64,
-    /// Cycles that failed on a `429`/`503` from Horizon.
-    rate_limited: AtomicU64,
-    /// Cycles that failed for any other reason.
-    error: AtomicU64,
-    /// Distinct incidents where one cursor produced three consecutive
-    /// non-rate-limit 4xx responses. Incremented once per streak so alerts are
-    /// actionable without turning every retry into a second incident.
-    repeated_cursor_4xx: AtomicU64,
-    /// Times the SSE stream listener reconnected — a closed connection, an
-    /// HTTP error, or (issue #312) an idle timeout with no error at all. A
-    /// persistently-reconnecting stream is the alertable signal that a
-    /// half-open connection is repeatedly disabling live payment detection.
-    stream_reconnects: AtomicU64,
-    /// Age, in seconds, of the most recently processed Horizon payment record
-    /// — the same value `poll_once` and `handle_stream_event` already compute
-    /// via `elapsed_secs` and previously only logged. This is the sharpest
-    /// signal of whether payment detection is falling behind, and was
-    /// unavailable to alerting until exported here (missing-metrics issue).
-    cursor_age_secs: AtomicI64,
-}
-
-impl Default for HorizonMetricsInner {
-    fn default() -> Self {
-        Self {
-            success: AtomicU64::new(0),
-            rate_limited: AtomicU64::new(0),
-            error: AtomicU64::new(0),
-            repeated_cursor_4xx: AtomicU64::new(0),
-            stream_reconnects: AtomicU64::new(0),
-            cursor_age_secs: AtomicI64::new(0),
-        }
-    }
+    /// Horizon payment records skipped because they carried no usable
+    /// `transaction_hash`. A healthy Horizon never produces these, so any
+    /// non-zero value means an unexpected payload (a proxy, a mock, a
+    /// truncated response) is reaching the reconciler (issue #224).
+    unhashed_records_skipped: AtomicU64,
 }
 
 impl HorizonMetrics {
@@ -260,51 +230,15 @@ impl HorizonMetrics {
         }
     }
 
-    pub fn record_success(&self) {
-        self.inner.success.fetch_add(1, Ordering::Relaxed);
-    }
-    pub fn record_rate_limited(&self) {
-        self.inner.rate_limited.fetch_add(1, Ordering::Relaxed);
-    }
-    pub fn record_error(&self) {
-        self.inner.error.fetch_add(1, Ordering::Relaxed);
-    }
-    pub fn record_repeated_cursor_4xx(&self) {
+    /// Record one Horizon record skipped for having no transaction hash.
+    pub fn record_unhashed_record_skipped(&self) {
         self.inner
-            .repeated_cursor_4xx
+            .unhashed_records_skipped
             .fetch_add(1, Ordering::Relaxed);
     }
-    pub fn record_stream_reconnect(&self) {
-        self.inner.stream_reconnects.fetch_add(1, Ordering::Relaxed);
-    }
 
-    /// Record the age (in seconds) of the most recently processed Horizon
-    /// payment record. Called from `poll_once` after each page and from
-    /// `handle_stream_event` for each streamed record, alongside the
-    /// existing `info!(cursor_age_secs, ...)` log lines.
-    pub fn record_cursor_age_secs(&self, secs: i64) {
-        self.inner.cursor_age_secs.store(secs, Ordering::Relaxed);
-    }
-
-    // ── Snapshot accessors ────────────────────────────────────────────────
-
-    pub fn success(&self) -> u64 {
-        self.inner.success.load(Ordering::Relaxed)
-    }
-    pub fn rate_limited(&self) -> u64 {
-        self.inner.rate_limited.load(Ordering::Relaxed)
-    }
-    pub fn error(&self) -> u64 {
-        self.inner.error.load(Ordering::Relaxed)
-    }
-    pub fn repeated_cursor_4xx(&self) -> u64 {
-        self.inner.repeated_cursor_4xx.load(Ordering::Relaxed)
-    }
-    pub fn stream_reconnects(&self) -> u64 {
-        self.inner.stream_reconnects.load(Ordering::Relaxed)
-    }
-    pub fn cursor_age_secs(&self) -> i64 {
-        self.inner.cursor_age_secs.load(Ordering::Relaxed)
+    pub fn unhashed_records_skipped(&self) -> u64 {
+        self.inner.unhashed_records_skipped.load(Ordering::Relaxed)
     }
 }
 
@@ -739,21 +673,10 @@ impl Default for TrustlineMetrics {
 
 // ── Prometheus text exposition ────────────────────────────────────────────────
 
-/// Render webhook delivery, auth outcome, background-task, Horizon poll, HTTP
-/// traffic, payment lifecycle, and database metrics as a Prometheus-compatible
+/// Render webhook delivery and auth outcome metrics as a Prometheus-compatible
 /// plain-text snapshot. Called by `GET /metrics`.
-#[allow(clippy::too_many_arguments)]
-pub fn render(
-    webhook: &WebhookMetrics,
-    auth: &AuthMetrics,
-    tasks: &crate::TaskHealth,
-    horizon: &HorizonMetrics,
-    http: &HttpMetrics,
-    payments: &PaymentMetrics,
-    db: &DbSnapshot,
-    trustlines: &TrustlineMetrics,
-) -> String {
-    let mut out = String::with_capacity(2048);
+pub fn render(webhook: &WebhookMetrics, auth: &AuthMetrics, horizon: &HorizonMetrics) -> String {
+    let mut out = String::with_capacity(1024);
 
     // stellargate_webhook_deliveries_total — counter vec by outcome
     out.push_str(
@@ -822,24 +745,11 @@ pub fn render(
         auth.failure_internal_error()
     ));
 
-    // Background task counters (issue #316): a crash-looping worker must be
-    // visible on the scrape, not only as a log line at shutdown.
+    // stellargate_horizon_records_skipped_total — counter vec by reason
     out.push_str(
-        "# HELP stellargate_tasks_started_total Total background task starts (including restarts).\n",
+        "# HELP stellargate_horizon_records_skipped_total Horizon payment records the reconciler refused to credit, by reason.\n",
     );
-    out.push_str("# TYPE stellargate_tasks_started_total counter\n");
-    out.push_str(&format!(
-        "stellargate_tasks_started_total {}\n",
-        tasks.started()
-    ));
-    out.push_str("# HELP stellargate_tasks_stopped_total Total background task clean stops.\n");
-    out.push_str("# TYPE stellargate_tasks_stopped_total counter\n");
-    out.push_str(&format!(
-        "stellargate_tasks_stopped_total {}\n",
-        tasks.stopped()
-    ));
-    out.push_str("# HELP stellargate_tasks_failed_total Total background task panics.\n");
-    out.push_str("# TYPE stellargate_tasks_failed_total counter\n");
+    out.push_str("# TYPE stellargate_horizon_records_skipped_total counter\n");
     out.push_str(&format!(
         "stellargate_tasks_failed_total {}\n",
         tasks.failed()
