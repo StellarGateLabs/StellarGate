@@ -80,11 +80,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     let has_asset_issuer: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('payments') WHERE name = 'asset_issuer'",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     if has_asset_issuer == 0 {
         sqlx::query("ALTER TABLE payments ADD COLUMN asset_issuer TEXT")
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
     }
 
@@ -159,11 +159,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     let has_acknowledged_at: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'acknowledged_at'",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     if has_acknowledged_at == 0 {
         sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN acknowledged_at TEXT")
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
     }
 
@@ -218,10 +218,10 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     /* Authentication looks a key up by hash on every request, so this index is
     load-bearing rather than an optimisation. */
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash)")
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_merchant ON api_keys(merchant_id)")
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
 
     /* Carry pre-existing single-key merchants across. Their raw key is not
@@ -234,7 +234,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
            FROM merchants
           WHERE api_key_hash IS NOT NULL AND api_key_hash <> ''",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* `webhook_deliveries` is queried by payment_id on every delivery listing
@@ -1053,7 +1053,7 @@ pub async fn list_redrivable_deliveries(
                  END
                ) || ' seconds') <= datetime('now')
          ORDER BY created_at ASC",
-    )
+    ))
     .bind(max_attempts)
     .bind(grace_secs)
     .bind(grace_secs)

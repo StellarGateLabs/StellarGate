@@ -316,12 +316,12 @@ mod property_tests {
                 let canonical2 = stroops_to_string(stroops2);
 
                 prop_assert_eq!(
-                    canonical1,
-                    canonical2,
+                    canonical1.clone(),
+                    canonical2.clone(),
                     "Canonicalization not idempotent: '{}' -> '{}' -> '{}'",
                     s,
-                    canonical1.clone(),
-                    canonical2.clone()
+                    canonical1,
+                    canonical2
                 );
             }
         }
