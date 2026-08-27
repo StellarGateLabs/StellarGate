@@ -535,6 +535,8 @@ pub struct Config {
     /// ≈ 8 MiB for the payments workload. Raising this reduces disk I/O on
     /// index-heavy queries at the cost of resident memory. Defaults to -2000.
     pub sqlite_cache_size: i32,
+    /// Whether to abort boot if the configured gateway account does not exist.
+    pub require_gateway_account: bool,
 }
 
 impl Config {
@@ -681,6 +683,7 @@ impl Config {
             sqlite_wal_autocheckpoint: parse_env("SQLITE_WAL_AUTOCHECKPOINT", 1000)?,
             sqlite_journal_size_limit: parse_env("SQLITE_JOURNAL_SIZE_LIMIT", 67_108_864)?,
             sqlite_cache_size: parse_env("SQLITE_CACHE_SIZE", -2000)?,
+            require_gateway_account: parse_env("REQUIRE_GATEWAY_ACCOUNT", false)?,
         };
         config.validate_addresses()?;
         config.validate_timing()?;
@@ -1274,6 +1277,10 @@ impl std::fmt::Debug for Config {
                 "retention_max_rows_per_cycle",
                 &self.retention_max_rows_per_cycle,
             )
+            .field(
+                "require_gateway_account",
+                &self.require_gateway_account,
+            )
             .finish()
     }
 }
@@ -1381,6 +1388,11 @@ mod tests {
             horizon_page_limit: 200,
             db_prune_batch_size: 500,
             retention_max_rows_per_cycle: 50_000,
+            horizon_timeout_secs: 10,
+            sqlite_wal_autocheckpoint: 1000,
+            sqlite_journal_size_limit: 67_108_864,
+            sqlite_cache_size: -2000,
+            require_gateway_account: false,
         };
         let output = format!("{cfg:?}");
         assert!(
@@ -1680,6 +1692,11 @@ mod tests {
             horizon_page_limit: 200,
             db_prune_batch_size: 500,
             retention_max_rows_per_cycle: 50_000,
+            horizon_timeout_secs: 10,
+            sqlite_wal_autocheckpoint: 1000,
+            sqlite_journal_size_limit: 67_108_864,
+            sqlite_cache_size: -2000,
+            require_gateway_account: false,
         }
     }
 

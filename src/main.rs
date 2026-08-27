@@ -361,6 +361,7 @@ mod tests {
             sqlite_wal_autocheckpoint: 1000,
             sqlite_journal_size_limit: 67_108_864,
             sqlite_cache_size: -2000,
+            require_gateway_account: false,
         }
     }
 

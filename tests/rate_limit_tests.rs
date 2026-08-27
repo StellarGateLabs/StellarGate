@@ -74,6 +74,11 @@ fn make_config(rate_limit_requests_per_sec: u32) -> Config {
         horizon_page_limit: 200,
         db_prune_batch_size: 500,
         retention_max_rows_per_cycle: 50_000,
+        horizon_timeout_secs: 10,
+        sqlite_wal_autocheckpoint: 1000,
+        sqlite_journal_size_limit: 67_108_864,
+        sqlite_cache_size: -2000,
+        require_gateway_account: false,
     }
 }
 

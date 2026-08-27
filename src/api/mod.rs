@@ -3,13 +3,15 @@ use crate::api::payments::{
 };
 use crate::{db, AppState};
 use axum::{
+    body::{to_bytes, Body},
     extract::{ConnectInfo, MatchedPath, Path, Query, Request, State},
-    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json,
 };
+use tracing::Instrument;
 use governor::clock::{Clock, DefaultClock};
 use governor::middleware::StateInformationMiddleware;
 use ipnet::IpNet;
@@ -22,7 +24,8 @@ use std::time::{Duration, Instant};
 use tower_http::{
     cors::CorsLayer,
     limit::RequestBodyLimitLayer,
-    request_id::{MakeRequestUuid, PropagateRequestIdLayer, RequestId, SetRequestIdLayer},
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    set_header::SetResponseHeaderLayer,
     timeout::TimeoutLayer,
     trace::TraceLayer,
 };
@@ -204,7 +207,109 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             state.http_metrics.clone(),
             http_metrics_middleware,
         ))
+        /* Baseline security headers on every response, not just the static
+        dashboard assets. Every JSON response — a payment record, a freshly
+        minted API key, a webhook URL — was previously sent with no headers
+        at all, leaving it MIME-sniffable, cacheable, and free to leak ids
+        through referrers. Applied outermost so they also cover responses the
+        inner layers generate (rate-limit 429s, timeout 408s, and the router's
+        404/405 fallbacks).
+
+        `nosniff` and `referrer-policy` override any inner value because a
+        stricter setting elsewhere is never correct (payment ids travel in
+        URLs). `cache-control` is `if_not_present` so a handler that
+        legitimately opts in to caching is not blindly clobbered, while the
+        API endpoints — which return a plaintext key once, or payment detail —
+        get `no-store` by default. Only `Strict-Transport-Security` is
+        conditional: TLS is terminated at Caddy and the app cannot assert HSTS
+        with any confidence on a testnet where that termination is absent
+        (issue: baseline security headers). The dashboard's Content-Security-Policy
+        is left untouched. */
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::HeaderName::from_static("strict-transport-security"),
+            hsts_value(&state.config.network),
+        ))
         .with_state(state)
+}
+
+/// The `Strict-Transport-Security` header value, or none on non-public
+/// networks. TLS is terminated by the reverse proxy in front of the app, so
+/// asserting HSTS is only meaningful where that termination is guaranteed to
+/// exist — on a `public` network deployment. On testnet (no enforced TLS) a
+/// `max-age` HSTS header would be sent to browsers over plain HTTP, where it
+/// is ignored but still misleading; returning `None` lets the caller keep the
+/// header absent entirely.
+fn hsts_value(network: &str) -> Option<HeaderValue> {
+    (network == "public")
+        .then(|| HeaderValue::from_static("max-age=63072000; includeSubDomains"))
+}
+
+/// Attaches the current request's `X-Request-Id` to a tracing span and, for
+/// error responses, embeds it in the JSON body under `request_id`. Without
+/// this, an operator correlating a dashboard error with a server log line
+/// would have to guess the id from the response headers — and the headers may
+/// not survive a proxy — while the server already generated the id.
+async fn request_id_context(req: Request, next: Next) -> Response {
+    let request_id = req
+        .headers()
+        .get(header::HeaderName::from_static("x-request-id"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .unwrap_or_else(|| "missing".to_string());
+    let span = tracing::info_span!("http_request", request_id = %request_id);
+    let response = next.run(req).instrument(span).await;
+
+    add_request_id_to_error(response, &request_id).await
+}
+
+async fn add_request_id_to_error(response: Response, request_id: &str) -> Response {
+    if !(response.status().is_client_error() || response.status().is_server_error()) {
+        return response;
+    }
+
+    let (parts, body) = response.into_parts();
+    let is_json = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    if !is_json {
+        return Response::from_parts(parts, body);
+    }
+
+    let Ok(bytes) = to_bytes(body, 1024 * 1024).await else {
+        return Response::from_parts(parts, Body::empty());
+    };
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Response::from_parts(parts, Body::from(bytes));
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "request_id".to_string(),
+            serde_json::Value::String(request_id.to_string()),
+        );
+        if let Ok(body) = serde_json::to_vec(&value) {
+            let mut parts = parts;
+            if let Ok(content_length) = HeaderValue::from_str(&body.len().to_string()) {
+                parts.headers.insert(header::CONTENT_LENGTH, content_length);
+            }
+            return Response::from_parts(parts, Body::from(body));
+        }
+    }
+
+    Response::from_parts(parts, Body::from(bytes))
 }
 
 /// Rewrites the bare, empty-body responses axum and `tower_http` generate for
@@ -1459,7 +1564,6 @@ async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 /// whichever is shorter). Returns Ok(()) when reachable (any non-5xx response),
 /// or an error string.
 async fn check_horizon_ready(state: &Arc<AppState>) -> Result<(), String> {
-    let url = state.config.horizon_url.trim_end_matches('/').to_string();
     let timeout_millis = std::cmp::min(3_000, state.config.horizon_timeout_secs * 1_000);
     let result = tokio::time::timeout(
         Duration::from_millis(timeout_millis),
@@ -1872,5 +1976,149 @@ mod tests {
         assert_eq!(bucket_rate_multiplier("redeliver"), 1);
         assert_eq!(bucket_rate_multiplier("default"), 5);
         assert_eq!(bucket_rate_multiplier("unknown"), 5);
+    }
+
+    // ── baseline security headers (issue #251) ──────────────────────────────
+
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+
+    /// Build a full `Config` for a header test. Mostly mirrors `expiry`'s
+    /// helper; the only field that varies here is `network`.
+    fn header_test_config(network: &str) -> crate::config::Config {
+        use crate::config::{AcceptedAsset, ListenerMode, WebhookPayloadDetail};
+        crate::config::Config {
+            port: 0,
+            database_url: "sqlite::memory:".into(),
+            network: network.into(),
+            horizon_url: "https://horizon.invalid".parse().unwrap(),
+            gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
+            accepted_assets: AcceptedAsset::default_list(),
+            webhook_secret: "a-very-long-and-secure-webhook-signing-secret-32-chars".into(),
+            webhook_retry_attempts: 1,
+            webhook_retry_delay_ms: 0,
+            webhook_retry_max_delay_ms: 60_000,
+            allowed_webhook_schemes: vec!["https".into()],
+            webhook_payload_detail: WebhookPayloadDetail::Minimal,
+            webhook_timeout_secs: 10,
+            webhook_redrive_interval_secs: 30,
+            webhook_redrive_concurrency: 4,
+            webhook_redrive_max_attempts: 8,
+            webhook_redrive_grace_secs: 60,
+            webhook_redrive_backoff_initial_secs: 0,
+            webhook_redrive_backoff_max_secs: 0,
+            webhook_redrive_jitter_secs: 0,
+            retention_interval_secs: 3600,
+            webhook_delivery_retention_days: 30,
+            idempotency_retention_days: 7,
+            poll_interval_secs: 10,
+            cursor_staleness_multiple: 3,
+            payment_ttl_secs: 3600,
+            expiry_batch_size: 500,
+            rate_limit_requests_per_sec: 1000,
+            db_pool_max_connections: 5,
+            db_busy_timeout_ms: 5000,
+            cors_allowed_origins: vec![],
+            listener_mode: ListenerMode::Poll,
+            webhook_allow_private_targets: false,
+            admin_provisioning_secret: String::new(),
+            request_timeout_secs: 30,
+            stream_idle_timeout_secs: 30,
+            trusted_proxy_cidrs: vec![],
+            max_payment_amount: Default::default(),
+            min_payment_amount: Default::default(),
+            max_body_bytes: 256 * 1024,
+            rate_limiter_max_keys: 10_000,
+            rate_limiter_idle_ttl_secs: 60,
+            pagination_default_limit: 20,
+            pagination_max_limit: 100,
+            shutdown_grace_secs: 30,
+            horizon_page_limit: 200,
+            db_prune_batch_size: 500,
+            retention_max_rows_per_cycle: 50_000,
+            horizon_timeout_secs: 10,
+            sqlite_wal_autocheckpoint: 1000,
+            sqlite_journal_size_limit: 67_108_864,
+            sqlite_cache_size: -2000,
+            require_gateway_account: false,
+        }
+    }
+
+    /// The exact `AppState` construction `router()` expects, backed by an
+    /// in-memory SQLite pool so routing — and the header layers — run for real.
+    async fn header_test_state(network: &str) -> Arc<AppState> {
+        let cfg = header_test_config(network);
+        let pool = SqlitePoolOptions::new()
+            .connect_with(
+                SqliteConnectOptions::from_str(&cfg.database_url)
+                    .unwrap()
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        Arc::new(AppState {
+            pool,
+            config: cfg,
+            http: reqwest::Client::new(),
+            webhook_http: reqwest::Client::new(),
+            webhook_metrics: crate::metrics::WebhookMetrics::new(),
+            auth_metrics: crate::metrics::AuthMetrics::new(),
+            horizon_metrics: crate::metrics::HorizonMetrics::new(),
+            trustline_metrics: crate::metrics::TrustlineMetrics::new(),
+            http_metrics: crate::metrics::HttpMetrics::new(),
+            payment_metrics: crate::metrics::PaymentMetrics::new(),
+            task_health: crate::TaskHealth::new(),
+        })
+    }
+
+    /// Representatives of the three acceptance criteria:
+    /// 1. nosniff + Referrer-Policy + Cache-Control on an API response;
+    /// 2. HSTS emitted only on public-network deployments;
+    /// 3. the dashboard's stricter CSP preserved, not overwritten.
+    #[tokio::test]
+    async fn api_responses_carry_baseline_security_headers() {
+        let state = header_test_state("testnet").await;
+        let server = TestServer::new(router(state)).unwrap();
+
+        // A representative API response: the 404 envelope is generated by the
+        // router's own fallback, so it is a pure API response with no handler
+        // that could set these headers itself.
+        let res = server.get("/payments/does-not-exist").await;
+        res.assert_status(StatusCode::NOT_FOUND);
+        assert_eq!(res.header("x-content-type-options"), "nosniff");
+        assert_eq!(res.header("referrer-policy"), "no-referrer");
+        assert_eq!(res.header("cache-control"), "no-store");
+    }
+
+    #[tokio::test]
+    async fn hsts_is_emitted_only_on_public_network() {
+        let public = TestServer::new(router(header_test_state("public").await)).unwrap();
+        let testnet = TestServer::new(router(header_test_state("testnet").await)).unwrap();
+
+        let public_ok = public.get("/health").await;
+        public_ok.assert_status_ok();
+        assert!(public_ok
+            .header("strict-transport-security")
+            .to_str()
+            .unwrap_or("")
+            .contains("max-age="));
+
+        let testnet_ok = testnet.get("/health").await;
+        testnet_ok.assert_status_ok();
+        assert!(!testnet_ok.contains_header("strict-transport-security"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_csp_survives_the_global_header_layers() {
+        let state = header_test_state("testnet").await;
+        let server = TestServer::new(router(state)).unwrap();
+
+        let res = server.get("/dashboard").await;
+        res.assert_status_ok();
+        // The dashboard's own, stricter CSP must not be clobbered.
+        assert_eq!(res.header("content-security-policy"), DASHBOARD_CSP);
+        // And it still gets the baseline headers like everything else.
+        assert_eq!(res.header("x-content-type-options"), "nosniff");
     }
 }

@@ -305,6 +305,16 @@ impl TaskHealth {
     pub fn last_success_unix(&self) -> i64 {
         self.inner.last_success_unix.load(Ordering::Relaxed)
     }
+
+    pub fn set_gateway_account_exists(&self, exists: bool) {
+        self.inner
+            .gateway_account_exists
+            .store(exists, Ordering::Relaxed);
+    }
+
+    pub fn gateway_account_exists(&self) -> bool {
+        self.inner.gateway_account_exists.load(Ordering::Relaxed)
+    }
 }
 
 /// Current Unix time in whole seconds.

@@ -1,7 +1,52 @@
 use anyhow::Result;
-use sqlx::{Acquire, Pool, Row, Sqlite};
+use sqlx::{Pool, Row, Sqlite};
+use tracing::info;
 
 pub type Db = Pool<Sqlite>;
+
+/// `kv_state` key namespace for one-time migration flags (issue #266). Distinct
+/// from the horizon poller's cursor keys and anything else `kv_state` holds.
+const MIGRATION_KEY_PREFIX: &str = "migration:";
+
+/// Whether the one-time migration `name` has already run against this
+/// database. Backed by `kv_state` as a cheap interim guard until a proper
+/// schema-version table exists — a full-table backfill or scan gated behind
+/// this runs at most once per database instead of on every boot.
+///
+/// Generic over the executor so it can run inside `migrate`'s transaction
+/// (where `kv_state` may only exist as an uncommitted DDL in that same
+/// transaction and is therefore invisible to a separate pooled connection).
+async fn migration_applied<'e, E>(exec: E, name: &str) -> Result<bool>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let key = format!("{MIGRATION_KEY_PREFIX}{name}");
+    let value: Option<String> = sqlx::query_scalar("SELECT value FROM kv_state WHERE key = ?")
+        .bind(&key)
+        .fetch_optional(exec)
+        .await?;
+    Ok(value.as_deref() == Some("done"))
+}
+
+/// Record that the one-time migration `name` has completed, so future calls
+/// to [`migrate`] skip it.
+async fn mark_migration_applied<'e, E>(exec: E, name: &str) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let key = format!("{MIGRATION_KEY_PREFIX}{name}");
+    sqlx::query(
+        "INSERT INTO kv_state (key, value, updated_at)
+         VALUES (?, 'done', strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = excluded.updated_at",
+    )
+    .bind(&key)
+    .execute(exec)
+    .await?;
+    Ok(())
+}
 
 /// Run `PRAGMA optimize` to update SQLite query planner statistics. Should be
 /// called periodically (e.g., at startup after migration and during graceful
@@ -54,6 +99,12 @@ fn normalize_ts(raw: &str) -> String {
 const TS_PATTERN: &str = "____-__-__T__:__:__Z";
 
 pub async fn migrate(pool: &Db) -> Result<()> {
+    /* All schema DDL and one-time backfills run in a single transaction so a
+    failure anywhere aborts atomically: a partially-applied migration must not
+    leave a half-upgraded database behind (tests/db_tests.rs asserts exactly
+    this). */
+    let mut tx = pool.begin().await?;
+
     sqlx::query(&format!(
         "CREATE TABLE IF NOT EXISTS payments (
             id TEXT PRIMARY KEY,
@@ -75,7 +126,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
                 CHECK (expires_at LIKE '{TS_PATTERN}')
         )",
     ))
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Bring pre-existing payment tables up to schema. New databases already have
@@ -109,11 +160,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     let has_asset_issuer: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('payments') WHERE name = 'asset_issuer'",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     if has_asset_issuer == 0 {
         sqlx::query("ALTER TABLE payments ADD COLUMN asset_issuer TEXT")
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
     }
 
@@ -132,7 +183,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_payments_status_expires_at ON payments(status, expires_at)
          WHERE status IN ('pending', 'underpaid')",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     sqlx::query(&format!(
@@ -151,7 +202,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
                 CHECK (created_at LIKE '{TS_PATTERN}')
         )",
     ))
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Bring pre-existing delivery tables up to schema. `event_type` records
@@ -179,11 +230,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     let has_acknowledged_at: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'acknowledged_at'",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     if has_acknowledged_at == 0 {
         sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN acknowledged_at TEXT")
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
     }
 
@@ -193,13 +244,13 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     let has_manual_attempts: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'manual_attempts'",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     if has_manual_attempts == 0 {
         sqlx::query(
             "ALTER TABLE webhook_deliveries ADD COLUMN manual_attempts INTEGER NOT NULL DEFAULT 0",
         )
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
 
@@ -213,7 +264,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
                 CHECK (updated_at LIKE '{TS_PATTERN}')
         )",
     ))
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Merchants are provisioned via POST /merchants. The raw API key is never
@@ -227,7 +278,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
                 CHECK (created_at LIKE '{TS_PATTERN}')
         )",
     ))
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Per-merchant rate-limit override (issue: rate limiter keyed on IP, not
@@ -236,11 +287,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     let has_rate_limit_per_sec: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('merchants') WHERE name = 'rate_limit_per_sec'",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     if has_rate_limit_per_sec == 0 {
         sqlx::query("ALTER TABLE merchants ADD COLUMN rate_limit_per_sec INTEGER")
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
     }
 
@@ -265,16 +316,16 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             revoked_at TEXT CHECK (revoked_at IS NULL OR revoked_at LIKE '{TS_PATTERN}')
         )",
     ))
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Authentication looks a key up by hash on every request, so this index is
     load-bearing rather than an optimisation. */
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash)")
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_merchant ON api_keys(merchant_id)")
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
 
     /* Carry pre-existing single-key merchants across. Their raw key is not
@@ -287,7 +338,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
            FROM merchants
           WHERE api_key_hash IS NOT NULL AND api_key_hash <> ''",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* `webhook_deliveries` is queried by payment_id on every delivery listing
@@ -313,7 +364,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             PRIMARY KEY (merchant_id, idempotency_key)
         )",
     ))
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Every on-chain transaction we credit to an intent, one row per
@@ -332,36 +383,50 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             PRIMARY KEY (payment_id, tx_hash)
         )",
     ))
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Backfill from legacy rows that recorded only the most-recent `tx_hash`
     and a cumulative `paid_amount`, so upgrading preserves the received-amount
-    ledger for intents that are still in flight. Idempotent via ON CONFLICT, so
-    it is safe to run on every startup. */
-    let legacy = sqlx::query(
-        "SELECT id, tx_hash, paid_amount FROM payments
-         WHERE tx_hash IS NOT NULL AND tx_hash <> '' AND paid_amount IS NOT NULL",
-    )
-    .fetch_all(&mut *tx)
-    .await?;
-    for row in &legacy {
-        let id: String = row.get("id");
-        let tx_hash: String = row.get("tx_hash");
-        let paid_amount: String = row.get("paid_amount");
-        if let Some(stroops) = crate::money::parse_stroops(&paid_amount) {
-            sqlx::query(
-                "INSERT INTO processed_transactions (payment_id, tx_hash, amount_stroops)
-                 VALUES (?, ?, ?)
-                 ON CONFLICT(payment_id, tx_hash) DO NOTHING",
-            )
-            .bind(&id)
-            .bind(&tx_hash)
-            .bind(stroops)
-            .execute(&mut *tx)
-            .await?;
+    ledger for intents that are still in flight. This is a one-time upgrade
+    step: it only needs to run once per database, so it is gated behind a
+    `kv_state` flag rather than re-scanning the full `payments` table (and
+    re-issuing one INSERT per matching row) on every boot (issue #266).
+    Idempotent via ON CONFLICT. Startup cost would otherwise grow, forever,
+    with lifetime payment volume. */
+    const BACKFILL_PROCESSED_TRANSACTIONS: &str = "backfill_processed_transactions";
+    if migration_applied(&mut *tx, BACKFILL_PROCESSED_TRANSACTIONS).await? {
+        info!(
+            migration = BACKFILL_PROCESSED_TRANSACTIONS,
+            "migration skipped (already applied)"
+        );
+    } else {
+        let legacy = sqlx::query(
+            "SELECT id, tx_hash, paid_amount FROM payments
+             WHERE tx_hash IS NOT NULL AND tx_hash <> '' AND paid_amount IS NOT NULL",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut backfilled = 0u64;
+        for row in &legacy {
+            let id: String = row.get("id");
+            let tx_hash: String = row.get("tx_hash");
+            let paid_amount: String = row.get("paid_amount");
+            if let Some(stroops) = crate::money::parse_stroops(&paid_amount) {
+                let result = sqlx::query(
+                    "INSERT INTO processed_transactions (payment_id, tx_hash, amount_stroops)
+                     VALUES (?, ?, ?)
+                     ON CONFLICT(payment_id, tx_hash) DO NOTHING",
+                )
+                .bind(&id)
+                .bind(&tx_hash)
+                .bind(stroops)
+                .execute(&mut *tx)
+                .await?;
+                backfilled += result.rows_affected();
+            }
         }
-        mark_migration_applied(pool, BACKFILL_PROCESSED_TRANSACTIONS).await?;
+        mark_migration_applied(&mut *tx, BACKFILL_PROCESSED_TRANSACTIONS).await?;
         info!(
             migration = BACKFILL_PROCESSED_TRANSACTIONS,
             candidates = legacy.len(),
@@ -383,7 +448,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     already expired. It would never surface as a detectable payment again and
     would be swept on the very next expiry cycle. */
     const NORMALIZE_LEGACY_TIMESTAMPS: &str = "normalize_legacy_timestamps";
-    if migration_applied(pool, NORMALIZE_LEGACY_TIMESTAMPS).await? {
+    if migration_applied(&mut *tx, NORMALIZE_LEGACY_TIMESTAMPS).await? {
         info!(
             migration = NORMALIZE_LEGACY_TIMESTAMPS,
             "migration skipped (already applied)"
@@ -401,14 +466,16 @@ pub async fn migrate(pool: &Db) -> Result<()> {
                 tbl_col.0,
                 col = tbl_col.1
             );
-            normalized += sqlx::query(&sql).execute(pool).await?.rows_affected();
+            normalized += sqlx::query(&sql)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
         }
-        mark_migration_applied(pool, NORMALIZE_LEGACY_TIMESTAMPS).await?;
+        mark_migration_applied(&mut *tx, NORMALIZE_LEGACY_TIMESTAMPS).await?;
         info!(
             migration = NORMALIZE_LEGACY_TIMESTAMPS,
             normalized, "migration applied"
         );
-        sqlx::query(&sql).execute(&mut *tx).await?;
     }
 
     tx.commit().await?;
@@ -1105,7 +1172,7 @@ pub async fn list_redrivable_deliveries(
                  + CASE WHEN ? > 0 THEN ABS(RANDOM()) % (? + 1) ELSE 0 END
                ) || ' seconds') <= datetime('now')
          ORDER BY created_at ASC",
-    )
+    ))
     .bind(max_attempts)
     .bind(grace_secs)
     .bind(grace_secs)
