@@ -1,17 +1,7 @@
 use anyhow::Result;
-use sqlx::{Acquire, Pool, Row, Sqlite};
+use sqlx::{Pool, Row, Sqlite};
 
 pub type Db = Pool<Sqlite>;
-
-/// Run `PRAGMA optimize` to update SQLite query planner statistics. Should be
-/// called periodically (e.g., at startup after migration and during graceful
-/// shutdown) to keep query plans aligned with actual table sizes and
-/// distributions. Without this, every index added by the schema is used
-/// according to whatever the planner guesses, not what ANALYZE has measured.
-pub async fn optimize(pool: &Db) -> Result<()> {
-    sqlx::query("PRAGMA optimize").execute(pool).await?;
-    Ok(())
-}
 
 /// Normalize a raw SQLite timestamp to strict RFC 3339 UTC with a Z suffix.
 ///
@@ -33,28 +23,8 @@ fn normalize_ts(raw: &str) -> String {
     s.to_string()
 }
 
-/// `LIKE` pattern every stored timestamp must match: strict RFC 3339 UTC with
-/// a `Z` suffix and no fractional seconds, e.g. `2026-04-29T15:00:00Z`. `_`
-/// matches exactly one character, so this pins the length and the position of
-/// every separator without needing per-digit character classes SQLite's
-/// dialect of `LIKE` cannot express.
-///
-/// Backing every timestamp `CHECK` constraint below (issue #314): every write
-/// path already produces exactly this format via `strftime('%Y-%m-%dT%H:%M:%SZ',
-/// ...)`, so this makes that a guarantee SQLite enforces rather than a
-/// convention a future write path could silently break — which is exactly how
-/// `expires_at` ended up compared as a lexical string against rows in the
-/// legacy `"YYYY-MM-DD HH:MM:SS"` form (no `T`, no `Z`), which sorts *before*
-/// every compliant timestamp and so reads as permanently expired.
-///
-/// Applies only to newly created tables: `CREATE TABLE IF NOT EXISTS` does not
-/// retroactively add a constraint to a table that already exists, so an
-/// upgrade of a running deployment does not gain this guarantee for rows
-/// already on disk — the startup normalisation below is what repairs those.
-const TS_PATTERN: &str = "____-__-__T__:__:__Z";
-
 pub async fn migrate(pool: &Db) -> Result<()> {
-    sqlx::query(&format!(
+    sqlx::query(
         "CREATE TABLE IF NOT EXISTS payments (
             id TEXT PRIMARY KEY,
             merchant_id TEXT NOT NULL DEFAULT 'anonymous',
@@ -67,14 +37,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             webhook_url TEXT,
             tx_hash TEXT,
             paid_amount TEXT,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-                CHECK (created_at LIKE '{TS_PATTERN}'),
-            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-                CHECK (updated_at LIKE '{TS_PATTERN}'),
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
             expires_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 hour'))
-                CHECK (expires_at LIKE '{TS_PATTERN}')
         )",
-    ))
+    )
     .execute(pool)
     .await?;
 
@@ -85,11 +52,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     let has_expires_at: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('payments') WHERE name = 'expires_at'",
     )
-    .fetch_one(&mut *tx)
+    .fetch_one(pool)
     .await?;
     if has_expires_at == 0 {
         sqlx::query("ALTER TABLE payments ADD COLUMN expires_at TEXT")
-            .execute(&mut *tx)
+            .execute(pool)
             .await?;
     }
     /* Backfill any row without an expiry (legacy rows, or rows inserted in the
@@ -100,12 +67,16 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', created_at, '+1 hour')
           WHERE expires_at IS NULL",
     )
-    .execute(&mut *tx)
+    .execute(pool)
     .await?;
 
-    /* Pin each intent to the issuer it was priced in. Rows written before this
-    column existed only stored the asset *code*; `backfill_asset_issuers` fills
-    them from the current allow-list after config loads (issue #222). */
+    /* `asset_issuer` completes the asset identity of an intent. Only the code
+    used to be stored, so which USDC (say) a historical row referred to lived in
+    process configuration and changed whenever `ACCEPTED_ASSETS` was edited
+    (issue #223). Existing databases get the column added in place; it is
+    nullable by design — NULL means the native asset, which has no issuer.
+    Rows created before this migration are backfilled, best-effort, from the
+    configured allow-list by [`backfill_asset_issuers`]. */
     let has_asset_issuer: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('payments') WHERE name = 'asset_issuer'",
     )
@@ -118,24 +89,18 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     }
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_memo ON payments(memo)")
-        .execute(&mut *tx)
+        .execute(pool)
         .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)")
-        .execute(&mut *tx)
+        .execute(pool)
         .await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_payments_created_id ON payments(created_at DESC, id DESC)",
     )
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_payments_status_expires_at ON payments(status, expires_at)
-         WHERE status IN ('pending', 'underpaid')",
-    )
     .execute(pool)
     .await?;
 
-    sqlx::query(&format!(
+    sqlx::query(
         "CREATE TABLE IF NOT EXISTS webhook_deliveries (
             id TEXT PRIMARY KEY,
             payment_id TEXT NOT NULL,
@@ -144,13 +109,10 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             event_type TEXT,
             status TEXT NOT NULL DEFAULT 'pending',
             attempts INTEGER NOT NULL DEFAULT 0,
-            manual_attempts INTEGER NOT NULL DEFAULT 0,
-            last_attempt TEXT CHECK (last_attempt IS NULL OR last_attempt LIKE '{TS_PATTERN}'),
-            acknowledged_at TEXT CHECK (acknowledged_at IS NULL OR acknowledged_at LIKE '{TS_PATTERN}'),
+            last_attempt TEXT,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-                CHECK (created_at LIKE '{TS_PATTERN}')
         )",
-    ))
+    )
     .execute(pool)
     .await?;
 
@@ -162,87 +124,38 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     let has_event_type: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'event_type'",
     )
-    .fetch_one(&mut *tx)
+    .fetch_one(pool)
     .await?;
     if has_event_type == 0 {
         sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN event_type TEXT")
-            .execute(&mut *tx)
-            .await?;
-    }
-
-    /* `acknowledged_at` records that somebody has seen a terminal failure and
-    acted on it — set by the bulk requeue/acknowledge endpoint. It exists so
-    retention can distinguish "this failure was dealt with" from "nobody has
-    looked at this yet", and refuse to delete the latter (issue #319). Rows
-    that predate the column are NULL, i.e. unacknowledged, which is the safe
-    reading: we do not know that anyone saw them. */
-    let has_acknowledged_at: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'acknowledged_at'",
-    )
-    .fetch_one(pool)
-    .await?;
-    if has_acknowledged_at == 0 {
-        sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN acknowledged_at TEXT")
             .execute(pool)
             .await?;
     }
 
-    /* Manual redeliveries must not share the automatic redrive budget (issue
-    #235). `manual_attempts` is incremented by POST .../redeliver; the redrive
-    worker only looks at `attempts`. */
-    let has_manual_attempts: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'manual_attempts'",
-    )
-    .fetch_one(pool)
-    .await?;
-    if has_manual_attempts == 0 {
-        sqlx::query(
-            "ALTER TABLE webhook_deliveries ADD COLUMN manual_attempts INTEGER NOT NULL DEFAULT 0",
-        )
-        .execute(pool)
-        .await?;
-    }
-
     /* Durable key/value state — used by the Horizon poller to persist its
     paging cursor so it resumes exactly where it left off across restarts. */
-    sqlx::query(&format!(
+    sqlx::query(
         "CREATE TABLE IF NOT EXISTS kv_state (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-                CHECK (updated_at LIKE '{TS_PATTERN}')
         )",
-    ))
+    )
     .execute(pool)
     .await?;
 
     /* Merchants are provisioned via POST /merchants. The raw API key is never
     stored; only its SHA-256 hex digest is persisted so a DB breach does not
     expose live credentials. */
-    sqlx::query(&format!(
+    sqlx::query(
         "CREATE TABLE IF NOT EXISTS merchants (
             id TEXT PRIMARY KEY,
             api_key_hash TEXT NOT NULL UNIQUE,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-                CHECK (created_at LIKE '{TS_PATTERN}')
         )",
-    ))
+    )
     .execute(pool)
     .await?;
-
-    /* Per-merchant rate-limit override (issue: rate limiter keyed on IP, not
-    identity). NULL means "use the configured default"; a merchant only gets
-    a row value once an operator sets one explicitly. */
-    let has_rate_limit_per_sec: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM pragma_table_info('merchants') WHERE name = 'rate_limit_per_sec'",
-    )
-    .fetch_one(pool)
-    .await?;
-    if has_rate_limit_per_sec == 0 {
-        sqlx::query("ALTER TABLE merchants ADD COLUMN rate_limit_per_sec INTEGER")
-            .execute(pool)
-            .await?;
-    }
 
     /* API keys, one row per credential rather than one per merchant, so a key
     can be rotated (issue a second, revoke the first) and revoked individually
@@ -252,19 +165,18 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     of the raw key so an operator can tell two keys apart in a list without the
     secret being recoverable. `revoked_at` is a tombstone rather than a delete
     so an audit trail survives revocation. */
-    sqlx::query(&format!(
+    sqlx::query(
         "CREATE TABLE IF NOT EXISTS api_keys (
             id TEXT PRIMARY KEY,
             merchant_id TEXT NOT NULL,
             key_hash TEXT NOT NULL UNIQUE,
             prefix TEXT NOT NULL,
             label TEXT,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-                CHECK (created_at LIKE '{TS_PATTERN}'),
-            last_used_at TEXT CHECK (last_used_at IS NULL OR last_used_at LIKE '{TS_PATTERN}'),
-            revoked_at TEXT CHECK (revoked_at IS NULL OR revoked_at LIKE '{TS_PATTERN}')
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            last_used_at TEXT,
+            revoked_at TEXT
         )",
-    ))
+    )
     .execute(pool)
     .await?;
 
@@ -296,23 +208,22 @@ pub async fn migrate(pool: &Db) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_payment
          ON webhook_deliveries(payment_id)",
     )
-    .execute(&mut *tx)
+    .execute(pool)
     .await?;
 
     /* Idempotency keys for payment creation. A key is unique per merchant and
     maps to the payment id minted for the first request that used it, so a
     client retrying after a network blip gets the original payment back
     instead of a duplicate intent. */
-    sqlx::query(&format!(
+    sqlx::query(
         "CREATE TABLE IF NOT EXISTS idempotency_keys (
             merchant_id TEXT NOT NULL,
             idempotency_key TEXT NOT NULL,
             payment_id TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-                CHECK (created_at LIKE '{TS_PATTERN}'),
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
             PRIMARY KEY (merchant_id, idempotency_key)
         )",
-    ))
+    )
     .execute(pool)
     .await?;
 
@@ -322,16 +233,19 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     later poll cycle, over the stream, or from a concurrent reconciler) is an
     idempotent no-op instead of a double-credit. `amount_stroops` is the
     integer stroop value so SUM is exact. */
-    sqlx::query(&format!(
+    sqlx::query(
         "CREATE TABLE IF NOT EXISTS processed_transactions (
             payment_id TEXT NOT NULL,
-            tx_hash TEXT NOT NULL,
+            /* The transaction hash is half the dedup key, so an empty value
+            would make every unhashed record collide on one row and silently
+            discard all but the first (issue #224). Reject it in the schema as
+            well as at the write path. */
+            tx_hash TEXT NOT NULL CHECK (tx_hash <> ''),
             amount_stroops INTEGER NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-                CHECK (created_at LIKE '{TS_PATTERN}'),
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
             PRIMARY KEY (payment_id, tx_hash)
         )",
-    ))
+    )
     .execute(pool)
     .await?;
 
@@ -343,7 +257,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
         "SELECT id, tx_hash, paid_amount FROM payments
          WHERE tx_hash IS NOT NULL AND tx_hash <> '' AND paid_amount IS NOT NULL",
     )
-    .fetch_all(&mut *tx)
+    .fetch_all(pool)
     .await?;
     for row in &legacy {
         let id: String = row.get("id");
@@ -358,85 +272,45 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             .bind(&id)
             .bind(&tx_hash)
             .bind(stroops)
-            .execute(&mut *tx)
+            .execute(pool)
             .await?;
         }
-        mark_migration_applied(pool, BACKFILL_PROCESSED_TRANSACTIONS).await?;
-        info!(
-            migration = BACKFILL_PROCESSED_TRANSACTIONS,
-            candidates = legacy.len(),
-            backfilled,
-            "migration applied"
+    }
+
+    /* Rows written before issue #224 was fixed may carry an empty `tx_hash`,
+    where two distinct unhashed records collapsed onto one primary key. We do
+    not delete them — the amount they carry was really received, and dropping
+    the row would silently reduce an intent's paid total — but we surface them
+    so an operator can reconcile against the ledger by hand. */
+    let unhashed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM processed_transactions WHERE tx_hash = ''")
+            .fetch_one(pool)
+            .await?;
+    if unhashed > 0 {
+        tracing::warn!(
+            rows = unhashed,
+            "processed_transactions contains rows with an empty tx_hash, written before \
+             unhashed Horizon records were rejected; these may under-count an intent's \
+             received amount and should be reconciled against Horizon by hand"
         );
     }
 
     /* Normalise legacy rows that were written by the old datetime('now') default,
-    which produced "YYYY-MM-DD HH:MM:SS" (space, no Z). This is a one-time
-    repair for rows written before the RFC 3339 format was enforced, so — like
-    the backfill above — it is gated behind a `kv_state` flag instead of
-    scanning both tables on every boot forever (issue #266).
-
-    `expires_at` is included for the same reason as the others (issue #314):
-    left in the legacy space-separated form, it sorts *before* every compliant
-    "…T…Z" timestamp — 'T' (0x54) > ' ' (0x20) — so `expires_at > strftime(...)`
-    in list_pending/expire_overdue/find_pending_by_memo reads such a row as
-    already expired. It would never surface as a detectable payment again and
-    would be swept on the very next expiry cycle. */
-    const NORMALIZE_LEGACY_TIMESTAMPS: &str = "normalize_legacy_timestamps";
-    if migration_applied(pool, NORMALIZE_LEGACY_TIMESTAMPS).await? {
-        info!(
-            migration = NORMALIZE_LEGACY_TIMESTAMPS,
-            "migration skipped (already applied)"
+    which produced "YYYY-MM-DD HH:MM:SS" (space, no Z). Safe to run on every
+    startup — the WHERE clause skips rows that are already RFC 3339. */
+    for tbl_col in [
+        ("payments", "created_at"),
+        ("payments", "updated_at"),
+        ("webhook_deliveries", "created_at"),
+    ] {
+        let sql = format!(
+            "UPDATE {} SET {col} = replace({col}, ' ', 'T') || 'Z' WHERE {col} NOT LIKE '%T%'",
+            tbl_col.0,
+            col = tbl_col.1
         );
-    } else {
-        let mut normalized = 0u64;
-        for tbl_col in [
-            ("payments", "created_at"),
-            ("payments", "updated_at"),
-            ("payments", "expires_at"),
-            ("webhook_deliveries", "created_at"),
-        ] {
-            let sql = format!(
-                "UPDATE {} SET {col} = replace({col}, ' ', 'T') || 'Z' WHERE {col} NOT LIKE '%T%'",
-                tbl_col.0,
-                col = tbl_col.1
-            );
-            normalized += sqlx::query(&sql).execute(pool).await?.rows_affected();
-        }
-        mark_migration_applied(pool, NORMALIZE_LEGACY_TIMESTAMPS).await?;
-        info!(
-            migration = NORMALIZE_LEGACY_TIMESTAMPS,
-            normalized, "migration applied"
-        );
-        sqlx::query(&sql).execute(&mut *tx).await?;
+        sqlx::query(&sql).execute(pool).await?;
     }
 
-    tx.commit().await?;
-    Ok(())
-}
-
-/// Fill `asset_issuer` on rows that only stored a code, using the current
-/// allow-list. Duplicate codes are rejected at boot, so each code maps to at
-/// most one issuer. Native assets stay NULL.
-pub async fn backfill_asset_issuers(
-    pool: &Db,
-    accepted: &[crate::config::AcceptedAsset],
-) -> Result<()> {
-    for asset in accepted {
-        let Some(issuer) = asset.issuer.as_deref() else {
-            continue;
-        };
-        sqlx::query(
-            "UPDATE payments
-                SET asset_issuer = ?
-              WHERE upper(asset) = upper(?)
-                AND (asset_issuer IS NULL OR asset_issuer = '')",
-        )
-        .bind(issuer)
-        .bind(&asset.code)
-        .execute(pool)
-        .await?;
-    }
     Ok(())
 }
 
@@ -448,6 +322,13 @@ pub struct Payment {
     pub memo: String,
     pub amount: String,
     pub asset: String,
+    /// Issuer of the asset this intent was priced in, as an `G…` account id.
+    /// `None` means the native asset (XLM), which has no issuer.
+    ///
+    /// Persisted at creation time from the accepted-asset allow-list so that
+    /// editing `ACCEPTED_ASSETS` later cannot retroactively change which asset
+    /// a historical intent refers to (issue #223).
+    pub asset_issuer: Option<String>,
     pub status: String,
     pub webhook_url: Option<String>,
     pub tx_hash: Option<String>,
@@ -456,10 +337,6 @@ pub struct Payment {
     pub updated_at: String,
     /// When this intent stops being `pending` and is swept to `expired`.
     pub expires_at: String,
-    /// Issuer account for a credit asset; `None` for native XLM. Settlement
-    /// matches this issuer, not any allow-list entry that shares the code
-    /// (issue #222).
-    pub asset_issuer: Option<String>,
 }
 
 fn row_to_payment(row: &sqlx::sqlite::SqliteRow) -> Payment {
@@ -470,6 +347,7 @@ fn row_to_payment(row: &sqlx::sqlite::SqliteRow) -> Payment {
         memo: row.get("memo"),
         amount: row.get("amount"),
         asset: row.get("asset"),
+        asset_issuer: row.get("asset_issuer"),
         status: row.get("status"),
         webhook_url: row.get("webhook_url"),
         tx_hash: row.get("tx_hash"),
@@ -477,7 +355,6 @@ fn row_to_payment(row: &sqlx::sqlite::SqliteRow) -> Payment {
         created_at: normalize_ts(&row.get::<String, _>("created_at")),
         updated_at: normalize_ts(&row.get::<String, _>("updated_at")),
         expires_at: normalize_ts(&row.get::<String, _>("expires_at")),
-        asset_issuer: row.get("asset_issuer"),
     }
 }
 
@@ -488,9 +365,11 @@ pub struct NewPayment<'a> {
     pub destination_address: &'a str,
     pub memo: &'a str,
     pub amount: &'a str,
-    pub asset: &'a str,
-    /// Issuer for `asset`; `None` for native XLM.
+    /// Issuer of `asset`, or `None` for the native asset. Resolved from the
+    /// accepted-asset allow-list by the caller and stored alongside the code so
+    /// the pair is a complete asset identity (issue #223).
     pub asset_issuer: Option<&'a str>,
+    pub asset: &'a str,
     pub webhook_url: Option<&'a str>,
     /// Seconds from now until the intent expires. The expiry timestamp is
     /// computed by SQLite at insert time as `now + ttl_secs`.
@@ -567,10 +446,7 @@ pub async fn save_idempotency_key(
     .execute(pool)
     .await?;
 
-    // A concurrent insert may have won the race; re-read to get the canonical
-    // payment_id. If the row is missing despite the insert (which cannot happen
-    // given SQLite's serialised writes), fall back to our own value so the
-    // caller still gets a usable id rather than an error.
+    // Re-read so a concurrent insert that won the race returns the canonical id.
     let stored = find_payment_id_by_idempotency_key(pool, merchant_id, key)
         .await?
         .unwrap_or_else(|| payment_id.to_string());
@@ -590,71 +466,56 @@ pub async fn get_payment(pool: &Db, id: &str) -> Result<Option<Payment>> {
     Ok(row.as_ref().map(row_to_payment))
 }
 
-/// Offset variant of `list_payments_keyset`. Rows are ordered by
-/// `(created_at DESC, id DESC)` — exactly the keyset ordering — so a
-/// `next_cursor` minted from this page resumes in cursor mode without
-/// skipping or repeating rows. `created_at` is whole-second, so ties are
-/// common; leaving their order to SQLite lets offset pages repeat or skip
-/// rows and would make the migration cursor diverge from the keyset scan.
-/// Offset-paginated page of a merchant's payments. Does **not** compute a row
-/// count — see [`count_payments`] (issue #320). SQLite has no cached row
-/// count, so a `COUNT(*)` here would scan every matching row on every list
-/// request (including the first page) purely to fill a `total` field most
-/// callers never read; keeping it a separate, opt-in query means the default
-/// list path never pays for it.
 pub async fn list_payments(
     pool: &Db,
     merchant_id: &str,
     status: Option<&str>,
     limit: i64,
     offset: i64,
-) -> Result<Vec<Payment>> {
-    let rows = if let Some(s) = status {
-        sqlx::query(
+) -> Result<(Vec<Payment>, i64)> {
+    let (rows, total) = if let Some(s) = status {
+        let rows = sqlx::query(
             "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-             FROM payments WHERE merchant_id = ? AND status = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+             FROM payments WHERE merchant_id = ? AND status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
         )
         .bind(merchant_id)
         .bind(s)
         .bind(limit)
         .bind(offset)
         .fetch_all(pool)
-        .await?
+        .await?;
+
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM payments WHERE merchant_id = ? AND status = ?",
+        )
+        .bind(merchant_id)
+        .bind(s)
+        .fetch_one(pool)
+        .await?;
+
+        (rows, total)
     } else {
-        sqlx::query(
+        let rows = sqlx::query(
             "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-             FROM payments WHERE merchant_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+             FROM payments WHERE merchant_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
         )
         .bind(merchant_id)
         .bind(limit)
         .bind(offset)
         .fetch_all(pool)
-        .await?
-    };
+        .await?;
 
-    Ok(rows.iter().map(row_to_payment).collect())
-}
-
-/// Count a merchant's payments matching an optional status filter. Split out
-/// from [`list_payments`] so the default `GET /payments` path never pays for
-/// a full-table `COUNT(*)` — this only runs when a caller explicitly asks for
-/// `total` via `?include_total=true` (issue #320).
-pub async fn count_payments(pool: &Db, merchant_id: &str, status: Option<&str>) -> Result<i64> {
-    let total = if let Some(s) = status {
-        sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE merchant_id = ? AND status = ?")
-            .bind(merchant_id)
-            .bind(s)
-            .fetch_one(pool)
-            .await?
-    } else {
-        sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE merchant_id = ?")
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE merchant_id = ?")
             .bind(merchant_id)
             .fetch_one(pool)
-            .await?
+            .await?;
+
+        (rows, total)
     };
-    Ok(total)
+
+    Ok((rows.iter().map(row_to_payment).collect(), total))
 }
 
 pub async fn list_payments_keyset(
@@ -747,42 +608,44 @@ pub async fn list_pending(pool: &Db) -> Result<Vec<Payment>> {
     Ok(rows.iter().map(row_to_payment).collect())
 }
 
-/// Transition up to `batch` watchable payments whose TTL has elapsed to
-/// `expired`, returning the rows that were swept so the caller can fire
-/// `payment.expired` webhooks.
-///
-/// The whole batch is transitioned in a single `UPDATE … RETURNING` — one
-/// round-trip instead of one guarded `UPDATE` per intent (issue #323). The
-/// `WHERE … status IN ('pending','underpaid')` guard remains what makes a
-/// concurrent settlement win the race: the subquery and update run under one
-/// write lock, so a payment that settles in between is never selected here
-/// (if the settlement committed first) and a payment this statement sweeps is
-/// rejected by the settlement's own guard (issue #155) — never double-reported.
-/// `RETURNING` yields exactly the rows this statement actually transitioned.
-///
-/// `batch` bounds each statement, so a large backlog drains over several
-/// sweeps instead of one long write lock.
-pub async fn expire_overdue(pool: &Db, batch: i64) -> Result<Vec<Payment>> {
-    let rows = sqlx::query(
-        "UPDATE payments
-            SET status = 'expired',
-                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-          WHERE id IN (
-              SELECT id FROM payments
-               WHERE status IN ('pending', 'underpaid')
-                 AND expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ','now')
-               ORDER BY created_at ASC
-               LIMIT ?
-          )
-          RETURNING id, merchant_id, destination_address, memo, amount, asset,
-                    asset_issuer, status, webhook_url, tx_hash, paid_amount,
-                    created_at, updated_at, expires_at",
+/// Transition every watchable payment whose TTL has elapsed to `expired`,
+/// returning the rows that were swept so the caller can fire `payment.expired`
+/// webhooks. Each row is updated with a guard on a watchable status so a payment
+/// that settles concurrently is left untouched and not double-reported.
+pub async fn expire_overdue(pool: &Db) -> Result<Vec<Payment>> {
+    let overdue = sqlx::query(
+        "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
+                webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
+         FROM payments
+         WHERE status IN ('pending', 'underpaid')
+           AND expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ','now')
+         ORDER BY created_at ASC",
     )
-    .bind(batch)
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.iter().map(row_to_payment).collect())
+    let mut expired = Vec::new();
+    for row in &overdue {
+        let mut payment = row_to_payment(row);
+        let result = sqlx::query(
+            "UPDATE payments
+                SET status = 'expired',
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+              WHERE id = ? AND status IN ('pending', 'underpaid')",
+        )
+        .bind(&payment.id)
+        .execute(pool)
+        .await?;
+
+        /* Only report rows we actually transitioned; a concurrent settlement
+        may have flipped the status out from under us. */
+        if result.rows_affected() == 1 {
+            payment.status = "expired".to_string();
+            expired.push(payment);
+        }
+    }
+
+    Ok(expired)
 }
 
 pub async fn find_pending_by_memo(pool: &Db, memo: &str) -> Result<Option<Payment>> {
@@ -847,6 +710,15 @@ pub async fn record_processed_tx(
     tx_hash: &str,
     amount_stroops: i64,
 ) -> Result<bool> {
+    /* An empty hash is not a hash: it would make every unhashed record share
+    one primary key, so the first would be credited and every later one
+    silently dropped as "already processed" (issue #224). Callers must skip
+    such records; reaching here with one is a bug, so it is an error rather
+    than a quiet `false` (which reads as "already recorded"). */
+    if tx_hash.is_empty() {
+        anyhow::bail!("refusing to record a processed transaction with an empty tx_hash");
+    }
+
     let result = sqlx::query(
         "INSERT INTO processed_transactions (payment_id, tx_hash, amount_stroops)
          VALUES (?, ?, ?)
@@ -882,6 +754,57 @@ pub async fn get_state(pool: &Db, key: &str) -> Result<Option<String>> {
     Ok(value)
 }
 
+/// Key recording that the one-off `asset_issuer` backfill has already run, so
+/// it is never applied twice.
+const ASSET_ISSUER_BACKFILL_KEY: &str = "schema_backfill_asset_issuer_v1";
+
+/// Backfill `payments.asset_issuer` for rows created before the column existed,
+/// using the currently-configured accepted-asset allow-list.
+///
+/// This runs exactly once per database (guarded by a marker in `kv_state`),
+/// because it is a *best-effort* reconstruction: the issuer a historical intent
+/// was actually priced in was never recorded, so all we can do is assume it was
+/// the one configured for that asset code today. Running it repeatedly would
+/// let a later `ACCEPTED_ASSETS` edit rewrite history a second time, which is
+/// exactly the problem the column exists to prevent (issue #223).
+///
+/// Native assets are left NULL — they have no issuer. Rows whose asset code is
+/// no longer in the allow-list are also left NULL, since there is nothing left
+/// to reconstruct from.
+pub async fn backfill_asset_issuers(
+    pool: &Db,
+    accepted_assets: &[crate::config::AcceptedAsset],
+) -> Result<()> {
+    if get_state(pool, ASSET_ISSUER_BACKFILL_KEY).await?.is_some() {
+        return Ok(());
+    }
+
+    let mut filled = 0u64;
+    for asset in accepted_assets {
+        let Some(issuer) = asset.issuer.as_deref() else {
+            continue;
+        };
+        let result = sqlx::query(
+            "UPDATE payments SET asset_issuer = ? WHERE asset = ? AND asset_issuer IS NULL",
+        )
+        .bind(issuer)
+        .bind(&asset.code)
+        .execute(pool)
+        .await?;
+        filled += result.rows_affected();
+    }
+
+    set_state(pool, ASSET_ISSUER_BACKFILL_KEY, "done").await?;
+    if filled > 0 {
+        tracing::info!(
+            rows = filled,
+            "backfilled payments.asset_issuer from the configured accepted assets; \
+             rows created before this migration are best-effort"
+        );
+    }
+    Ok(())
+}
+
 /// Insert or update a value in the durable key/value state table.
 pub async fn set_state(pool: &Db, key: &str, value: &str) -> Result<()> {
     sqlx::query(
@@ -896,6 +819,14 @@ pub async fn set_state(pool: &Db, key: &str, value: &str) -> Result<()> {
     .execute(pool)
     .await?;
     Ok(())
+}
+
+pub async fn memo_exists(pool: &Db, memo: &str) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE memo = ?")
+        .bind(memo)
+        .fetch_one(pool)
+        .await?;
+    Ok(count > 0)
 }
 
 /// Record an outbound webhook delivery. `event_type` is the event name the
@@ -928,7 +859,7 @@ pub async fn update_webhook_delivery(
     status: &str,
     attempts: i64,
 ) -> Result<()> {
-    let result = sqlx::query(
+    sqlx::query(
         "UPDATE webhook_deliveries SET status = ?, attempts = ?, last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
     )
     .bind(status)
@@ -936,31 +867,6 @@ pub async fn update_webhook_delivery(
     .bind(id)
     .execute(pool)
     .await?;
-    if result.rows_affected() == 0 {
-        anyhow::bail!("webhook delivery {id} not found for status update");
-    }
-    Ok(())
-}
-
-/// Record a merchant-initiated redelivery outcome.
-///
-/// Updates `status` and increments `manual_attempts` only. Leaves `attempts`
-/// and `last_attempt` untouched so the automatic redrive budget and backoff
-/// schedule are unaffected (issue #235).
-pub async fn record_manual_redelivery(pool: &Db, id: &str, status: &str) -> Result<()> {
-    let result = sqlx::query(
-        "UPDATE webhook_deliveries
-            SET status = ?,
-                manual_attempts = manual_attempts + 1
-          WHERE id = ?",
-    )
-    .bind(status)
-    .bind(id)
-    .execute(pool)
-    .await?;
-    if result.rows_affected() == 0 {
-        anyhow::bail!("webhook delivery {id} not found for manual redelivery");
-    }
     Ok(())
 }
 
@@ -975,14 +881,7 @@ pub struct WebhookDelivery {
     pub event_type: Option<String>,
     pub status: String,
     pub attempts: i64,
-    /// Merchant-initiated redeliveries. Ignored by the redrive worker's budget
-    /// (issue #235); exposed on listing so operators can tell the two apart.
-    pub manual_attempts: i64,
     pub last_attempt: Option<String>,
-    /// When somebody acted on this delivery — requeued it, or explicitly
-    /// acknowledged it. `None` means nobody has looked at it yet, which is
-    /// what keeps a terminal failure exempt from retention (issue #319).
-    pub acknowledged_at: Option<String>,
     pub created_at: String,
 }
 
@@ -1000,10 +899,6 @@ impl WebhookDelivery {
         if let Some(event) = &self.event_type {
             return event.clone();
         }
-        // Every payload this gateway has ever written carries an `event` field,
-        // so this fallback is only reached for payloads written by a future
-        // schema change or external tooling. FALLBACK_EVENT is a safe last
-        // resort rather than a panic.
         serde_json::from_str::<serde_json::Value>(&self.payload)
             .ok()
             .and_then(|v| v.get("event")?.as_str().map(str::to_string))
@@ -1020,17 +915,10 @@ fn row_to_webhook_delivery(row: &sqlx::sqlite::SqliteRow) -> WebhookDelivery {
         event_type: row.get("event_type"),
         status: row.get("status"),
         attempts: row.get("attempts"),
-        manual_attempts: row.get("manual_attempts"),
         last_attempt: row.get("last_attempt"),
-        acknowledged_at: row.get("acknowledged_at"),
         created_at: normalize_ts(&row.get::<String, _>("created_at")),
     }
 }
-
-/// Columns every delivery read selects, in the order `row_to_webhook_delivery`
-/// expects. Kept in one place so adding a column cannot leave one query behind.
-const DELIVERY_COLUMNS: &str = "id, payment_id, url, payload, event_type, status, attempts, \
-                                manual_attempts, last_attempt, acknowledged_at, created_at";
 
 /// Deliveries eligible for the background redrive worker: not yet delivered,
 /// under the attempt cap, and idle long enough that no in-flight `dispatch()`
@@ -1053,56 +941,22 @@ const DELIVERY_COLUMNS: &str = "id, payment_id, url, payload, event_type, status
 /// A row with `attempts == 0` (left behind by a crash between insert and its
 /// first send, not a delivery failure) is exempt from this backoff and is
 /// gated by `grace_secs` alone.
-///
-/// `jitter_secs` adds a per-row random offset in `[0, jitter_secs]` on top of
-/// whichever window applies, and is what actually decorrelates a co-failing
-/// batch (issue #318). The exponential backoff alone does not: rows that failed
-/// together share an `attempts` value and a near-identical `last_attempt`, so
-/// `initial * 2^(attempts-1)` resolves to the same instant for every one of
-/// them, and this query — which computes eligibility in SQL from `last_attempt`
-/// — re-clusters the batch on every pass. `RANDOM()` is evaluated per row per
-/// statement, so each pass admits a different random subset and a batch that
-/// failed together spreads over several intervals instead of moving as one
-/// block. Pass `0` to disable.
-fn redrive_backoff_exponent_cap(initial_secs: i64, max_secs: i64) -> i64 {
-    if initial_secs <= 0 || max_secs <= initial_secs {
-        return 0;
-    }
-
-    // Smallest exponent e for which initial * 2^e reaches the configured cap.
-    // The SQL query substitutes `max_secs` at and beyond this exponent, so it
-    // only multiplies while the product is strictly below max and cannot
-    // overflow. Casts are safe after the positive guards above.
-    let ratio = (max_secs as u64).div_ceil(initial_secs as u64);
-    (u64::BITS - (ratio - 1).leading_zeros()) as i64
-}
-
 pub async fn list_redrivable_deliveries(
     pool: &Db,
     max_attempts: i64,
     grace_secs: i64,
     backoff_initial_secs: i64,
     backoff_max_secs: i64,
-    jitter_secs: i64,
 ) -> Result<Vec<WebhookDelivery>> {
-    let exponent_cap = redrive_backoff_exponent_cap(backoff_initial_secs, backoff_max_secs);
-
-    /* `ABS(RANDOM()) % (n+1)` yields [0, n]. Guarded on `jitter_secs > 0`:
-    `% 1` is a constant 0, and a zero modulus is a runtime error in SQLite. */
-    let rows = sqlx::query(&format!(
-        "SELECT {DELIVERY_COLUMNS}
+    let rows = sqlx::query(
+        "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
          FROM webhook_deliveries
          WHERE status IN ('pending', 'failed')
            AND attempts < ?
            AND datetime(COALESCE(last_attempt, created_at), '+' || (
-                  CASE WHEN attempts = 0 THEN ?
-                       ELSE MAX(?, CASE
-                              WHEN ? <= 0 THEN 0
-                              WHEN attempts - 1 >= ? THEN ?
-                              ELSE ? * (1 << (attempts - 1))
-                            END)
-                  END
-                 + CASE WHEN ? > 0 THEN ABS(RANDOM()) % (? + 1) ELSE 0 END
+                 CASE WHEN attempts = 0 THEN ?
+                      ELSE MAX(?, MIN(? * (1 << MIN(attempts - 1, 32)), ?))
+                 END
                ) || ' seconds') <= datetime('now')
          ORDER BY created_at ASC",
     )
@@ -1110,11 +964,7 @@ pub async fn list_redrivable_deliveries(
     .bind(grace_secs)
     .bind(grace_secs)
     .bind(backoff_initial_secs)
-    .bind(exponent_cap)
     .bind(backoff_max_secs)
-    .bind(backoff_initial_secs)
-    .bind(jitter_secs)
-    .bind(jitter_secs)
     .fetch_all(pool)
     .await?;
 
@@ -1123,10 +973,10 @@ pub async fn list_redrivable_deliveries(
 
 /// Get all webhook deliveries for a payment, ordered by created_at descending.
 pub async fn list_webhook_deliveries(pool: &Db, payment_id: &str) -> Result<Vec<WebhookDelivery>> {
-    let rows = sqlx::query(&format!(
-        "SELECT {DELIVERY_COLUMNS}
+    let rows = sqlx::query(
+        "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
          FROM webhook_deliveries WHERE payment_id = ? ORDER BY created_at DESC",
-    ))
+    )
     .bind(payment_id)
     .fetch_all(pool)
     .await?;
@@ -1134,161 +984,12 @@ pub async fn list_webhook_deliveries(pool: &Db, payment_id: &str) -> Result<Vec<
     Ok(rows.iter().map(row_to_webhook_delivery).collect())
 }
 
-/// Get a page of webhook deliveries for a payment with keyset (cursor)
-/// pagination, sharing the contracts used by `GET /payments`.
-///
-/// Rows are ordered by `(created_at DESC, id DESC)` — the same ordering and
-/// tie-break as the payments listing — so a `next_cursor` encoded from any
-/// page resumes exactly after its last row and never re-reads or skips the
-/// whole-second `created_at` tie group that ends the page. An optional
-/// `status` filter narrows to deliveries in that state (`pending`,
-/// `delivered`, or `failed`).
-pub async fn list_webhook_deliveries_keyset(
-    pool: &Db,
-    payment_id: &str,
-    status: Option<&str>,
-    limit: i64,
-    cursor: Option<(&str, &str)>,
-) -> Result<Vec<WebhookDelivery>> {
-    let rows = match (status, cursor) {
-        (None, None) => {
-            sqlx::query(&format!(
-                "SELECT {DELIVERY_COLUMNS}
-                 FROM webhook_deliveries WHERE payment_id = ?
-                 ORDER BY created_at DESC, id DESC LIMIT ?",
-            ))
-            .bind(payment_id)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
-        }
-
-        (None, Some((ts, cid))) => {
-            sqlx::query(&format!(
-                "SELECT {DELIVERY_COLUMNS}
-                 FROM webhook_deliveries
-                 WHERE payment_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
-                 ORDER BY created_at DESC, id DESC LIMIT ?",
-            ))
-            .bind(payment_id)
-            .bind(ts)
-            .bind(ts)
-            .bind(cid)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
-        }
-
-        (Some(s), None) => {
-            sqlx::query(&format!(
-                "SELECT {DELIVERY_COLUMNS}
-                 FROM webhook_deliveries WHERE payment_id = ? AND status = ?
-                 ORDER BY created_at DESC, id DESC LIMIT ?",
-            ))
-            .bind(payment_id)
-            .bind(s)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
-        }
-
-        (Some(s), Some((ts, cid))) => {
-            sqlx::query(&format!(
-                "SELECT {DELIVERY_COLUMNS}
-                 FROM webhook_deliveries
-                 WHERE payment_id = ? AND status = ?
-                   AND (created_at < ? OR (created_at = ? AND id < ?))
-                 ORDER BY created_at DESC, id DESC LIMIT ?",
-            ))
-            .bind(payment_id)
-            .bind(s)
-            .bind(ts)
-            .bind(ts)
-            .bind(cid)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
-        }
-    };
-
-    Ok(rows.iter().map(row_to_webhook_delivery).collect())
-}
-
-/// List a *merchant's* deliveries across every one of their payments, filtered
-/// by status and paginated with the same keyset cursor the payments list uses
-/// (issue #319).
-///
-/// This is the query the dead-letter view is built on. Answering "a merchant
-/// says they are missing events" previously required already knowing which
-/// payment to look at, which is backwards — the payment id is exactly what the
-/// person asking does not have. The only way to get the answer was to query
-/// SQLite directly on the production volume.
-///
-/// Scoping is a join to `payments`, not a filter the caller supplies, so a
-/// merchant can never read another tenant's deliveries.
-pub async fn list_deliveries_for_merchant(
-    pool: &Db,
-    merchant_id: &str,
-    status: &str,
-    limit: i64,
-    cursor: Option<(&str, &str)>,
-) -> Result<Vec<WebhookDelivery>> {
-    let mut sql = String::from(
-        "SELECT d.id, d.payment_id, d.url, d.payload, d.event_type, d.status, d.attempts, \
-                d.manual_attempts, d.last_attempt, d.acknowledged_at, d.created_at
-           FROM webhook_deliveries d
-           JOIN payments p ON p.id = d.payment_id
-          WHERE p.merchant_id = ? AND d.status = ?",
-    );
-    if cursor.is_some() {
-        sql.push_str(" AND (d.created_at < ? OR (d.created_at = ? AND d.id < ?))");
-    }
-    sql.push_str(" ORDER BY d.created_at DESC, d.id DESC LIMIT ?");
-
-    let mut query = sqlx::query(&sql).bind(merchant_id).bind(status);
-    if let Some((ts, id)) = cursor {
-        query = query.bind(ts).bind(ts).bind(id);
-    }
-    let rows = query.bind(limit).fetch_all(pool).await?;
-
-    Ok(rows.iter().map(row_to_webhook_delivery).collect())
-}
-
-/// Requeue a merchant's failed deliveries so the redrive worker retries them,
-/// and mark them acknowledged. Returns how many rows were affected.
-///
-/// `ids` empty means every failed delivery this merchant has.
-pub async fn requeue_failed_deliveries(
-    pool: &Db,
-    merchant_id: &str,
-    ids: &[String],
-) -> Result<u64> {
-    let mut sql = String::from(
-        "UPDATE webhook_deliveries
-            SET status = 'pending',
-                attempts = 0,
-                acknowledged_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-          WHERE status = 'failed'
-            AND payment_id IN (SELECT id FROM payments WHERE merchant_id = ?)",
-    );
-    if !ids.is_empty() {
-        sql.push_str(" AND id IN (");
-        sql.push_str(&vec!["?"; ids.len()].join(","));
-        sql.push(')');
-    }
-
-    let mut query = sqlx::query(&sql).bind(merchant_id);
-    for id in ids {
-        query = query.bind(id);
-    }
-    Ok(query.execute(pool).await?.rows_affected())
-}
-
 /// Get a specific webhook delivery by id.
 pub async fn get_webhook_delivery(pool: &Db, id: &str) -> Result<Option<WebhookDelivery>> {
-    let row = sqlx::query(&format!(
-        "SELECT {DELIVERY_COLUMNS} FROM webhook_deliveries WHERE id = ?",
-    ))
+    let row = sqlx::query(
+        "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+         FROM webhook_deliveries WHERE id = ?",
+    )
     .bind(id)
     .fetch_optional(pool)
     .await?;
@@ -1303,41 +1004,6 @@ pub async fn ping(pool: &Db) -> Result<()> {
         .fetch_one(pool)
         .await?;
     Ok(())
-}
-
-/// Resolve the on-disk path from a `sqlite:` `DATABASE_URL`, for file-size
-/// metrics. Returns `None` for `sqlite::memory:` or anything else with no
-/// backing file to `stat()`.
-fn sqlite_path(database_url: &str) -> Option<&str> {
-    let rest = database_url.strip_prefix("sqlite:")?;
-    // `split('?').next()` always returns Some on a non-empty iterator, so
-    // this fallback to `rest` is unreachable — it is here to satisfy the
-    // type-checker without an unwrap that could panic.
-    let rest = rest.split('?').next().unwrap_or(rest);
-    let rest = rest.trim_start_matches("//");
-    if rest.is_empty() || rest == ":memory:" {
-        return None;
-    }
-    Some(rest)
-}
-
-/// Sizes, in bytes, of the main database file and its `-wal`/`-shm`
-/// companions, for the `stellargate_db_file_size_bytes` gauge (issue: missing
-/// DB metrics). Each is `None` when the file doesn't exist yet (a `-wal`
-/// before the first write, or any of them for an in-memory database) rather
-/// than an error — a fresh deployment legitimately has no WAL file.
-///
-/// Returns `(main, wal, shm)`.
-pub fn file_sizes(database_url: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
-    let Some(path) = sqlite_path(database_url) else {
-        return (None, None, None);
-    };
-    let stat = |p: String| std::fs::metadata(p).ok().map(|m| m.len());
-    (
-        stat(path.to_string()),
-        stat(format!("{path}-wal")),
-        stat(format!("{path}-shm")),
-    )
 }
 
 /* ---------------------------------------------------------------------------
@@ -1361,23 +1027,12 @@ fn hash_api_key(raw: &str) -> String {
 /// constraint on databases created before `api_keys` existed. Nothing reads it
 /// any more — authentication goes through `api_keys` so that rotation and
 /// revocation work — and it is not maintained as keys change.
-///
-/// `rate_limit_per_sec` is an optional per-merchant override for the
-/// authenticated rate limiter; `None` leaves the merchant on the configured
-/// default quota.
-pub async fn create_merchant(
-    pool: &Db,
-    id: &str,
-    raw_key: &str,
-    prefix: &str,
-    rate_limit_per_sec: Option<i64>,
-) -> Result<String> {
+pub async fn create_merchant(pool: &Db, id: &str, raw_key: &str, prefix: &str) -> Result<String> {
     let mut tx = pool.begin().await?;
 
-    sqlx::query("INSERT INTO merchants (id, api_key_hash, rate_limit_per_sec) VALUES (?, ?, ?)")
+    sqlx::query("INSERT INTO merchants (id, api_key_hash) VALUES (?, ?)")
         .bind(id)
         .bind(hash_api_key(raw_key))
-        .bind(rate_limit_per_sec)
         .execute(&mut *tx)
         .await?;
 
@@ -1401,20 +1056,20 @@ pub async fn create_merchant(
 Retention
 --------------------------------------------------------------------------- */
 
+/// Rows removed per statement. Deleting in batches keeps each write lock short:
+/// SQLite has a single writer, so one unbounded `DELETE` over a large table
+/// would stall every payment write until it finished.
+pub const PRUNE_BATCH: i64 = 500;
+
 /// Delete one batch of idempotency keys older than `retention_days`.
 ///
 /// A key only has to outlive the window in which a client might retry the
 /// create it guarded. Past that it is dead weight, and the table has no other
 /// bound (issue #110).
 ///
-/// `batch` bounds rows removed per statement — deleting in batches keeps each
-/// write lock short, since SQLite has a single writer and one unbounded
-/// `DELETE` over a large table would stall every payment write until it
-/// finished (configurable via `DB_PRUNE_BATCH_SIZE`, issue #279).
-///
 /// Returns how many rows went; the caller loops until a batch comes back
 /// short.
-pub async fn prune_idempotency_keys(pool: &Db, retention_days: i64, batch: i64) -> Result<u64> {
+pub async fn prune_idempotency_keys(pool: &Db, retention_days: i64) -> Result<u64> {
     let cutoff = format!("-{retention_days} days");
     let n = sqlx::query(
         "DELETE FROM idempotency_keys
@@ -1425,7 +1080,7 @@ pub async fn prune_idempotency_keys(pool: &Db, retention_days: i64, batch: i64) 
           )",
     )
     .bind(&cutoff)
-    .bind(batch)
+    .bind(PRUNE_BATCH)
     .execute(pool)
     .await?
     .rows_affected();
@@ -1434,70 +1089,23 @@ pub async fn prune_idempotency_keys(pool: &Db, retention_days: i64, batch: i64) 
 
 /// Delete one batch of webhook deliveries that have finished and aged out.
 ///
-/// A `pending` row is still owned by the redrive worker — pruning it would
-/// silently drop a delivery that was going to be retried. The worker marks
-/// rows `failed` once attempts are exhausted, so nothing stays exempt forever
-/// (issue #111).
-///
-/// An **unacknowledged `failed`** row is also exempt. Deleting one destroys the
-/// only record that an event was permanently lost, on a timer, whether or not
-/// anybody looked at it — so the evidence for "we never received your webhook"
-/// expired exactly when it was most likely to be asked for (issue #319).
-/// Acknowledging or requeueing a delivery clears the exemption, and
-/// [`compact_stale_failed_deliveries`] keeps the retained rows from costing
-/// what a full delivery row costs.
-pub async fn prune_webhook_deliveries(pool: &Db, retention_days: i64, batch: i64) -> Result<u64> {
+/// Only `delivered` and `failed` rows are eligible. A `pending` row is still
+/// owned by the redrive worker — pruning it would silently drop a delivery
+/// that was going to be retried. The worker marks rows `failed` once attempts
+/// are exhausted, so nothing stays exempt forever (issue #111).
+pub async fn prune_webhook_deliveries(pool: &Db, retention_days: i64) -> Result<u64> {
     let cutoff = format!("-{retention_days} days");
     let n = sqlx::query(
         "DELETE FROM webhook_deliveries
           WHERE rowid IN (
               SELECT rowid FROM webhook_deliveries
-               WHERE (status = 'delivered'
-                      OR (status = 'failed' AND acknowledged_at IS NOT NULL))
+               WHERE status IN ('delivered','failed')
                  AND created_at < strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
                LIMIT ?
           )",
     )
     .bind(&cutoff)
-    .bind(batch)
-    .execute(pool)
-    .await?
-    .rows_affected();
-    Ok(n)
-}
-
-/// Drop the stored payload of aged-out, unacknowledged `failed` deliveries,
-/// leaving a compact tombstone.
-///
-/// Exempting terminal failures from retention outright would trade one
-/// unbounded table for another, which is the problem retention was added to
-/// solve (issues #110, #111). `payload` is by far the largest column, and its
-/// only consumer is redelivery — which is not something anyone does to a
-/// months-old failure. Clearing it keeps the row (and therefore the answer to
-/// "did this event ever get through?") at a few hundred bytes, indefinitely.
-///
-/// The `payload <> ''` guard makes this idempotent: a row is compacted once,
-/// not rewritten on every cycle.
-pub async fn compact_stale_failed_deliveries(
-    pool: &Db,
-    retention_days: i64,
-    batch: i64,
-) -> Result<u64> {
-    let cutoff = format!("-{retention_days} days");
-    let n = sqlx::query(
-        "UPDATE webhook_deliveries
-            SET payload = ''
-          WHERE rowid IN (
-              SELECT rowid FROM webhook_deliveries
-               WHERE status = 'failed'
-                 AND acknowledged_at IS NULL
-                 AND payload <> ''
-                 AND created_at < strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
-               LIMIT ?
-          )",
-    )
-    .bind(&cutoff)
-    .bind(batch)
+    .bind(PRUNE_BATCH)
     .execute(pool)
     .await?
     .rows_affected();
@@ -1562,69 +1170,62 @@ pub async fn create_api_key(
 
 /// Resolve a raw API key to its merchant, rejecting revoked keys.
 ///
-/// Also refreshes `last_used_at`, but at most once a minute per key: the
-/// SELECT fetches the current value and only issues an UPDATE when it is
-/// NULL or stale, avoiding a write transaction on every authenticated request.
-/// Minute granularity is plenty to spot a key that has gone quiet or one that
-/// is being used when it should not be.
+/// Also refreshes `last_used_at`, but at most once a minute per key: this runs
+/// on every authenticated request, and SQLite takes a write lock for each
+/// update, so touching it unconditionally would put a write in the path of
+/// every read. Minute granularity is plenty to spot a key that has gone quiet
+/// or one that is being used when it should not be.
 pub async fn find_merchant_by_key(pool: &Db, raw_key: &str) -> Result<Option<String>> {
     let hash = hash_api_key(raw_key);
 
-    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT id, merchant_id, last_used_at FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL",
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT id, merchant_id FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL",
     )
     .bind(&hash)
     .fetch_optional(pool)
     .await?;
 
-    let Some((key_id, merchant_id, last_used_at)) = row else {
+    let Some((key_id, merchant_id)) = row else {
         return Ok(None);
     };
 
-    // Only issue the UPDATE if last_used_at is stale or NULL. Parse the
-    // timestamp and compare in application code to avoid a write transaction
-    // on every request — SQLite takes a write lock even for a zero-row UPDATE.
-    let needs_update = match last_used_at {
-        None => true,
-        Some(ts) => {
-            // Parse the stored RFC 3339 timestamp and check if it's older than 60 seconds.
-            match time::OffsetDateTime::parse(&ts, &time::format_description::well_known::Rfc3339)
-            {
-                Ok(last_used) => {
-                    let now = time::OffsetDateTime::now_utc();
-                    let age = now - last_used;
-                    age.whole_seconds() >= 60
-                }
-                Err(_) => true, // If parse fails, update to fix the bad timestamp
-            }
-        }
-    };
-
-    if needs_update {
-        sqlx::query(
-            "UPDATE api_keys SET last_used_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
-        )
-        .bind(&key_id)
-        .execute(pool)
-        .await?;
-    }
+    sqlx::query(
+        "UPDATE api_keys
+            SET last_used_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+          WHERE id = ?
+            AND (last_used_at IS NULL
+                 OR last_used_at < strftime('%Y-%m-%dT%H:%M:%SZ','now','-60 seconds'))",
+    )
+    .bind(&key_id)
+    .execute(pool)
+    .await?;
 
     Ok(Some(merchant_id))
 }
 
-/// (id, prefix, label, created_at, last_used_at, revoked_at) as selected by
-/// every `api_keys` listing query below.
-type KeyRow = (
-    String,
-    String,
-    Option<String>,
-    String,
-    Option<String>,
-    Option<String>,
-);
+/// Every key issued to a merchant, newest first, including revoked ones so the
+/// history stays visible.
+pub async fn list_api_keys(pool: &Db, merchant_id: &str) -> Result<Vec<ApiKeyInfo>> {
+    /// (id, prefix, label, created_at, last_used_at, revoked_at) as selected below.
+    type KeyRow = (
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+    );
 
-fn key_rows_to_info(rows: Vec<KeyRow>) -> Vec<ApiKeyInfo> {
-    rows.into_iter()
+    let rows: Vec<KeyRow> = sqlx::query_as(
+        "SELECT id, prefix, label, created_at, last_used_at, revoked_at
+               FROM api_keys WHERE merchant_id = ? ORDER BY created_at DESC, id DESC",
+    )
+    .bind(merchant_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
         .map(
             |(id, prefix, label, created_at, last_used_at, revoked_at)| ApiKeyInfo {
                 id,
@@ -1635,111 +1236,7 @@ fn key_rows_to_info(rows: Vec<KeyRow>) -> Vec<ApiKeyInfo> {
                 revoked_at,
             },
         )
-        .collect()
-}
-
-/// A page of a merchant's API keys, newest first (`created_at DESC, id DESC`
-/// keyset ordering — the same convention `GET /payments` and the webhook
-/// delivery listings use). Revoked keys are retained deliberately as an audit
-/// trail and are included by default; pass `active = Some(true)` to skip
-/// straight past the history to the keys someone would actually reach for
-/// (issue #262).
-pub async fn list_api_keys_keyset(
-    pool: &Db,
-    merchant_id: &str,
-    active: Option<bool>,
-    limit: i64,
-    cursor: Option<(&str, &str)>,
-) -> Result<Vec<ApiKeyInfo>> {
-    let rows: Vec<KeyRow> = match (active, cursor) {
-        (None, None) => {
-            sqlx::query_as(
-                "SELECT id, prefix, label, created_at, last_used_at, revoked_at
-                 FROM api_keys WHERE merchant_id = ?
-                 ORDER BY created_at DESC, id DESC LIMIT ?",
-            )
-            .bind(merchant_id)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
-        }
-
-        (None, Some((ts, cid))) => {
-            sqlx::query_as(
-                "SELECT id, prefix, label, created_at, last_used_at, revoked_at
-                 FROM api_keys
-                 WHERE merchant_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
-                 ORDER BY created_at DESC, id DESC LIMIT ?",
-            )
-            .bind(merchant_id)
-            .bind(ts)
-            .bind(ts)
-            .bind(cid)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
-        }
-
-        (Some(true), None) => {
-            sqlx::query_as(
-                "SELECT id, prefix, label, created_at, last_used_at, revoked_at
-                 FROM api_keys WHERE merchant_id = ? AND revoked_at IS NULL
-                 ORDER BY created_at DESC, id DESC LIMIT ?",
-            )
-            .bind(merchant_id)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
-        }
-
-        (Some(true), Some((ts, cid))) => {
-            sqlx::query_as(
-                "SELECT id, prefix, label, created_at, last_used_at, revoked_at
-                 FROM api_keys
-                 WHERE merchant_id = ? AND revoked_at IS NULL
-                   AND (created_at < ? OR (created_at = ? AND id < ?))
-                 ORDER BY created_at DESC, id DESC LIMIT ?",
-            )
-            .bind(merchant_id)
-            .bind(ts)
-            .bind(ts)
-            .bind(cid)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
-        }
-
-        (Some(false), None) => {
-            sqlx::query_as(
-                "SELECT id, prefix, label, created_at, last_used_at, revoked_at
-                 FROM api_keys WHERE merchant_id = ? AND revoked_at IS NOT NULL
-                 ORDER BY created_at DESC, id DESC LIMIT ?",
-            )
-            .bind(merchant_id)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
-        }
-
-        (Some(false), Some((ts, cid))) => {
-            sqlx::query_as(
-                "SELECT id, prefix, label, created_at, last_used_at, revoked_at
-                 FROM api_keys
-                 WHERE merchant_id = ? AND revoked_at IS NOT NULL
-                   AND (created_at < ? OR (created_at = ? AND id < ?))
-                 ORDER BY created_at DESC, id DESC LIMIT ?",
-            )
-            .bind(merchant_id)
-            .bind(ts)
-            .bind(ts)
-            .bind(cid)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
-        }
-    };
-
-    Ok(key_rows_to_info(rows))
+        .collect())
 }
 
 /// Revoke a key. Scoped by merchant so one merchant cannot revoke another's.
@@ -1773,36 +1270,6 @@ pub async fn count_active_api_keys(pool: &Db, merchant_id: &str) -> Result<i64> 
     Ok(n)
 }
 
-/// The merchant's per-second rate-limit override, if an operator has set one.
-/// `Ok(None)` covers both "merchant has no override" and "merchant does not
-/// exist" — callers that need to distinguish those should check
-/// [`merchant_exists`] first.
-pub async fn get_merchant_rate_limit(pool: &Db, merchant_id: &str) -> Result<Option<i64>> {
-    let value: Option<Option<i64>> = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT rate_limit_per_sec FROM merchants WHERE id = ?",
-    )
-    .bind(merchant_id)
-    .fetch_optional(pool)
-    .await?;
-    Ok(value.flatten())
-}
-
-/// Set (or clear, with `None`) a merchant's rate-limit override. Returns
-/// `false` if the merchant does not exist.
-pub async fn set_merchant_rate_limit(
-    pool: &Db,
-    merchant_id: &str,
-    rate_limit_per_sec: Option<i64>,
-) -> Result<bool> {
-    let affected = sqlx::query("UPDATE merchants SET rate_limit_per_sec = ? WHERE id = ?")
-        .bind(rate_limit_per_sec)
-        .bind(merchant_id)
-        .execute(pool)
-        .await?
-        .rows_affected();
-    Ok(affected > 0)
-}
-
 /// Whether a merchant exists, so key endpoints can 404 rather than silently
 /// operating on nothing.
 pub async fn merchant_exists(pool: &Db, merchant_id: &str) -> Result<bool> {
@@ -1816,62 +1283,15 @@ pub async fn merchant_exists(pool: &Db, merchant_id: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-    use std::str::FromStr;
-
-    /// A fresh, uniquely-named in-memory SQLite database with `cache=shared`,
-    /// so every connection the pool opens talks to the SAME database rather
-    /// than each getting its own private one, which a bare `sqlite::memory:`
-    /// DSN would do under this pool's default multi-connection size (issue
-    /// #309).
-    fn shared_memory_dsn() -> String {
-        format!(
-            "sqlite:file:{}?mode=memory&cache=shared",
-            uuid::Uuid::new_v4()
-        )
-    }
+    use sqlx::sqlite::SqlitePoolOptions;
 
     async fn memory_db() -> Db {
         let pool = SqlitePoolOptions::new()
-            // A shared-cache in-memory database is dropped once its last
-            // connection closes — keep exactly one open for the pool's
-            // lifetime.
-            .min_connections(1)
-            .connect_with(SqliteConnectOptions::from_str(&shared_memory_dsn()).unwrap())
+            .connect("sqlite::memory:")
             .await
             .unwrap();
         migrate(&pool).await.unwrap();
         pool
-    }
-
-    /// The `payments` table exactly as it looks on disk before this binary's
-    /// first `migrate()` call ever runs against it — every column the current
-    /// code selects, but none of the `CHECK` constraints added since (they are
-    /// not retroactive to a table that already existed, see [`TS_PATTERN`]).
-    /// Used to seed "an existing deployment's database" for tests of one-time
-    /// migrations (issue #266) without going through `migrate()` first.
-    async fn create_legacy_payments_table(pool: &Db) {
-        sqlx::query(
-            "CREATE TABLE payments (
-                id TEXT PRIMARY KEY,
-                merchant_id TEXT NOT NULL DEFAULT 'anonymous',
-                destination_address TEXT NOT NULL,
-                memo TEXT NOT NULL UNIQUE,
-                amount TEXT NOT NULL,
-                asset TEXT NOT NULL DEFAULT 'XLM',
-                asset_issuer TEXT,
-                status TEXT NOT NULL DEFAULT 'pending',
-                webhook_url TEXT,
-                tx_hash TEXT,
-                paid_amount TEXT,
-                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-                expires_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 hour'))
-            )",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
     }
 
     /// An upgrade must not lock out merchants whose keys predate the
@@ -1884,8 +1304,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_single_key_merchants_survive_the_api_keys_migration() {
         let pool = SqlitePoolOptions::new()
-            .min_connections(1)
-            .connect_with(SqliteConnectOptions::from_str(&shared_memory_dsn()).unwrap())
+            .connect("sqlite::memory:")
             .await
             .unwrap();
 
@@ -1918,120 +1337,10 @@ mod tests {
         );
 
         // It is now a first-class key: listable, and revocable once replaced.
-        let keys = list_api_keys_keyset(&pool, "legacy-merchant", None, 100, None)
-            .await
-            .unwrap();
+        let keys = list_api_keys(&pool, "legacy-merchant").await.unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].prefix, "legacy");
         assert!(keys[0].revoked_at.is_none());
-
-        // The pre-upgrade schema had no rate_limit_per_sec column at all;
-        // migrating must add it and leave existing merchants on the default.
-        assert_eq!(
-            get_merchant_rate_limit(&pool, "legacy-merchant")
-                .await
-                .unwrap(),
-            None
-        );
-    }
-
-    /// The `processed_transactions` backfill (issue #266) must scan the
-    /// `payments` table at most once per database, not on every boot.
-    ///
-    /// Simulates an upgrade: a payment row already carries a legacy
-    /// `tx_hash`/`paid_amount` pair before `migrate()` ever runs. The first
-    /// call must backfill it into `processed_transactions`; a second call
-    /// must leave the table alone rather than re-scanning `payments` and
-    /// re-inserting.
-    #[tokio::test]
-    async fn processed_transactions_backfill_runs_at_most_once() {
-        let pool = SqlitePoolOptions::new()
-            .min_connections(1)
-            .connect_with(SqliteConnectOptions::from_str(&shared_memory_dsn()).unwrap())
-            .await
-            .unwrap();
-
-        // Full pre-migration payments schema, with a settled legacy row
-        // already present — exactly what an existing deployment's database
-        // looks like the moment this migration ships.
-        create_legacy_payments_table(&pool).await;
-        sqlx::query(
-            "INSERT INTO payments (id, destination_address, memo, amount, tx_hash, paid_amount)
-             VALUES ('pay1', 'GDEST', 'memo1', '10.0000000', 'legacytxhash', '10.0000000')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        migrate(&pool).await.unwrap();
-
-        assert_eq!(
-            sum_processed_stroops(&pool, "pay1").await.unwrap(),
-            100_000_000,
-            "the first migrate() call must backfill the legacy row"
-        );
-
-        // Clear the backfilled row. If the second migrate() call re-scans
-        // `payments` and redoes the backfill, this row comes back; if it
-        // correctly skips, it stays gone.
-        sqlx::query("DELETE FROM processed_transactions")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        migrate(&pool).await.unwrap();
-
-        assert_eq!(
-            sum_processed_stroops(&pool, "pay1").await.unwrap(),
-            0,
-            "a second migrate() call must not re-run the one-time backfill"
-        );
-    }
-
-    /// A merchant's rate-limit override round-trips: unset by default,
-    /// settable, and clearable back to `None` (the "use the default" state).
-    #[tokio::test]
-    async fn merchant_rate_limit_override_round_trips() {
-        let pool = memory_db().await;
-        let (raw, prefix) = generate_api_key();
-        create_merchant(&pool, "m1", &raw, &prefix, None)
-            .await
-            .unwrap();
-
-        assert_eq!(get_merchant_rate_limit(&pool, "m1").await.unwrap(), None);
-
-        assert!(set_merchant_rate_limit(&pool, "m1", Some(50))
-            .await
-            .unwrap());
-        assert_eq!(
-            get_merchant_rate_limit(&pool, "m1").await.unwrap(),
-            Some(50)
-        );
-
-        assert!(set_merchant_rate_limit(&pool, "m1", None).await.unwrap());
-        assert_eq!(get_merchant_rate_limit(&pool, "m1").await.unwrap(), None);
-
-        // A merchant that doesn't exist reports "nothing updated".
-        assert!(
-            !set_merchant_rate_limit(&pool, "no-such-merchant", Some(10))
-                .await
-                .unwrap()
-        );
-    }
-
-    /// A merchant provisioned with an override has it set from creation.
-    #[tokio::test]
-    async fn create_merchant_persists_initial_rate_limit_override() {
-        let pool = memory_db().await;
-        let (raw, prefix) = generate_api_key();
-        create_merchant(&pool, "m2", &raw, &prefix, Some(25))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            get_merchant_rate_limit(&pool, "m2").await.unwrap(),
-            Some(25)
-        );
     }
 
     /// Revoking a key must take effect immediately for authentication.
@@ -2039,9 +1348,7 @@ mod tests {
     async fn revoked_keys_stop_authenticating() {
         let pool = memory_db().await;
         let (raw, prefix) = generate_api_key();
-        let key_id = create_merchant(&pool, "m1", &raw, &prefix, None)
-            .await
-            .unwrap();
+        let key_id = create_merchant(&pool, "m1", &raw, &prefix).await.unwrap();
 
         assert_eq!(
             find_merchant_by_key(&pool, &raw).await.unwrap(),
@@ -2098,73 +1405,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_persists_asset_issuer() {
-        let pool = memory_db().await;
-        let usdc = create_payment(
-            &pool,
-            NewPayment {
-                id: "usdc",
-                merchant_id: "m",
-                destination_address: "GGATEWAY",
-                memo: "MEMOUSDC",
-                amount: "5",
-                asset: "USDC",
-                asset_issuer: Some("GUSDC"),
-                webhook_url: None,
-                ttl_secs: 3600,
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(usdc.asset_issuer.as_deref(), Some("GUSDC"));
-
-        let xlm = create_payment(&pool, new_payment("xlm", "MEMOXLM", 3600))
-            .await
-            .unwrap();
-        assert_eq!(xlm.asset_issuer, None);
-    }
-
-    #[tokio::test]
-    async fn backfill_fills_null_issuer_from_allow_list() {
-        let pool = memory_db().await;
-        sqlx::query(
-            "INSERT INTO payments
-                (id, merchant_id, destination_address, memo, amount, asset, status, expires_at)
-             VALUES ('legacy', 'm', 'GGATEWAY', 'MEMOLEG', '5', 'USDC', 'pending',
-                     strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 hour'))",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        backfill_asset_issuers(
-            &pool,
-            &[crate::config::AcceptedAsset {
-                code: "USDC".into(),
-                issuer: Some("GUSDC".into()),
-            }],
-        )
-        .await
-        .unwrap();
-
-        let p = get_payment(&pool, "legacy").await.unwrap().unwrap();
-        assert_eq!(p.asset_issuer.as_deref(), Some("GUSDC"));
-
-        // Already-pinned rows are left alone.
-        backfill_asset_issuers(
-            &pool,
-            &[crate::config::AcceptedAsset {
-                code: "USDC".into(),
-                issuer: Some("GOTHER".into()),
-            }],
-        )
-        .await
-        .unwrap();
-        let p = get_payment(&pool, "legacy").await.unwrap().unwrap();
-        assert_eq!(p.asset_issuer.as_deref(), Some("GUSDC"));
-    }
-
-    #[tokio::test]
     async fn list_pending_excludes_overdue_even_before_sweep() {
         let pool = memory_db().await;
         create_payment(&pool, new_payment("live", "MEMOL", 3600))
@@ -2177,138 +1417,6 @@ mod tests {
         let pending = list_pending(&pool).await.unwrap();
         let ids: Vec<&str> = pending.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, vec!["live"]);
-    }
-
-    // ── Legacy timestamp format (issue #314) ─────────────────────────────────
-
-    /// A row whose `expires_at` was written in the legacy
-    /// `"YYYY-MM-DD HH:MM:SS"` form (space separator, no `Z`) — as produced by
-    /// the old `datetime('now')` default — must not be misread as already
-    /// expired just because it sorts lexically before an RFC 3339 `"…T…Z"`
-    /// string, even when the date it encodes is far in the future.
-    ///
-    /// Writes directly into a table created by [`create_legacy_payments_table`],
-    /// which carries none of the `expires_at` `CHECK` constraints added since
-    /// issue #314 — exactly how a pre-#314 row would already exist on disk
-    /// before an upgrade.
-    async fn seed_legacy_format_expiry(pool: &Db, id: &str, memo: &str, legacy_expires_at: &str) {
-        sqlx::query(
-            "INSERT INTO payments
-                (id, merchant_id, destination_address, memo, amount, asset, status, expires_at)
-             VALUES (?, 'm', 'GGATEWAY', ?, '10', 'XLM', 'pending', ?)",
-        )
-        .bind(id)
-        .bind(memo)
-        .bind(legacy_expires_at)
-        .execute(pool)
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn legacy_format_expiry_far_in_the_future_is_fixed_by_normalisation_and_then_findable() {
-        // Built directly, not via `memory_db()`: the timestamp-normalisation
-        // migration now runs at most once per database (issue #266), so the
-        // legacy row must exist on disk *before* `migrate()` ever runs, the
-        // same way it would on a real upgrade — seeding it after an initial
-        // `migrate()` call would find nothing to normalise and mark the
-        // migration done with the row still unfixed.
-        let pool = SqlitePoolOptions::new()
-            .min_connections(1)
-            .connect_with(SqliteConnectOptions::from_str(&shared_memory_dsn()).unwrap())
-            .await
-            .unwrap();
-        create_legacy_payments_table(&pool).await;
-        // 5 minutes from now, same calendar day in the overwhelming majority
-        // of runs — deliberately *not* a different year or day, since a
-        // different leading date digit would make the row compare greater
-        // regardless of the separator and wouldn't reproduce the bug at all.
-        // The reproduction needs an otherwise-identical date-time prefix so
-        // the single differing byte — ' ' (0x20) vs 'T' (0x54) — is what
-        // decides the (wrong) comparison outcome, exactly as issue #314
-        // describes.
-        let soon = time::OffsetDateTime::now_utc() + time::Duration::minutes(5);
-        let legacy_expires_at = format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            soon.year(),
-            u8::from(soon.month()),
-            soon.day(),
-            soon.hour(),
-            soon.minute(),
-            soon.second()
-        );
-        seed_legacy_format_expiry(&pool, "legacy", "MEMOLEGACY", &legacy_expires_at).await;
-
-        // Before normalisation: the bug this issue describes. A row that will
-        // not expire for 70+ years is invisible to both detection paths.
-        assert!(
-            list_pending(&pool).await.unwrap().is_empty(),
-            "legacy-format row must reproduce the bug before normalisation runs"
-        );
-        assert!(find_pending_by_memo(&pool, "MEMOLEGACY")
-            .await
-            .unwrap()
-            .is_none());
-
-        // migrate() is re-run on every startup and is what applies the
-        // normalisation UPDATE — simulating the next process start.
-        migrate(&pool).await.unwrap();
-
-        let pending = list_pending(&pool).await.unwrap();
-        assert_eq!(
-            pending.len(),
-            1,
-            "row must be detectable after normalisation"
-        );
-        assert_eq!(pending[0].id, "legacy");
-        assert!(pending[0].expires_at.contains('T') && pending[0].expires_at.ends_with('Z'));
-
-        let found = find_pending_by_memo(&pool, "MEMOLEGACY").await.unwrap();
-        assert_eq!(found.map(|p| p.id), Some("legacy".to_string()));
-    }
-
-    /// The companion case: a legacy-format row whose encoded date has already
-    /// passed must still be swept as overdue after normalisation — the fix
-    /// must not accidentally make every legacy row look perpetually fresh.
-    #[tokio::test]
-    async fn legacy_format_expiry_in_the_past_is_still_expired_after_normalisation() {
-        // See the comment on the sibling test above: seeded before the first
-        // `migrate()` call so there is something for that call to normalise.
-        let pool = SqlitePoolOptions::new()
-            .min_connections(1)
-            .connect_with(SqliteConnectOptions::from_str(&shared_memory_dsn()).unwrap())
-            .await
-            .unwrap();
-        create_legacy_payments_table(&pool).await;
-        seed_legacy_format_expiry(&pool, "legacy-dead", "MEMODEAD", "2020-01-01 00:00:00").await;
-
-        migrate(&pool).await.unwrap();
-
-        assert!(list_pending(&pool).await.unwrap().is_empty());
-        let expired = expire_overdue(&pool, 10).await.unwrap();
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].id, "legacy-dead");
-        assert_eq!(expired[0].status, "expired");
-    }
-
-    /// The `CHECK` constraint itself: on a freshly created table (this test's
-    /// `:memory:` database always is one), a write that does not conform to
-    /// the RFC 3339 `Z` format must fail loudly at insert time rather than
-    /// being silently accepted and only caught by the next normalisation pass.
-    #[tokio::test]
-    async fn malformed_expires_at_is_rejected_at_insert_time_on_a_fresh_table() {
-        let pool = memory_db().await;
-        let result = sqlx::query(
-            "INSERT INTO payments
-                (id, merchant_id, destination_address, memo, amount, asset, status, expires_at)
-             VALUES ('bad', 'm', 'GGATEWAY', 'MEMOBAD', '10', 'XLM', 'pending', '2026-04-29 15:00:00')",
-        )
-        .execute(&pool)
-        .await;
-        assert!(
-            result.is_err(),
-            "a space-separated, non-Z timestamp must violate the CHECK constraint"
-        );
     }
 
     #[tokio::test]
@@ -2342,7 +1450,7 @@ mod tests {
             .unwrap()
             .is_none());
 
-        let expired = expire_overdue(&pool, 1).await.unwrap();
+        let expired = expire_overdue(&pool).await.unwrap();
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].id, "partial-dead");
         assert_eq!(expired[0].status, "expired");
@@ -2359,7 +1467,7 @@ mod tests {
             .unwrap();
 
         // First sweep expires exactly the overdue intent and returns it.
-        let expired = expire_overdue(&pool, 10).await.unwrap();
+        let expired = expire_overdue(&pool).await.unwrap();
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].id, "dead");
         assert_eq!(expired[0].status, "expired");
@@ -2374,154 +1482,7 @@ mod tests {
         );
 
         // A second sweep is a no-op — nothing is double-reported.
-        assert_eq!(expire_overdue(&pool, 10).await.unwrap().len(), 0);
-    }
-
-    /// A backlog larger than a single batch must drain across repeated sweeps
-    /// rather than being cut off at the batch size, and each sweep must report
-    /// exactly the rows it transitioned (issue #323).
-    #[tokio::test]
-    async fn expire_overdue_drains_large_backlog_across_batches() {
-        let pool = memory_db().await;
-        let batch = 7;
-        // An arbitrary count comfortably larger than a single batch — this
-        // test exercises the expiry sweeper's own EXPIRY_BATCH_SIZE, not the
-        // retention pruner's batch size, so no relationship to the latter is
-        // implied by this number.
-        let total = 500 + 137;
-        for i in 0..total {
-            create_payment(
-                &pool,
-                new_payment(&format!("backlog{i}"), &format!("MEMOB{i}"), -10),
-            )
-            .await
-            .unwrap();
-        }
-
-        let mut swept = 0i64;
-        while swept < total {
-            let expired = expire_overdue(&pool, batch).await.unwrap();
-            assert!(
-                expired.len() <= batch as usize,
-                "a sweep may not exceed its batch"
-            );
-            for payment in &expired {
-                assert_eq!(payment.status, "expired");
-            }
-            swept += expired.len() as i64;
-        }
-
-        assert_eq!(swept, total, "the whole backlog must eventually drain");
-
-        // Nothing is left over for the next sweep; nothing was double-counted.
-        assert_eq!(expire_overdue(&pool, batch).await.unwrap().len(), 0);
-    }
-
-    /// A payment settled concurrently with the sweep must not be expired (and
-    /// thus cannot be reported as expired) — the settlement's status guard wins
-    /// the race even though the row was selected as overdue first (issue #323).
-    #[tokio::test]
-    async fn concurrent_settlement_beats_overdue_sweep() {
-        let pool = memory_db().await;
-        create_payment(&pool, new_payment("racer", "MEMOR", -10))
-            .await
-            .unwrap();
-        create_payment(&pool, new_payment("swept", "MEMOS", -10))
-            .await
-            .unwrap();
-
-        // "Concurrent" settlement: flip the racer out from under the sweep
-        // between selection and update. `update_payment_status` applies the
-        // same `status IN ('pending','underpaid')` guard as real settlement.
-        assert!(
-            update_payment_status(&pool, "racer", "completed", "TX1", "10")
-                .await
-                .unwrap()
-        );
-
-        let expired = expire_overdue(&pool, 10).await.unwrap();
-        assert_eq!(
-            expired.len(),
-            1,
-            "only the unsettled overdue intent may expire"
-        );
-        assert_eq!(expired[0].id, "swept");
-
-        let racer = get_payment(&pool, "racer").await.unwrap().unwrap();
-        assert_eq!(
-            racer.status, "completed",
-            "settlement must win over the sweep"
-        );
-        let swept = get_payment(&pool, "swept").await.unwrap().unwrap();
-        assert_eq!(swept.status, "expired");
-    }
-
-    /// Verify that the partial composite index for watchable-status queries exists
-    /// (issue #270). This test confirms the index was created successfully during
-    /// database migration and is available for query optimization.
-    #[tokio::test]
-    async fn partial_composite_index_created_for_watchable_queries() {
-        let pool = memory_db().await;
-
-        // Verify the partial composite index exists in sqlite_master
-        let index_exists: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sqlite_master
-             WHERE type = 'index'
-               AND name = 'idx_payments_status_expires_at'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        assert_eq!(
-            index_exists, 1,
-            "idx_payments_status_expires_at index must exist in the database"
-        );
-
-        // Verify the index is on the payments table
-        let index_table: String = sqlx::query_scalar(
-            "SELECT tbl_name FROM sqlite_master
-             WHERE type = 'index'
-               AND name = 'idx_payments_status_expires_at'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        assert_eq!(
-            index_table, "payments",
-            "idx_payments_status_expires_at must be on the payments table"
-        );
-
-        // Create a test payment to verify the index can be used
-        create_payment(&pool, new_payment("test-idx", "MEMOIDX", 3600))
-            .await
-            .unwrap();
-
-        // Verify list_pending successfully retrieves the payment
-        let pending = list_pending(&pool).await.unwrap();
-        assert!(
-            pending.iter().any(|p| p.id == "test-idx"),
-            "list_pending should find the test payment"
-        );
-
-        // Verify expire_overdue works correctly
-        create_payment(&pool, new_payment("test-expire", "MEMOEXP", -10))
-            .await
-            .unwrap();
-
-        let expired = expire_overdue(&pool, 10).await.unwrap();
-        assert!(
-            expired.iter().any(|p| p.id == "test-expire"),
-            "expire_overdue should find and transition the overdue payment"
-        );
-
-        // Verify find_pending_by_memo works correctly
-        let found = find_pending_by_memo(&pool, "MEMOIDX").await.unwrap();
-        assert!(
-            found.is_some(),
-            "find_pending_by_memo should find the pending payment"
-        );
+        assert_eq!(expire_overdue(&pool).await.unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -2570,9 +1531,7 @@ mod tests {
         .await
         .unwrap();
 
-        let candidates = list_redrivable_deliveries(&pool, 8, 0, 0, 0, 0)
-            .await
-            .unwrap();
+        let candidates = list_redrivable_deliveries(&pool, 8, 0, 0, 0).await.unwrap();
         let ids: Vec<&str> = candidates.iter().map(|d| d.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -2619,35 +1578,25 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_backfills_processed_transactions_from_legacy_rows() {
-        // Built directly, not via `memory_db()`: the backfill now runs at
-        // most once per database (issue #266), so the legacy row must exist
-        // on disk before migrate()'s first call, the same way it would on a
-        // real pre-#119 upgrade — see `processed_transactions_backfill_runs_at_most_once`.
-        let pool = SqlitePoolOptions::new()
-            .min_connections(1)
-            .connect_with(SqliteConnectOptions::from_str(&shared_memory_dsn()).unwrap())
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("legacy", "MEMOLEG", 3600))
             .await
             .unwrap();
-        create_legacy_payments_table(&pool).await;
-        // Simulate a pre-#119 underpaid intent: only the latest tx_hash and
-        // the cumulative paid_amount were persisted, no join-table row.
-        sqlx::query(
-            "INSERT INTO payments (id, destination_address, memo, amount, status, tx_hash, paid_amount)
-             VALUES ('legacy', 'GGATEWAY', 'MEMOLEG', '10', 'underpaid', 'TX_OLD', '3')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        // Simulate a pre-#119 underpaid intent: only the latest tx_hash and the
+        // cumulative paid_amount were persisted.
+        update_payment_status(&pool, "legacy", "underpaid", "TX_OLD", "3")
+            .await
+            .unwrap();
+        // The join table is empty until a backfill runs.
+        assert_eq!(sum_processed_stroops(&pool, "legacy").await.unwrap(), 0);
 
-        // The first migrate() call (as on the next startup after upgrade)
-        // backfills the ledger.
+        // A subsequent migrate() (as on the next startup) backfills the ledger.
         migrate(&pool).await.unwrap();
         assert_eq!(
             sum_processed_stroops(&pool, "legacy").await.unwrap(),
             30_000_000
         );
-        // And it is safe to call again — the backfill runs at most once, so
-        // the ledger is not re-summed or duplicated.
+        // And it is idempotent across restarts.
         migrate(&pool).await.unwrap();
         assert_eq!(
             sum_processed_stroops(&pool, "legacy").await.unwrap(),
@@ -2666,92 +1615,18 @@ mod tests {
             .unwrap();
 
         // Freshly inserted, so a large grace window makes it ineligible...
-        assert!(list_redrivable_deliveries(&pool, 8, 3600, 0, 0, 0)
+        assert!(list_redrivable_deliveries(&pool, 8, 3600, 0, 0)
             .await
             .unwrap()
             .is_empty());
         // ...while a zero grace window makes it immediately eligible.
         assert_eq!(
-            list_redrivable_deliveries(&pool, 8, 0, 0, 0, 0)
+            list_redrivable_deliveries(&pool, 8, 0, 0, 0)
                 .await
                 .unwrap()
                 .len(),
             1
         );
-    }
-
-    /// The redrive half of issue #318.
-    ///
-    /// Exponential backoff does not desynchronise a batch that failed
-    /// together: those rows share an `attempts` value and a near-identical
-    /// `last_attempt`, so their next-attempt times coincide and this query
-    /// hands the worker the whole cluster on one pass — which is precisely the
-    /// stampede the backoff was supposed to prevent.
-    ///
-    /// With jitter, each pass admits a random subset instead. 200 co-failing
-    /// rows and a 100-second window: the chance of all 200 clearing a random
-    /// `[0,100]` offset at once is nil, so a full batch means jitter is not
-    /// being applied.
-    #[tokio::test]
-    async fn jitter_desynchronises_a_batch_that_failed_together() {
-        let pool = memory_db().await;
-        create_payment(&pool, new_payment("p1", "MEMOJIT", 3600))
-            .await
-            .unwrap();
-
-        // 200 deliveries, all created and failed at the same instant.
-        for i in 0..200 {
-            let id = format!("sync-{i}");
-            save_webhook_delivery(&pool, &id, "p1", "http://x", "{}", "payment.completed")
-                .await
-                .unwrap();
-        }
-
-        // No jitter: every row clears the zero grace window, so the worker
-        // takes the entire cluster in one pass — the behaviour being fixed.
-        let unjittered = list_redrivable_deliveries(&pool, 8, 0, 0, 0, 0)
-            .await
-            .unwrap();
-        assert_eq!(
-            unjittered.len(),
-            200,
-            "without jitter a co-failing batch moves as one block"
-        );
-
-        // With jitter, each row waits a random extra [0, 100] seconds.
-        let jittered = list_redrivable_deliveries(&pool, 8, 0, 0, 0, 100)
-            .await
-            .unwrap();
-        assert!(
-            jittered.len() < 200,
-            "jitter must spread the batch across passes, but all {} rows were \
-             returned at once",
-            jittered.len()
-        );
-    }
-
-    /// Jitter must only ever *delay* a row, never pull it forward past the
-    /// grace window that keeps the worker off a live `dispatch()`.
-    #[tokio::test]
-    async fn jitter_never_shortens_the_grace_window() {
-        let pool = memory_db().await;
-        create_payment(&pool, new_payment("p1", "MEMOJI2", 3600))
-            .await
-            .unwrap();
-        save_webhook_delivery(&pool, "fresh", "p1", "http://x", "{}", "payment.completed")
-            .await
-            .unwrap();
-
-        for _ in 0..50 {
-            assert!(
-                list_redrivable_deliveries(&pool, 8, 3600, 0, 0, 300)
-                    .await
-                    .unwrap()
-                    .is_empty(),
-                "a row inside its grace window must stay ineligible regardless \
-                 of the jitter draw"
-            );
-        }
     }
 
     #[tokio::test]
@@ -2774,7 +1649,7 @@ mod tests {
         // attempts == 0 (never sent) is gated by grace_secs alone, not the
         // exponential backoff, even with a huge backoff floor configured.
         assert_eq!(
-            list_redrivable_deliveries(&pool, 8, 0, 3600, 3600, 0)
+            list_redrivable_deliveries(&pool, 8, 0, 3600, 3600)
                 .await
                 .unwrap()
                 .len(),
@@ -2798,7 +1673,7 @@ mod tests {
         // One failed attempt (attempts=1): backoff = initial * 2^0 = initial.
         // A huge initial delay makes it ineligible even with grace_secs=0.
         assert!(
-            list_redrivable_deliveries(&pool, 8, 0, 3600, 3600, 0)
+            list_redrivable_deliveries(&pool, 8, 0, 3600, 3600)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2807,118 +1682,11 @@ mod tests {
         // grace_secs is a floor under the backoff: even with backoff disabled
         // (initial=max=0), a large grace_secs still holds the row back.
         assert!(
-            list_redrivable_deliveries(&pool, 8, 3600, 0, 0, 0)
+            list_redrivable_deliveries(&pool, 8, 3600, 0, 0)
                 .await
                 .unwrap()
                 .is_empty(),
             "grace_secs must floor eligibility even when backoff computes to 0"
         );
-    }
-
-    #[tokio::test]
-    async fn list_redrivable_deliveries_caps_attempt_33_at_the_configured_max() {
-        let pool = memory_db().await;
-        create_payment(&pool, new_payment("p1", "MEMOR33", 3600))
-            .await
-            .unwrap();
-        save_webhook_delivery(
-            &pool,
-            "many-failures",
-            "p1",
-            "http://x",
-            "{}",
-            "payment.completed",
-        )
-        .await
-        .unwrap();
-        update_webhook_delivery(&pool, "many-failures", "failed", 33)
-            .await
-            .unwrap();
-
-        // At attempt 33, the uncapped factor is 2^32. With the accepted
-        // one-day extreme, the row must use the 86,400-second cap without
-        // evaluating an overflowing initial * factor product.
-        sqlx::query(
-            "UPDATE webhook_deliveries
-                SET last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ','now','-86399 seconds')
-              WHERE id = 'many-failures'",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        assert!(
-            list_redrivable_deliveries(&pool, 34, 0, 86_400, 86_400, 0)
-                .await
-                .unwrap()
-                .is_empty(),
-            "attempt 33 must remain ineligible until the configured cap elapses"
-        );
-
-        sqlx::query(
-            "UPDATE webhook_deliveries
-                SET last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ','now','-86401 seconds')
-              WHERE id = 'many-failures'",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            list_redrivable_deliveries(&pool, 34, 0, 86_400, 86_400, 0)
-                .await
-                .unwrap()
-                .len(),
-            1,
-            "attempt 33 must become eligible immediately after the cap"
-        );
-    }
-
-    #[test]
-    fn redrive_backoff_exponent_cap_avoids_extreme_products() {
-        assert_eq!(redrive_backoff_exponent_cap(0, 86_400), 0);
-        assert_eq!(redrive_backoff_exponent_cap(86_400, 86_400), 0);
-        assert_eq!(redrive_backoff_exponent_cap(1, 86_400), 17);
-
-        // Even callers that bypass Config cannot make the SQL multiply two
-        // values whose product would exceed SQLite's signed integer range.
-        assert_eq!(redrive_backoff_exponent_cap(1, i64::MAX), 63);
-        assert_eq!(redrive_backoff_exponent_cap(i64::MAX / 2, i64::MAX), 2);
-    }
-
-    // ── file_sizes / sqlite_path (issue: missing DB metrics) ────────────────
-
-    #[test]
-    fn file_sizes_is_none_for_in_memory_database() {
-        let (main, wal, shm) = file_sizes("sqlite::memory:");
-        assert_eq!((main, wal, shm), (None, None, None));
-    }
-
-    #[test]
-    fn file_sizes_reports_the_main_file_and_absent_wal_shm() {
-        let contents = b"pretend sqlite header bytes";
-        let path =
-            std::env::temp_dir().join(format!("stellargate-metrics-test-{}", uuid::Uuid::new_v4()));
-        std::fs::write(&path, contents).unwrap();
-
-        let url = format!("sqlite:{}", path.display());
-        let (main, wal, shm) = file_sizes(&url);
-        assert_eq!(
-            main,
-            Some(contents.len() as u64),
-            "main file size must be reported"
-        );
-        assert_eq!(wal, None, "no -wal file exists yet");
-        assert_eq!(shm, None, "no -shm file exists yet");
-
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn file_sizes_strips_query_parameters_before_stat() {
-        // The shared-memory DSN other tests in this module use
-        // (`sqlite:file:<uuid>?mode=memory&cache=shared`) has no on-disk
-        // file, but must not panic or attempt to stat a path still carrying
-        // its `?mode=...` query string.
-        let (main, wal, shm) = file_sizes(&shared_memory_dsn());
-        assert_eq!((main, wal, shm), (None, None, None));
     }
 }

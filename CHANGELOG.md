@@ -324,6 +324,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`payments.asset_issuer`.** An intent recorded only the asset *code*, so
+  which USDC it was priced in lived in process configuration and changed
+  retroactively whenever `ACCEPTED_ASSETS` was edited — historical rows could
+  not be audited or reconciled against an external ledger, and a webhook saying
+  `"asset": "USDC"` did not tell the receiver which USDC. The issuer is now
+  persisted alongside the code and exposed in `GET /payments/:id` and every
+  webhook payload (`null` for the native asset). Settlement matches against the
+  issuer recorded on the intent rather than today's configuration. Rows created
+  before the column existed are backfilled once from the configured allow-list,
+  best-effort — the issuer they were priced in was never recorded (issue #223).
+- **`POLL_MAX_PAGES_PER_CYCLE`.** Bounds how many Horizon pages one poll cycle
+  walks before yielding to the next tick, so a large catch-up cannot monopolise
+  the poller task indefinitely. `0` restores the previous unlimited behaviour
+  (issue #226).
+- Prometheus counter `stellargate_horizon_records_skipped_total`, tracking
+  Horizon records the reconciler refused to credit (issue #224).
 - **`GET /payments/:id/webhooks` now paginates like the payments listing.**
   The endpoint previously serialised every delivery row for a payment with no
   `LIMIT`, so a payment with unbounded delivery activity (see issue #233) grew
@@ -414,6 +430,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Horizon records with no `transaction_hash` are no longer credited.** A
+  missing hash was defaulted to the empty string and used as half of the
+  `processed_transactions` primary key, so two different unhashed transactions
+  looked like the same one and the second was silently discarded as "already
+  credited" — money on chain, never credited to the merchant. Such a record is
+  now skipped, counted and logged instead; the poller re-sees it on the next
+  cycle, so skipping is self-healing. The schema rejects an empty `tx_hash`
+  outright, and rows written before the fix are reported at startup rather than
+  deleted (issue #224).
+- **The poller observes shutdown mid-catch-up.** `poll_once` looped over
+  Horizon pages until caught up without ever checking the shutdown signal, so
+  `SIGTERM` during a long backlog drain was ignored until the backlog finished
+  or the 30 s shutdown grace killed the task mid-page — which replayed that page
+  on the next boot and made the next shutdown worse. The signal is now checked
+  at every page boundary, immediately after the cursor is checkpointed
+  (issue #226).
+- **The stream listener resumes from a persisted cursor.** It hard-coded
+  `cursor=now` on every process start, so payments that landed while the
+  process was down were invisible to the stream and recoverable only by the
+  poller — whose own catch-up is slower, and which is disabled entirely in a
+  poll-less configuration. The stream now resumes from its own persisted cursor
+  (falling back to the poller's, then to the live edge), under a separate
+  `kv_state` key so the two cursors never overwrite one another (issue #228).
 - **`GET /payments` offset pages now order rows exactly like cursor pages.**
   The offset query sorted by `created_at DESC` alone while the keyset query
   broke whole-second `created_at` ties on `id DESC`, so a `next_cursor` minted

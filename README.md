@@ -118,6 +118,10 @@ tests/             Integration tests (API, concurrency, rate limits, webhooks, t
 
 **Two independent listeners** run concurrently. The SSE stream gives near-real-time settlement; the interval poller re-scans from a persisted cursor and acts as a reconciler for anything missed during a reconnect. Both converge on the same idempotent settlement path, so a payment observed twice settles once.
 
+**Both listeners resume from a persisted cursor across restarts**, under separate `kv_state` keys (`horizon_stream_cursor` and `horizon_payment_cursor`) so neither drags the other backwards. A deploy therefore does not cost the stream its ~1 s settlement latency: it reconnects from the last event it handled and works forward through whatever landed while the process was down, rather than re-baselining at the live edge and leaving the gap to the poller. Only a genuinely fresh database — no cursor under either key — starts at the live edge. Re-seeing records the other listener already handled is harmless; settlement is idempotent through `processed_transactions`.
+
+**Shutdown is observed mid-catch-up.** A poll cycle checks the shutdown signal at every page boundary, right after it checkpoints its cursor, so `SIGTERM` during a long backlog drain is honoured in one page rather than after the whole backlog (or, worse, by being killed mid-page once the 30 s shutdown grace expires). `POLL_MAX_PAGES_PER_CYCLE` bounds a single cycle for the same reason.
+
 ### Tech Stack
 
 | Layer | Choice |
@@ -348,6 +352,7 @@ XLM free to cover one per asset.
 | `STELLAR_LISTENER_MODE` | `stream` (SSE + poller reconciler) or `poll` (interval only) | `stream` |
 | `POLL_INTERVAL_SECS` | How often the poller reconciles | `10` |
 | `CURSOR_STALENESS_MULTIPLE` | Multiplier on `POLL_INTERVAL_SECS` that may elapse without a successful poll/stream event before `/ready` reports the detection cursor stale (`503`). A healthy poller cycles on the poll interval, so this only trips when the poller died or the stream wedged. | `3` |
+| `POLL_MAX_PAGES_PER_CYCLE` | Maximum Horizon pages (200 records each) one poll cycle walks before yielding to the next tick. Bounds how long a catch-up can monopolise the poller; the cursor is checkpointed at every page boundary, so the next cycle resumes exactly where this one stopped. `0` = unlimited. | `50` |
 | `PAYMENT_TTL_SECS` | How long an intent stays `pending` before expiring, from `created_at` | `3600` |
 | `EXPIRY_BATCH_SIZE` | Maximum overdue intents the expiry sweeper transitions per sweep | `500` |
 
@@ -868,7 +873,7 @@ Create a payment intent. Requires a merchant API key; the merchant is taken from
 | Field | Type | Required | Constraints |
 |---|---|---|---|
 | `amount` | string | ✅ | Positive decimal, ≤ 7 decimal places |
-| `asset` | string | ❌ | Must be in `ACCEPTED_ASSETS`. Defaults to `XLM`. |
+| `asset` | string | ❌ | Must be in `ACCEPTED_ASSETS`. Defaults to `XLM`. The issuer configured for that code is resolved at creation time and returned as `asset_issuer`; it is not accepted in the request. |
 | `webhook_url` | string | ❌ | ≤ 2048 chars; scheme must be allowed; HTTPS required on `public`; SSRF-checked |
 
 Any other field is rejected with `400` `unknown_field` — see [Error
@@ -1602,6 +1607,7 @@ Schema is applied at startup by `db::migrate` in [`src/db.rs`](src/db.rs), calle
 - Tables and indexes are created with `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`.
 - New columns on existing tables are added by probing `pragma_table_info(...)` first, then `ALTER TABLE ... ADD COLUMN`.
 - A few one-time data backfills (populating `processed_transactions` from legacy rows, filling `asset_issuer` from `ACCEPTED_ASSETS`, normalising pre-RFC 3339 timestamps) run alongside them.
+- `payments.asset_issuer` is the one backfill that does *not* run on every boot: it reconstructs the issuer of pre-existing rows from the configured allow-list, so re-running it after an `ACCEPTED_ASSETS` edit would rewrite history a second time. It runs once per database, guarded by a `kv_state` marker, from `db::backfill_asset_issuers` — and rows created before it are best-effort by nature, since the issuer they were priced in was never recorded.
 
 Every statement is written to be safe to re-run, because **all of them run on every boot**. There is no version table, nothing is recorded as applied, and the whole sequence is not wrapped in a transaction.
 
