@@ -27,6 +27,11 @@ ignore = [
     # advisory scanners, which read the lockfile) purely as an optional,
     # unbuilt transitive dependency.
     #
+    # Triage (2026-08-26): rsa 0.9.10 still present in Cargo.lock. No fixed
+    # release published upstream; RUSTSEC-2023-0071 remains open. sqlx has not
+    # removed the MySQL backend from resolution. StellarGate enables the
+    # `sqlite` feature only — the vulnerable code is unreachable.
+    #
     # Removal condition — drop this ignore as soon as ANY of these holds:
     #   1. A fixed `rsa` release is published (track RustSec advisory
     #      RUSTSEC-2023-0071 and https://github.com/RustCrypto/RSA/issues/19).
@@ -35,9 +40,9 @@ ignore = [
     #   3. StellarGate begins enabling sqlx's MySQL backend — in which case the
     #      code IS reachable and this must become a real fix, not an ignore.
     #
-    # Review by: 2026-10-22 (quarterly). Tracking issue: StellarGateLabs#154.
+    # Review by: 2027-01-01 (next quarterly). Tracking issue: StellarGateLabs#154.
     # Keep in sync with the `--ignore` flag in supply-chain.yml.
-    { id = "RUSTSEC-2023-0071", reason = "rsa reachable only via sqlx's unenabled MySQL backend; no fixed release yet. Remove when fixed/removed upstream. Review by 2026-10-22. See StellarGateLabs#154." },
+    { id = "RUSTSEC-2023-0071", reason = "rsa reachable only via sqlx's unenabled MySQL backend; no fixed release yet. Remove when fixed/removed upstream. Review by 2027-01-01. See StellarGateLabs#154." },
 ]
 
 # ── Licenses ──────────────────────────────────────────────────────────────────
@@ -76,7 +81,7 @@ multiple-versions = "deny"
 # Wildcard ("*") version requirements are allowed for now.
 wildcards = "allow"
 
-# Known duplicate versions as of 2026-08-20. Every entry below is a
+# Known duplicate versions as of 2026-08-26. Every entry below is a
 # transitively-forced version split that cannot be resolved without waiting for
 # upstream crates to unify on a single major. They are listed here so that
 # `multiple-versions = "deny"` above rejects any *new* unregistered duplicate
@@ -89,16 +94,24 @@ wildcards = "allow"
 # rand 0.8 required by sqlx; 0.9 by governor; 0.10 by newer transitive deps.
 # Collapse when sqlx and governor align on a single rand major.
 name = "rand"
-version = "=0.8.6"
+version = "=0.8.7"
 
 [[bans.skip]]
 name = "rand"
 version = "=0.9.5"
 
 [[bans.skip]]
+name = "rand"
+version = "=0.10.2"
+
+[[bans.skip]]
 # rand_chacha splits alongside rand majors.
 name = "rand_chacha"
 version = "=0.3.1"
+
+[[bans.skip]]
+name = "rand_chacha"
+version = "=0.9.0"
 
 [[bans.skip]]
 # rand_core splits alongside rand majors.
@@ -108,6 +121,10 @@ version = "=0.6.4"
 [[bans.skip]]
 name = "rand_core"
 version = "=0.9.5"
+
+[[bans.skip]]
+name = "rand_core"
+version = "=0.10.1"
 
 [[bans.skip]]
 # sha2 0.10 / digest 0.10 required by sqlx and hmac 0.12;
@@ -121,6 +138,10 @@ name = "digest"
 version = "=0.10.7"
 
 [[bans.skip]]
+name = "digest"
+version = "=0.11.3"
+
+[[bans.skip]]
 # hmac 0.12 required by sqlx; 0.13 required by our direct dep (webhooks).
 name = "hmac"
 version = "=0.12.1"
@@ -131,9 +152,35 @@ name = "crypto-common"
 version = "=0.1.7"
 
 [[bans.skip]]
+name = "crypto-common"
+version = "=0.2.2"
+
+[[bans.skip]]
 # block-buffer splits alongside the RustCrypto digest/sha2 version bump.
 name = "block-buffer"
 version = "=0.10.4"
+
+[[bans.skip]]
+name = "block-buffer"
+version = "=0.12.1"
+
+[[bans.skip]]
+# const-oid splits across the RustCrypto version bump.
+name = "const-oid"
+version = "=0.9.6"
+
+[[bans.skip]]
+name = "const-oid"
+version = "=0.10.2"
+
+[[bans.skip]]
+# cpufeatures splits across the RustCrypto version bump.
+name = "cpufeatures"
+version = "=0.2.17"
+
+[[bans.skip]]
+name = "cpufeatures"
+version = "=0.3.0"
 
 [[bans.skip]]
 # tower-http 0.6 required by axum 0.7; 0.7 is pulled by a newer transitive dep.
@@ -152,6 +199,10 @@ name = "getrandom"
 version = "=0.3.4"
 
 [[bans.skip]]
+name = "getrandom"
+version = "=0.4.3"
+
+[[bans.skip]]
 # hashbrown splits across multiple collections/indexmap majors.
 name = "hashbrown"
 version = "=0.14.5"
@@ -161,19 +212,13 @@ name = "hashbrown"
 version = "=0.15.5"
 
 [[bans.skip]]
+name = "hashbrown"
+version = "=0.17.1"
+
+[[bans.skip]]
 # http 0.2 required by older tower/hyper chain; 1.x by newer axum/hyper stack.
 name = "http"
 version = "=0.2.12"
-
-[[bans.skip]]
-# const-oid splits across the RustCrypto version bump.
-name = "const-oid"
-version = "=0.9.6"
-
-[[bans.skip]]
-# cpufeatures splits across the RustCrypto version bump.
-name = "cpufeatures"
-version = "=0.2.17"
 
 [[bans.skip]]
 # r-efi splits between two platform-abstraction crate generations.
@@ -181,15 +226,27 @@ name = "r-efi"
 version = "=5.3.0"
 
 [[bans.skip]]
+name = "r-efi"
+version = "=6.0.0"
+
+[[bans.skip]]
 # redox_syscall splits between older/newer Redox platform crates.
 name = "redox_syscall"
 version = "=0.5.18"
 
 [[bans.skip]]
+name = "redox_syscall"
+version = "=0.9.3"
+
+[[bans.skip]]
 # syn 2 and 3 coexist due to different proc-macro crates being at different
 # migration stages. Collapse when all proc-macro deps unify on syn 3.
 name = "syn"
-version = "=2.0.117"
+version = "=2.0.119"
+
+[[bans.skip]]
+name = "syn"
+version = "=3.0.3"
 
 [[bans.skip]]
 # thiserror 1.x required by older deps; 2.x by newer ones.
@@ -215,37 +272,77 @@ name = "windows-sys"
 version = "=0.52.0"
 
 [[bans.skip]]
+name = "windows-sys"
+version = "=0.61.2"
+
+[[bans.skip]]
 # windows-targets and windows_* arch crates split alongside windows-sys.
 name = "windows-targets"
 version = "=0.48.5"
+
+[[bans.skip]]
+name = "windows-targets"
+version = "=0.52.6"
 
 [[bans.skip]]
 name = "windows_aarch64_gnullvm"
 version = "=0.48.5"
 
 [[bans.skip]]
+name = "windows_aarch64_gnullvm"
+version = "=0.52.6"
+
+[[bans.skip]]
 name = "windows_aarch64_msvc"
 version = "=0.48.5"
+
+[[bans.skip]]
+name = "windows_aarch64_msvc"
+version = "=0.52.6"
 
 [[bans.skip]]
 name = "windows_i686_gnu"
 version = "=0.48.5"
 
 [[bans.skip]]
+name = "windows_i686_gnu"
+version = "=0.52.6"
+
+[[bans.skip]]
+name = "windows_i686_gnullvm"
+version = "=0.52.6"
+
+[[bans.skip]]
 name = "windows_i686_msvc"
 version = "=0.48.5"
+
+[[bans.skip]]
+name = "windows_i686_msvc"
+version = "=0.52.6"
 
 [[bans.skip]]
 name = "windows_x86_64_gnu"
 version = "=0.48.5"
 
 [[bans.skip]]
+name = "windows_x86_64_gnu"
+version = "=0.52.6"
+
+[[bans.skip]]
 name = "windows_x86_64_gnullvm"
 version = "=0.48.5"
 
 [[bans.skip]]
+name = "windows_x86_64_gnullvm"
+version = "=0.52.6"
+
+[[bans.skip]]
 name = "windows_x86_64_msvc"
 version = "=0.48.5"
+
+[[bans.skip]]
+name = "windows_x86_64_msvc"
+version = "=0.52.6"
 
 [[bans.skip]]
 # wit-bindgen splits between wasmtime generations pulled by different deps.

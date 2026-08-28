@@ -20,8 +20,6 @@
 //! small tolerance window. See the README "Verifying webhooks" section for the
 //! verification recipe and recommended window.
 
-use crate::config::WebhookPayloadDetail;
-use crate::supervise::TaskExit;
 use crate::{db, AppState};
 // `KeyInit` provides `new_from_slice`; it moved off `Mac` in hmac 0.13.
 use hmac::{Hmac, KeyInit, Mac};
@@ -30,10 +28,33 @@ use sha2::Sha256;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{watch, Semaphore};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Redact a webhook URL for logging: keep scheme and host so a target is
+/// still identifiable, but drop the path and query string entirely.
+///
+/// Webhook URLs commonly embed capability tokens in the path or query string
+/// (e.g. `https://hooks.example.com/t/SecretToken`). Logging the full URL
+/// copies that credential into every log sink and aggregator (issue #240).
+///
+/// ```text
+/// https://hooks.example.com/t/Secret?sig=abc  →  https://hooks.example.com/…
+/// https://example.com/                         →  https://example.com
+/// <unparseable input>                          →  <unparseable>
+/// ```
+pub fn redact_url(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(u) => {
+            let host = u.host_str().unwrap_or("?");
+            let suffix = if u.path() == "/" { "" } else { "/\u{2026}" };
+            format!("{}://{}{}", u.scheme(), host, suffix)
+        }
+        Err(_) => "<unparseable>".into(),
+    }
+}
 
 /// Compute the hex-encoded HMAC-SHA256 signature for a webhook, binding it to
 /// `timestamp` by signing the Stripe-style payload `"{timestamp}.{body}"`.
@@ -68,66 +89,45 @@ pub(crate) fn current_timestamp() -> i64 {
 ///
 /// `delta` carries the absolute difference between the requested and received
 /// amounts, and is included in the payload for `payment.overpaid` (excess to
-/// refund) and `payment.underpaid` (shortfall still owed) events — but only
-/// under [`WebhookPayloadDetail::Full`]; see below.
+/// refund) and `payment.underpaid` (shortfall still owed) events.
 ///
 /// Amounts are canonicalized to ensure consistent serialization: "10.00", "10.0",
 /// and "10" all serialize as "10". This handles both new payments (already
 /// canonicalized on write) and any legacy data.
-///
-/// `detail` controls how much the body carries (issue #306):
-///
-/// - [`WebhookPayloadDetail::Minimal`] (the default): `event`, `payment_id`,
-///   `status`, and `updated_at`. Enough to know *that* something happened and
-///   to look it up; a receiver that needs the rest already has an API key and
-///   can call `GET /v1/payments/:id`.
-/// - [`WebhookPayloadDetail::Full`]: the above, plus `merchant_id`, `amount`,
-///   `paid_amount`, `asset`, `asset_issuer`, `tx_hash`, and (when present)
-///   `delta`.
-///
-/// `merchant_id` and the amounts are the fields withheld by default:
-/// `merchant_id` is a tenant identifier the receiver already knows (it's
-/// *their* id), so it adds nothing for a legitimate recipient while making an
-/// intercepted payload immediately attributable, and the same reasoning
-/// applies to transaction size. HMAC signing proves the payload is authentic;
-/// it says nothing about who else could read it in transit.
-pub fn build_payload(
-    payment: &db::Payment,
-    event: &str,
-    delta: Option<&str>,
-    detail: WebhookPayloadDetail,
-) -> serde_json::Value {
+pub fn build_payload(payment: &db::Payment, event: &str, delta: Option<&str>) -> serde_json::Value {
+    // Canonicalize the requested amount
+    let canonical_amount = crate::money::parse_stroops(&payment.amount)
+        .map(crate::money::stroops_to_string)
+        .unwrap_or_else(|| payment.amount.clone());
+
+    // Canonicalize the received amount
+    let canonical_paid_amount = payment
+        .paid_amount
+        .as_ref()
+        .and_then(|pa| crate::money::parse_stroops(pa).map(crate::money::stroops_to_string));
+
+    // Canonicalize delta if present (it's a price difference)
+    let canonical_delta =
+        delta.and_then(|d| crate::money::parse_stroops(d).map(crate::money::stroops_to_string));
+
     let mut payload = json!({
         "event": event,
         "payment_id": payment.id,
+        "merchant_id": payment.merchant_id,
+        "tx_hash": payment.tx_hash,
+        "amount": canonical_amount,
+        "paid_amount": canonical_paid_amount,
+        "asset": payment.asset,
+        /* The code alone does not identify a Stellar asset — a receiver
+        integrating two gateways cannot tell which USDC "USDC" means. Send the
+        issuer the intent was priced in alongside it; `null` for the native
+        asset, which has no issuer (issue #223). */
+        "asset_issuer": payment.asset_issuer,
         "status": payment.status,
-        "updated_at": payment.updated_at,
     });
-
-    if detail == WebhookPayloadDetail::Full {
-        // Canonicalize amounts to ensure consistent serialization: "10.00",
-        // "10.0", and "10" all serialize as "10".
-        let canonical_amount = crate::money::parse_stroops(&payment.amount)
-            .map(crate::money::stroops_to_string)
-            .unwrap_or_else(|| payment.amount.clone());
-        let canonical_paid_amount = payment
-            .paid_amount
-            .as_ref()
-            .and_then(|pa| crate::money::parse_stroops(pa).map(crate::money::stroops_to_string));
-        let canonical_delta =
-            delta.and_then(|d| crate::money::parse_stroops(d).map(crate::money::stroops_to_string));
-
-        payload["merchant_id"] = json!(payment.merchant_id);
-        payload["tx_hash"] = json!(payment.tx_hash);
-        payload["amount"] = json!(canonical_amount);
-        payload["paid_amount"] = json!(canonical_paid_amount);
-        payload["asset"] = json!(payment.asset);
-        payload["asset_issuer"] = json!(payment.asset_issuer);
-        if let Some(d) = canonical_delta {
-            payload["delta"] = json!(d);
-        }
+    if let Some(d) = canonical_delta {
+        payload["delta"] = json!(d);
     }
-
     payload
 }
 
@@ -149,7 +149,7 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
         return;
     };
 
-    let payload = build_payload(payment, event, delta, state.config.webhook_payload_detail);
+    let payload = build_payload(payment, event, delta);
     let body = match serde_json::to_vec(&payload) {
         Ok(b) => b,
         Err(e) => {
@@ -171,24 +171,13 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
     )
     .await
     {
-        /* A durable delivery row is a precondition for the send. Continuing
-        after a save failure POSTs a signed event with no audit row, no
-        redrive path, and silent no-op updates (issue #234). Settlement is
-        already committed, so skipping the send is recoverable — but only if
-        the failure is visible. */
-        error!(
-            payment_id = %payment.id,
-            error = %e,
-            "could not record webhook delivery; not sending"
-        );
-        state.webhook_metrics.record_failed();
-        return;
+        warn!(error = %e, "failed to record webhook delivery");
     }
 
     let client = match safe_client(state, &url).await {
         Ok(c) => c,
         Err(e) => {
-            warn!(payment_id = %payment.id, %url, error = %e, "webhook blocked by SSRF guard");
+            warn!(payment_id = %payment.id, url = %redact_url(&url), error = %e, "webhook blocked by SSRF guard");
             /* This is a terminal failure and must be counted like one. It was
             not, so an entire class of permanent failure — a target that
             resolves into a blocked range — was invisible to
@@ -207,8 +196,7 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
     };
 
     let attempts = state.config.webhook_retry_attempts.max(1);
-    let base_delay = Duration::from_millis(state.config.webhook_retry_delay_ms);
-    let max_delay = Duration::from_millis(state.config.webhook_retry_max_delay_ms);
+    let delay = Duration::from_millis(state.config.webhook_retry_delay_ms);
     let start = Instant::now();
 
     for attempt in 1..=attempts {
@@ -229,7 +217,7 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
 
         match result {
             Ok(resp) if resp.status().is_success() => {
-                info!(payment_id = %payment.id, %url, attempt, "webhook delivered");
+                info!(payment_id = %payment.id, url = %redact_url(&url), attempt, "webhook delivered");
                 state.webhook_metrics.record_delivered();
                 state
                     .webhook_metrics
@@ -252,68 +240,16 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
         }
 
         if attempt < attempts {
-            tokio::time::sleep(retry_delay(attempt, base_delay, max_delay)).await;
+            tokio::time::sleep(delay).await;
         }
     }
 
-    warn!(payment_id = %payment.id, %url, "webhook delivery exhausted all retries");
+    warn!(payment_id = %payment.id, url = %redact_url(&url), "webhook delivery exhausted all retries");
     state.webhook_metrics.record_failed();
     state
         .webhook_metrics
         .record_latency_ms(start.elapsed().as_millis() as u64);
     let _ = db::update_webhook_delivery(&state.pool, &delivery_id, "failed", attempts as i64).await;
-}
-
-/// How long to wait before inline retry `attempt + 1`, given the configured
-/// base and cap.
-///
-/// Two properties, and the issue needs both (#318).
-///
-/// **Growth.** `base * 2^(attempt-1)`, capped at `max`. A constant delay meant
-/// a receiver returning 503 for two minutes saw, per delivery, three attempts
-/// at `t`, `t+5s`, `t+10s` — and across a settlement burst of N payments, `3N`
-/// requests arriving in three tight clusters, precisely while the receiver was
-/// least able to absorb them.
-///
-/// **Jitter**, because growth alone does not desynchronise anything. Deliveries
-/// that fail together share an attempt number, so a purely exponential schedule
-/// puts their next attempts at the same instant — the same lockstep, just
-/// further apart.
-///
-/// This is *equal* jitter — uniform in `[ceiling/2, ceiling]` — rather than the
-/// more common full jitter over `[0, ceiling]`. Full jitter can return a
-/// near-zero delay, and this service already treats that as a misconfiguration:
-/// `WEBHOOK_RETRY_DELAY_MS == 0` with retries enabled is rejected at boot
-/// because "a zero delay causes retry bursts that hammer the target endpoint".
-/// Equal jitter keeps a guaranteed floor under every retry while still spreading
-/// a co-failing batch across half the window.
-pub fn retry_delay(attempt: u32, base: Duration, max: Duration) -> Duration {
-    /* `2^(attempt-1)`, saturating rather than wrapping: a large
-    WEBHOOK_RETRY_ATTEMPTS must clamp to `max`, not overflow to a tiny delay. */
-    let factor = 2u32.saturating_pow(attempt.saturating_sub(1));
-    let ceiling = base.saturating_mul(factor).min(max);
-
-    let ceiling_ms = ceiling.as_millis() as u64;
-    if ceiling_ms == 0 {
-        return Duration::ZERO;
-    }
-    let half = ceiling_ms / 2;
-    Duration::from_millis(half + rand::random_range(0..=(ceiling_ms - half)))
-}
-
-/// The `attempts` value to record for a delivery the SSRF guard blocked.
-///
-/// `list_redrivable_deliveries` selects rows where `status IN ('pending',
-/// 'failed') AND attempts < max_attempts` — so `status = "failed"` alone does
-/// not remove a row from consideration; only `attempts` reaching the redrive
-/// cap does. A blocked delivery makes no network attempt, so there is no
-/// natural attempt count to record, but leaving it at its prior value (often
-/// `0`) left `attempts < max_attempts` permanently true: the redrive worker
-/// would pick the same blocked delivery back up on every subsequent pass —
-/// forever, and double-counting the terminal-failure metric each time it did.
-/// Recording the cap itself is what actually makes the row terminal.
-fn blocked_delivery_attempts(state: &AppState) -> i64 {
-    state.config.webhook_redrive_max_attempts as i64
 }
 
 /// Resolve and SSRF-check `url`, returning a client pinned to the validated
@@ -346,7 +282,6 @@ pub async fn redrive_once(state: &Arc<AppState>) -> usize {
         state.config.webhook_redrive_grace_secs,
         state.config.webhook_redrive_backoff_initial_secs,
         state.config.webhook_redrive_backoff_max_secs,
-        state.config.webhook_redrive_jitter_secs,
     )
     .await
     {
@@ -396,7 +331,7 @@ async fn redrive_one(state: &Arc<AppState>, delivery: db::WebhookDelivery) {
     let client = match safe_client(state, &delivery.url).await {
         Ok(c) => c,
         Err(e) => {
-            warn!(delivery_id = %delivery.id, url = %delivery.url, error = %e, "redrive blocked by SSRF guard");
+            warn!(delivery_id = %delivery.id, url = %redact_url(&delivery.url), error = %e, "redrive blocked by SSRF guard");
             // Terminal, so counted — same gap as the inline path above.
             state.webhook_metrics.record_failed();
             let _ = db::update_webhook_delivery(
@@ -470,10 +405,7 @@ async fn redrive_one(state: &Arc<AppState>, delivery: db::WebhookDelivery) {
 /// the process shuts down. Runs one pass immediately on startup — before the
 /// first sleep — so a restart repairs any deliveries left `pending`/`failed`
 /// by the previous process without waiting a full interval.
-pub async fn run_redrive_worker(
-    state: Arc<AppState>,
-    mut shutdown: watch::Receiver<bool>,
-) -> TaskExit {
+pub async fn run_redrive_worker(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     let interval = Duration::from_secs(state.config.webhook_redrive_interval_secs.max(1));
     info!(
         interval_secs = state.config.webhook_redrive_interval_secs,
@@ -490,7 +422,7 @@ pub async fn run_redrive_worker(
             _ = tokio::time::sleep(interval) => {}
             _ = shutdown.changed() => {
                 info!("webhook redrive worker shutting down");
-                return TaskExit::ShutdownRequested;
+                return;
             }
         }
     }
@@ -500,7 +432,74 @@ pub async fn run_redrive_worker(
 mod tests {
     use super::*;
 
-    // ── Inline retry backoff and jitter (issue #318) ─────────────────────────
+    // ── Panic-risk audit (#433) ───────────────────────────────────────────────
+    //
+    // Two `.unwrap()` calls remain in this test module:
+    //
+    // * `serde_json::to_vec(&payload).unwrap()` — test assertion: the only way
+    //   `to_vec` can fail is if the value contains a non-serialisable type (e.g.
+    //   a map with non-string keys). `serde_json::Value` produced by the `json!`
+    //   macro is always serialisable; a failure here is a bug in the test
+    //   fixture, not a recoverable error.
+    // * `String::from_utf8(body).unwrap()` — `serde_json::to_vec` always emits
+    //   valid UTF-8, so this is infallible for any body that `to_vec` produced.
+    //
+    // Neither pattern appears in production code paths.
+
+    // ── redact_url (issue #240) ───────────────────────────────────────────────
+
+    /// The path and query string — the most common location for capability
+    /// tokens in signed-URL webhook endpoints — must not appear in the
+    /// redacted form.
+    #[test]
+    fn redact_url_strips_path_and_query() {
+        let raw = "https://hooks.example.com/t/AbCdEfSecretToken?sig=abc123&ts=1700000000";
+        let redacted = redact_url(raw);
+        assert!(
+            !redacted.contains("AbCdEfSecretToken"),
+            "path secret must not appear in redacted URL: {redacted}"
+        );
+        assert!(
+            !redacted.contains("sig=abc123"),
+            "query secret must not appear in redacted URL: {redacted}"
+        );
+        assert!(
+            redacted.contains("hooks.example.com"),
+            "host must be preserved for debugging: {redacted}"
+        );
+        assert!(
+            redacted.starts_with("https://"),
+            "scheme must be preserved: {redacted}"
+        );
+    }
+
+    #[test]
+    fn redact_url_root_path_produces_no_ellipsis() {
+        // A URL with no path beyond "/" is identified by scheme+host alone —
+        // adding "/…" would imply a path was omitted when there isn't one.
+        let redacted = redact_url("https://example.com/");
+        assert_eq!(redacted, "https://example.com");
+    }
+
+    #[test]
+    fn redact_url_non_root_path_appends_ellipsis() {
+        let redacted = redact_url("https://example.com/webhooks/stellar");
+        assert_eq!(redacted, "https://example.com/\u{2026}");
+        assert!(!redacted.contains("stellar"), "path must be dropped");
+    }
+
+    #[test]
+    fn redact_url_unparseable_returns_placeholder() {
+        assert_eq!(redact_url("not a url at all"), "<unparseable>");
+        assert_eq!(redact_url(""), "<unparseable>");
+    }
+
+    #[test]
+    fn redact_url_preserves_http_scheme() {
+        let redacted = redact_url("http://dev.example.com/hook/secret");
+        assert!(redacted.starts_with("http://"), "http scheme must be kept");
+        assert!(!redacted.contains("secret"), "path secret must be stripped");
+    }
 
     const BASE: Duration = Duration::from_millis(1_000);
     const MAX: Duration = Duration::from_millis(30_000);
@@ -634,6 +633,7 @@ mod tests {
             memo: "ABCD1234".into(),
             amount: "10".into(),
             asset: "XLM".into(),
+            asset_issuer: None,
             status: "completed".into(),
             tx_hash: Some("txhash".into()),
             paid_amount: Some("10".into()),
@@ -641,7 +641,6 @@ mod tests {
             created_at: "2026-01-01T00:00:00".into(),
             updated_at: "2026-01-01T00:00:01".into(),
             expires_at: "2026-01-01T01:00:00".into(),
-            asset_issuer: None,
         };
 
         for event in &[
@@ -650,7 +649,7 @@ mod tests {
             "payment.underpaid",
             "payment.expired",
         ] {
-            let payload = build_payload(&payment, event, None, WebhookPayloadDetail::Full);
+            let payload = build_payload(&payment, event, None);
             assert_eq!(
                 payload["event"].as_str(),
                 Some(*event),
@@ -667,92 +666,5 @@ mod tests {
                 "serialised body must contain the event string (event={event})"
             );
         }
-    }
-
-    // ── Payload minimisation (issue #306) ────────────────────────────────────
-
-    fn sample_payment() -> db::Payment {
-        db::Payment {
-            id: "pay_1".into(),
-            merchant_id: "merchant_1".into(),
-            destination_address: "GDESTINATION".into(),
-            memo: "ABCD1234".into(),
-            amount: "10".into(),
-            asset: "XLM".into(),
-            status: "completed".into(),
-            tx_hash: Some("txhash".into()),
-            paid_amount: Some("10".into()),
-            webhook_url: None,
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:01Z".into(),
-            expires_at: "2026-01-01T01:00:00Z".into(),
-            asset_issuer: None,
-        }
-    }
-
-    /// The default (`Minimal`) payload must carry only what's needed to know
-    /// something happened and look it up — no tenant or financial detail.
-    #[test]
-    fn build_payload_minimal_omits_tenant_and_financial_detail() {
-        let payment = sample_payment();
-        let payload = build_payload(
-            &payment,
-            "payment.completed",
-            Some("5"),
-            WebhookPayloadDetail::Minimal,
-        );
-
-        assert_eq!(payload["event"], "payment.completed");
-        assert_eq!(payload["payment_id"], "pay_1");
-        assert_eq!(payload["status"], "completed");
-        assert_eq!(payload["updated_at"], "2026-01-01T00:00:01Z");
-
-        for field in [
-            "merchant_id",
-            "amount",
-            "paid_amount",
-            "asset",
-            "asset_issuer",
-            "tx_hash",
-            "delta",
-        ] {
-            assert!(
-                payload.get(field).is_none(),
-                "minimal payload must not include {field:?}, got: {payload}"
-            );
-        }
-    }
-
-    /// `Full` restores the previous rich payload for merchants that opt in.
-    #[test]
-    fn build_payload_full_includes_tenant_and_financial_detail() {
-        let payment = sample_payment();
-        let payload = build_payload(
-            &payment,
-            "payment.overpaid",
-            Some("5"),
-            WebhookPayloadDetail::Full,
-        );
-
-        assert_eq!(payload["merchant_id"], "merchant_1");
-        assert_eq!(payload["amount"], "10");
-        assert_eq!(payload["paid_amount"], "10");
-        assert_eq!(payload["asset"], "XLM");
-        assert_eq!(payload["tx_hash"], "txhash");
-        assert_eq!(payload["delta"], "5");
-    }
-
-    /// `delta` is only ever present under `Full`, and only when the caller
-    /// actually passed one (exact-payment events pass `None`).
-    #[test]
-    fn build_payload_full_without_delta_omits_the_field() {
-        let payment = sample_payment();
-        let payload = build_payload(
-            &payment,
-            "payment.completed",
-            None,
-            WebhookPayloadDetail::Full,
-        );
-        assert!(payload.get("delta").is_none());
     }
 }

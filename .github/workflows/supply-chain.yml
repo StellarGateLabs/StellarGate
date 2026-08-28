@@ -14,7 +14,7 @@ jobs:
     name: cargo audit (RustSec)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       # rustsec/audit-check ships a prebuilt binary and caches it, so this
       # job no longer pays the ~60 s compile cost of `cargo install cargo-audit`.
@@ -22,14 +22,22 @@ jobs:
       # TEMPORARY IGNORE — RUSTSEC-2023-0071 (Marvin timing side-channel in
       # `rsa`). `rsa` is pulled in only via sqlx's unused MySQL backend (we
       # enable the `sqlite` feature only), so the vulnerable code is never
-      # compiled. It is flagged because it still appears in Cargo.lock.
+      # compiled. It is flagged because it still appears in Cargo.lock as an
+      # unbuilt optional transitive dependency of sqlx-mysql.
+      #
+      # Triage (2026-08-26): rsa 0.9.10 is still in Cargo.lock. No fixed
+      # release has been published upstream (RustSec RUSTSEC-2023-0071 remains
+      # open; track https://github.com/RustCrypto/RSA/issues/19). The sqlx
+      # team has not removed the MySQL backend from resolution. We do not
+      # enable the sqlx `mysql` feature, so the vulnerable code path is never
+      # compiled or executed in any StellarGate binary or test.
       #
       # This is a tracked, time-boxed exception, NOT a permanent waiver. Remove
       # the `ignore` entry as soon as any removal condition is met:
       #   * a fixed `rsa` release ships, or
       #   * `rsa` leaves the dependency tree, or
       #   * we start enabling sqlx's MySQL backend (then it needs a real fix).
-      # Review by: 2026-10-22 (quarterly). Tracking issue: StellarGateLabs#154.
+      # Review by: 2027-01-01 (next quarterly). Tracking issue: StellarGateLabs#154.
       # Rationale + removal conditions are kept in sync in deny.toml.
       #
       # The weekly `schedule:` cron above re-runs this audit against a fresh
@@ -44,18 +52,30 @@ jobs:
     name: cargo deny (licenses + bans + sources + advisories)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       # EmbarkStudios/cargo-deny-action ships a prebuilt binary and caches it.
-      # deny.toml at the repo root is picked up automatically.
+      # deny.toml at the repo root is picked up automatically and contains the
+      # full policy with justifications for every exception.
       #
-      # Checks run:
-      #   advisories — RustSec advisory database (overlaps with cargo audit;
-      #                belt-and-suspenders for the weekly scheduled run).
-      #   licenses   — every dependency must use an approved SPDX license.
-      #   bans       — banned crates and duplicate-version policy.
-      #   sources    — only crates.io dependencies are permitted.
+      # Checks run and what each enforces:
+      #   advisories — RustSec advisory DB: fails on known vulnerabilities,
+      #                unsound code, and yanked crates. Overlaps with cargo
+      #                audit above; belt-and-suspenders for the weekly run.
+      #   licenses   — every dependency must use an approved SPDX identifier
+      #                from the `allow` list in deny.toml; any unlisted license
+      #                fails CI, forcing a conscious review decision.
+      #   bans       — banned crates list and duplicate-version policy;
+      #                `multiple-versions = "deny"` means any new unregistered
+      #                duplicate fails CI, requiring an explicit `skip` entry.
+      #   sources    — only crates.io is permitted; any git or path dependency
+      #                not explicitly listed in deny.toml fails CI.
+      #
+      # `fail-on-error: true` makes every violation above a hard CI failure,
+      # not a warning. (This is already the default for cargo-deny-action, but
+      # is set explicitly here so the intent is unambiguous to any reader.)
       - name: Run cargo deny
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check bans licenses sources advisories
+          fail-on-error: true

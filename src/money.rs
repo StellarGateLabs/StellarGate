@@ -141,6 +141,84 @@ mod tests {
         let a = parse_stroops("0.1").unwrap() + parse_stroops("0.2").unwrap();
         assert_eq!(a, parse_stroops("0.3").unwrap());
     }
+
+    // ── New targeted tests (issues #436) ────────────────────────────────────
+
+    #[test]
+    fn rejects_bare_dot() {
+        // A lone "." has no digits on either side. Both int_part and frac_part
+        // are empty after the split, so the guard catches it.
+        assert_eq!(parse_stroops("."), None);
+    }
+
+    #[test]
+    fn accepts_exactly_seven_decimal_places() {
+        // 7 fractional digits is the MAX_DECIMALS boundary — must be accepted.
+        // "1.1234567" = 1 whole unit + 1_234_567 stroops = 11_234_567 stroops.
+        assert_eq!(parse_stroops("1.1234567"), Some(11_234_567));
+    }
+
+    #[test]
+    fn accepts_leading_zeros_in_integer_part() {
+        // Leading zeros in the integer part are ordinary digits — not a sign,
+        // not an octal prefix. "007" == 7, so 7 × 10_000_000 = 70_000_000.
+        assert_eq!(parse_stroops("007"), Some(70_000_000));
+    }
+
+    #[test]
+    fn rejects_only_whitespace() {
+        // After .trim() the string is empty, which is rejected before any
+        // digit checks.
+        assert_eq!(parse_stroops("   "), None);
+        assert_eq!(parse_stroops("\t"), None);
+    }
+
+    #[test]
+    fn max_i64_round_trips_via_stroops_to_string() {
+        // The largest value stroops_to_string can produce is i64::MAX stroops.
+        // It must round-trip: parse_stroops(stroops_to_string(v)) == Some(v).
+        // (i64::MAX = 9_223_372_036_854_775_807, which is above the overflow
+        // guard only if multiplied — here it is the stroop count itself so no
+        // overflow occurs.)
+        let max = i64::MAX;
+        let s = stroops_to_string(max);
+        assert_eq!(
+            parse_stroops(&s),
+            Some(max),
+            "stroops_to_string({max}) = {s:?} did not round-trip"
+        );
+    }
+
+    #[test]
+    fn is_valid_amount_agrees_with_parse_stroops() {
+        // is_valid_amount must return the same yes/no decision as parse_stroops.
+        for &valid in &["1", "0.0000001", "10.50", "007", "1.1234567"] {
+            assert!(
+                is_valid_amount(valid),
+                "is_valid_amount({valid:?}) should be true"
+            );
+        }
+        for &invalid in &["", "0", "-1", "abc", ".", "   ", "0.0000000"] {
+            assert!(
+                !is_valid_amount(invalid),
+                "is_valid_amount({invalid:?}) should be false"
+            );
+        }
+    }
+
+    #[test]
+    fn fractional_only_at_minimum_stroop_boundary() {
+        // ".0000001" has no integer part and exactly 7 fractional digits whose
+        // value is 1. That is the smallest possible Stellar amount.
+        assert_eq!(parse_stroops(".0000001"), Some(1));
+    }
+
+    #[test]
+    fn rejects_all_zero_fractional() {
+        // "0.0000000" evaluates to zero stroops, which is non-positive and
+        // must be rejected — same rule that rejects "0" or "0.0".
+        assert_eq!(parse_stroops("0.0000000"), None);
+    }
 }
 
 #[cfg(test)]
@@ -238,12 +316,12 @@ mod property_tests {
                 let canonical2 = stroops_to_string(stroops2);
 
                 prop_assert_eq!(
-                    canonical1,
-                    canonical2,
+                    canonical1.clone(),
+                    canonical2.clone(),
                     "Canonicalization not idempotent: '{}' -> '{}' -> '{}'",
                     s,
-                    canonical1.clone(),
-                    canonical2.clone()
+                    canonical1,
+                    canonical2
                 );
             }
         }

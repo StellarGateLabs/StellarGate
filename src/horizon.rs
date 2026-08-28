@@ -14,10 +14,12 @@
 //! | Paid **less** than requested | `underpaid` | `payment.underpaid` | `delta` = shortfall; intent stays watchable |
 //! | Top-up brings total to exactly expected | `completed` | `payment.completed` | — |
 //! | Top-up brings total above expected | `completed` | `payment.overpaid` | `delta` = cumulative excess |
+//! | Payment after intent is `completed` or `expired` | unchanged | `payment.unexpected` | `delta` = the unexpected amount; merchant must refund |
 //!
-//! Once an intent reaches `completed`, it is removed from the watchlist.
-//! Any subsequent on-chain payment to the same address and memo is silently
-//! ignored — it will not trigger an additional webhook.
+//! Once an intent reaches `completed` or `expired`, its status is never
+//! changed. A subsequent on-chain payment to the same address and memo fires a
+//! `payment.unexpected` webhook carrying the amount so the merchant can arrange
+//! a refund — the gateway is the only component that can see such a payment.
 //!
 //! Multiple follow-up (top-up) payments are supported per underpaid intent.
 //! Every processed transaction is recorded in the `processed_transactions`
@@ -26,6 +28,16 @@
 //! concurrent reconciler) never double-counts and the ledger is independent of
 //! the order records arrive in. The payment row's `tx_hash` still records the
 //! most recent processed transaction for display.
+//!
+//! ## Restart behaviour
+//!
+//! Both listeners resume from a cursor persisted in `kv_state`, under separate
+//! keys ([`PAYMENT_CURSOR_KEY`] and [`STREAM_CURSOR_KEY`]) so neither drags the
+//! other backwards. Only a database with no cursor under either key starts at
+//! the live edge. The poller additionally checks its shutdown signal at every
+//! page boundary — immediately after checkpointing — so a `SIGTERM` during a
+//! long catch-up is honoured within one page instead of being ignored until the
+//! whole backlog drains (issues #226, #228).
 //!
 //! ## Finality
 //!
@@ -38,11 +50,9 @@
 //! and undocumented behaviour that Horizon's payments-for-account endpoint
 //! tends to surface only successful operations.
 //!
-//! The intent matching and settlement-decision logic used by [`verify`] and
-//! [`reconcile_payment`] are pure and unit-tested; the networked functions wrap
-//! them with I/O.
+//! The matching logic in [`verify`] is pure and unit-tested; the networked
+//! functions wrap it with I/O.
 
-use crate::supervise::TaskExit;
 use crate::{db, money, webhook, AppState};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -50,68 +60,20 @@ use std::sync::Arc;
 use std::time::Duration;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::watch;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Key under which the last fully-processed Horizon paging token is stored in
 /// the `kv_state` table, so polling resumes from it across restarts.
 const PAYMENT_CURSOR_KEY: &str = "horizon_payment_cursor";
 
-/// The three payment-request shapes used by the reconciler. Keeping the query
-/// layout here makes every caller go through `Url`'s encoding API while
-/// preserving the parameters each Horizon endpoint already receives.
-#[derive(Debug, Clone, Copy)]
-enum PaymentsRequest<'a> {
-    Poll { cursor: &'a str, limit: u32 },
-    Baseline { cursor: Option<&'a str>, limit: u32 },
-    Stream { cursor: &'a str },
-}
+/// Key under which the stream listener persists the paging token of the last
+/// event it handled. Deliberately separate from [`PAYMENT_CURSOR_KEY`]: the two
+/// listeners advance at different rates, and a shared key would let whichever
+/// one wrote last drag the other backwards or forwards (issue #228).
+const STREAM_CURSOR_KEY: &str = "horizon_stream_cursor";
 
-fn horizon_account_url(base: &reqwest::Url, account: &str) -> anyhow::Result<reqwest::Url> {
-    let mut url = base.clone();
-    url.path_segments_mut()
-        .map_err(|_| anyhow::anyhow!("STELLAR_HORIZON_URL cannot be used as a path base"))?
-        .pop_if_empty()
-        .extend(["accounts", account]);
-    Ok(url)
-}
-
-fn horizon_payments_url(
-    base: &reqwest::Url,
-    account: &str,
-    request: PaymentsRequest<'_>,
-) -> anyhow::Result<reqwest::Url> {
-    let mut url = horizon_account_url(base, account)?;
-    url.path_segments_mut()
-        .map_err(|_| anyhow::anyhow!("STELLAR_HORIZON_URL cannot be used as a path base"))?
-        .push("payments");
-
-    match request {
-        PaymentsRequest::Poll { cursor, limit } => {
-            let limit = limit.to_string();
-            url.query_pairs_mut()
-                .append_pair("order", "asc")
-                .append_pair("cursor", cursor)
-                .append_pair("limit", &limit)
-                .append_pair("join", "transactions");
-        }
-        PaymentsRequest::Baseline { cursor, limit } => {
-            let limit = limit.to_string();
-            let mut pairs = url.query_pairs_mut();
-            pairs
-                .append_pair("order", "desc")
-                .append_pair("limit", &limit);
-            if let Some(cursor) = cursor {
-                pairs.append_pair("cursor", cursor);
-            }
-        }
-        PaymentsRequest::Stream { cursor } => {
-            url.query_pairs_mut()
-                .append_pair("cursor", cursor)
-                .append_pair("join", "transactions");
-        }
-    }
-    Ok(url)
-}
+/// How many payment records to request per Horizon page while catching up.
+const PAGE_LIMIT: u32 = 200;
 
 /// A single payment operation as returned by Horizon, with the embedded
 /// transaction (requested via `join=transactions`) so we can read its memo.
@@ -178,6 +140,15 @@ struct AccountResponse {
 }
 
 /// One balance / trustline line on a Stellar account.
+///
+/// `is_authorized` can be `false` even when the balance line exists if the
+/// asset's issuer uses `AUTH_REQUIRED` and has not yet granted (or has since
+/// revoked) authorization. An unauthorized trustline cannot receive payments —
+/// a deposit attempt bounces on-chain just like a missing trustline would.
+///
+/// `limit` is the maximum number of units this account will accept for the
+/// asset (in the same decimal format as `balance`). A payment that would push
+/// `balance` past `limit` also fails on-chain.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AccountBalance {
     #[serde(default)]
@@ -188,6 +159,23 @@ pub struct AccountBalance {
     pub asset_issuer: Option<String>,
     #[serde(default)]
     pub balance: Option<String>,
+    /// Whether the account is authorized to hold this asset.
+    /// Always `true` for native XLM. `false` means the issuer has not
+    /// granted (or has revoked) authorization; the trustline is present
+    /// but unusable for incoming payments.
+    #[serde(default = "default_true")]
+    pub is_authorized: bool,
+    /// Maximum units the account will accept for this asset.
+    /// `"922337203685.4775807"` is the Stellar maximum (i64::MAX stroops).
+    #[serde(default)]
+    pub limit: Option<String>,
+}
+
+/// Default value for `is_authorized` when the field is absent in the JSON
+/// (e.g. native XLM, which Horizon omits it for). Native XLM is always
+/// implicitly authorized, so this default must be `true` rather than `false`.
+fn default_true() -> bool {
+    true
 }
 
 /// The outcome of matching a Horizon payment against a pending intent.
@@ -210,79 +198,6 @@ pub enum Verdict {
         tx_hash: String,
         paid_amount: String,
     },
-}
-
-impl Verdict {
-    fn tx_hash(&self) -> &str {
-        match self {
-            Self::Completed { tx_hash, .. }
-            | Self::Overpaid { tx_hash, .. }
-            | Self::Underpaid { tx_hash, .. } => tx_hash,
-        }
-    }
-
-    fn paid_amount(&self) -> &str {
-        match self {
-            Self::Completed { paid_amount, .. }
-            | Self::Overpaid { paid_amount, .. }
-            | Self::Underpaid { paid_amount, .. } => paid_amount,
-        }
-    }
-}
-
-/// Pure result consumed by production reconciliation after the authoritative
-/// processed-transaction ledger has been re-summed. Keeping the verdict and
-/// its persistence/webhook metadata together prevents those outcomes from
-/// drifting into separate amount comparisons (issue #225).
-#[derive(Debug, PartialEq, Eq)]
-struct SettlementDecision {
-    verdict: Verdict,
-    status: &'static str,
-    event: &'static str,
-    delta: Option<String>,
-}
-
-impl SettlementDecision {
-    fn from_totals(total_stroops: i64, expected_stroops: i64, tx_hash: &str) -> Self {
-        let paid_amount = money::stroops_to_string(total_stroops);
-
-        use std::cmp::Ordering;
-        match total_stroops.cmp(&expected_stroops) {
-            Ordering::Equal => Self {
-                verdict: Verdict::Completed {
-                    tx_hash: tx_hash.into(),
-                    paid_amount,
-                },
-                status: "completed",
-                event: "payment.completed",
-                delta: None,
-            },
-            Ordering::Greater => Self {
-                verdict: Verdict::Overpaid {
-                    tx_hash: tx_hash.into(),
-                    paid_amount,
-                },
-                status: "completed",
-                event: "payment.overpaid",
-                delta: Some(money::stroops_to_string(total_stroops - expected_stroops)),
-            },
-            Ordering::Less => Self {
-                verdict: Verdict::Underpaid {
-                    tx_hash: tx_hash.into(),
-                    paid_amount,
-                },
-                status: "underpaid",
-                event: "payment.underpaid",
-                delta: Some(money::stroops_to_string(expected_stroops - total_stroops)),
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct IntentMatch {
-    new_stroops: i64,
-    expected_stroops: i64,
 }
 
 impl HorizonPayment {
@@ -328,10 +243,19 @@ fn elapsed_secs(ts: &str) -> Option<i64> {
     Some((OffsetDateTime::now_utc() - then).whole_seconds())
 }
 
-/// Return the parsed amounts when a Horizon payment belongs to this intent.
-/// Unrelated, unsuccessful, wrong-asset, or malformed records return `None` and
-/// must not enter the authoritative processed-transaction ledger.
-fn matches_intent(payment: &db::Payment, hp: &HorizonPayment) -> Option<IntentMatch> {
+/// Decide whether a Horizon payment satisfies a pending intent.
+///
+/// `already_paid_stroops` is the cumulative amount already received for this
+/// intent (0 for a fresh `pending` payment, non-zero for an `underpaid` one).
+///
+/// Returns `None` when the payment is unrelated (wrong type, destination, memo,
+/// or asset). When it matches, returns the verdict for the cumulative total.
+pub fn verify(
+    payment: &db::Payment,
+    hp: &HorizonPayment,
+    accepted_assets: &[crate::config::AcceptedAsset],
+    already_paid_stroops: i64,
+) -> Option<Verdict> {
     if hp.kind != "payment" {
         return None;
     }
@@ -350,163 +274,90 @@ fn matches_intent(payment: &db::Payment, hp: &HorizonPayment) -> Option<IntentMa
         return None;
     }
 
-    /* Match the issuer this intent was priced in — not any allow-list entry
-    that happens to share the code. Two `USDC` issuers used to both settle an
-    intent that stored only the code (issue #222). */
-    let asset_matches = match payment.asset_issuer.as_deref().filter(|s| !s.is_empty()) {
-        None => {
-            payment.asset.eq_ignore_ascii_case("XLM") && hp.asset_type.as_deref() == Some("native")
+    /* The asset must still be one the gateway accepts, but *which* issuer
+    counts comes from the intent, not from today's configuration: an intent
+    priced in one issuer's USDC must not become payable in another's because
+    `ACCEPTED_ASSETS` was edited after it was created (issue #223). Rows written
+    before `asset_issuer` existed carry `None`, and fall back to the configured
+    issuer — the same behaviour they had before. */
+    let asset_matches = accepted_assets.iter().any(|a| {
+        if a.code != payment.asset {
+            return false;
         }
-        Some(issuer) => {
-            hp.asset_code.as_deref() == Some(payment.asset.as_str())
-                && hp.asset_issuer.as_deref() == Some(issuer)
+        match payment.asset_issuer.as_deref().or(a.issuer.as_deref()) {
+            None => hp.asset_type.as_deref() == Some("native"),
+            Some(issuer) => {
+                hp.asset_code.as_deref() == Some(a.code.as_str())
+                    && hp.asset_issuer.as_deref() == Some(issuer)
+            }
         }
-    };
+    });
     if !asset_matches {
         return None;
     }
 
-    Some(IntentMatch {
-        new_stroops: money::parse_stroops(hp.amount.as_deref()?)?,
-        expected_stroops: money::parse_stroops(&payment.amount)?,
-    })
-}
-
-/// Decide whether a Horizon payment satisfies a pending intent.
-///
-/// `already_paid_stroops` is the cumulative amount already received for this
-/// intent (0 for a fresh `pending` payment, non-zero for an `underpaid` one).
-///
-/// Returns `None` when the payment is unrelated (wrong type, destination, memo,
-/// or asset — including a credit payment whose issuer does not match the
-/// issuer stored on the intent). When it matches, returns the same pure
-/// settlement verdict that production reconciliation consumes after recording.
-pub fn verify(
-    payment: &db::Payment,
-    hp: &HorizonPayment,
-    already_paid_stroops: i64,
-) -> Option<Verdict> {
-    let matched = matches_intent(payment, hp)?;
-    let total_paid = already_paid_stroops + matched.new_stroops;
+    let raw_amount = hp.amount.as_deref()?;
+    let new_paid = money::parse_stroops(raw_amount)?;
+    let expected = money::parse_stroops(&payment.amount)?;
+    let total_paid = already_paid_stroops + new_paid;
     let tx_hash = hp.transaction_hash.clone().unwrap_or_default();
+    let paid_amount = money::stroops_to_string(total_paid);
 
-    Some(SettlementDecision::from_totals(total_paid, matched.expected_stroops, &tx_hash).verdict)
-}
-
-/// A Horizon HTTP failure, distinguishing throttling (`429 Too Many Requests`
-/// or `503 Service Unavailable`, carrying `Retry-After` when Horizon sends
-/// one) from any other failure. Before this, `fetch_recent_payments` turned
-/// every non-2xx response into an opaque `reqwest::Error` via
-/// `error_for_status()`, discarding the status code and headers — the poller
-/// had no way to tell "back off, and for how long" from an ordinary blip
-/// (issue #313).
-#[derive(Debug)]
-pub struct HorizonHttpError {
-    pub status: reqwest::StatusCode,
-    pub retry_after: Option<Duration>,
-    /// Cursor used by the failed request, when that endpoint had one. This is
-    /// carried only for bounded repeated-4xx classification; it is never used
-    /// to change retry or payment-detection semantics.
-    pub cursor: Option<String>,
-    body: String,
-}
-
-impl std::fmt::Display for HorizonHttpError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Horizon returned {}: {}", self.status, self.body)
+    use std::cmp::Ordering;
+    match total_paid.cmp(&expected) {
+        Ordering::Equal => Some(Verdict::Completed {
+            tx_hash,
+            paid_amount,
+        }),
+        Ordering::Greater => Some(Verdict::Overpaid {
+            tx_hash,
+            paid_amount,
+        }),
+        Ordering::Less => Some(Verdict::Underpaid {
+            tx_hash,
+            paid_amount,
+        }),
     }
-}
-
-impl std::error::Error for HorizonHttpError {}
-
-impl HorizonHttpError {
-    /// `429`/`503` mean "back off", not "something is broken" — every other
-    /// non-2xx status is treated as an ordinary failure.
-    pub fn is_rate_limited(&self) -> bool {
-        matches!(
-            self.status,
-            reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::SERVICE_UNAVAILABLE
-        )
-    }
-
-    /// A cursor-specific client error worth tracking across retries. `429` is
-    /// deliberately excluded: the existing rate-limit path already classifies
-    /// and alerts on it, and it does not imply that a particular cursor is bad.
-    fn is_cursor_client_error(&self) -> bool {
-        self.status.is_client_error() && !self.is_rate_limited() && self.cursor.is_some()
-    }
-}
-
-/// Preserve Horizon's status, retry header, body, and request cursor instead of
-/// collapsing a non-2xx response into an opaque `reqwest::Error`.
-async fn horizon_success(
-    resp: reqwest::Response,
-    cursor: Option<&str>,
-) -> anyhow::Result<reqwest::Response> {
-    let status = resp.status();
-    if status.is_success() {
-        return Ok(resp);
-    }
-
-    let retry_after = parse_retry_after(resp.headers());
-    let body = resp.text().await.unwrap_or_default();
-    Err(HorizonHttpError {
-        status,
-        retry_after,
-        cursor: cursor.map(str::to_owned),
-        body,
-    }
-    .into())
-}
-
-/// Parse `Retry-After` as delta-seconds (RFC 9110) — the form every rate
-/// limiter this service talks to actually sends, including Horizon's. The
-/// HTTP-date form is not handled: nothing observed in the wild sends it for
-/// `429`/`503`, and misparsing a date as a much smaller or larger delay would
-/// be worse than falling back to the exponential backoff below.
-fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    headers
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(Duration::from_secs)
 }
 
 /// Fetch the most recent payments into `account` from Horizon, newest first,
 /// with their transactions joined so memos are available.
-///
-/// A non-2xx response is returned as a [`HorizonHttpError`] rather than
-/// `error_for_status`'s opaque `reqwest::Error`, so a caller can tell a `429`/
-/// `503` — and any `Retry-After` Horizon attached — apart from an ordinary
-/// failure (issue #313).
 pub async fn fetch_recent_payments(
     client: &reqwest::Client,
-    horizon_url: &reqwest::Url,
+    horizon_url: &str,
     account: &str,
     cursor: &str,
     limit: u32,
 ) -> anyhow::Result<Vec<HorizonPayment>> {
-    let url = horizon_payments_url(
-        horizon_url,
+    let url = format!(
+        "{}/accounts/{}/payments?order=asc&cursor={}&limit={}&join=transactions",
+        horizon_url.trim_end_matches('/'),
         account,
-        PaymentsRequest::Poll { cursor, limit },
-    )?;
-    let resp = client
-        .get(url)
+        cursor,
+        limit
+    );
+    let page: PaymentsPage = client
+        .get(&url)
         .header("Accept", "application/json")
         .send()
+        .await?
+        .error_for_status()?
+        .json()
         .await?;
-
-    let page: PaymentsPage = horizon_success(resp, Some(cursor)).await?.json().await?;
     Ok(page.embedded.records)
 }
 
-/// Return the accepted assets the gateway account holds **no** trustline for.
+/// Return the accepted assets the gateway account holds **no usable** trustline
+/// for.
 ///
-/// Native XLM never needs a trustline, so it is always considered held. An
-/// issued asset (`CODE:ISSUER`) is held only if the account has a balance line
-/// with the matching `asset_code` and `asset_issuer`. Pure, so it is
-/// unit-tested without any network.
+/// A trustline is considered missing (i.e. the asset cannot be received) when
+/// any of the following is true:
+/// - No balance line exists for the asset at all.
+/// - The balance line exists but `is_authorized` is `false` (the issuer uses
+///   `AUTH_REQUIRED` and has revoked or not yet granted authorization).
+///
+/// Native XLM never needs a trustline, so it is always considered held and
+/// authorized. Pure, so it is unit-tested without any network.
 pub fn missing_trustlines<'a>(
     accepted_assets: &'a [crate::config::AcceptedAsset],
     balances: &[AccountBalance],
@@ -516,31 +367,90 @@ pub fn missing_trustlines<'a>(
         .filter(|asset| match asset.issuer.as_deref() {
             // Native asset — no trustline required.
             None => false,
-            Some(issuer) => !balances.iter().any(|b| {
-                b.asset_code.as_deref() == Some(asset.code.as_str())
-                    && b.asset_issuer.as_deref() == Some(issuer)
-            }),
+            Some(issuer) => {
+                match balances.iter().find(|b| {
+                    b.asset_code.as_deref() == Some(asset.code.as_str())
+                        && b.asset_issuer.as_deref() == Some(issuer)
+                }) {
+                    // Balance line absent — missing trustline.
+                    None => true,
+                    // Balance line present but not authorized — unusable.
+                    Some(b) => !b.is_authorized,
+                }
+            }
         })
         .collect()
 }
 
-/// Fetch and decode the gateway account, factored out of [`check_trustlines`]
-/// purely so its one fallible sequence (request, status check, decode) has a
-/// single `?`-propagated exit for the caller to attribute to
-/// `record_check_failure`.
-async fn fetch_account(
-    state: &Arc<AppState>,
-    url: reqwest::Url,
-) -> anyhow::Result<AccountResponse> {
-    Ok(state
+/// Parse a Stellar decimal amount string (e.g. `"1000.5000000"`) into stroops.
+/// Returns `None` when `s` is `None` or unparseable.
+fn parse_stroops_opt(s: Option<&str>) -> Option<i64> {
+    money::parse_stroops(s?)
+}
+
+/// Return the remaining headroom (in stroops) for each accepted non-native
+/// asset that has a trustline on the gateway account: `limit - balance`.
+///
+/// A payment that would push the balance past `limit` fails on-chain, so a
+/// headroom approaching zero is an actionable signal. Returns only assets where
+/// both `limit` and `balance` are parseable; assets with missing or
+/// unparseable values are skipped (not treated as zero headroom).
+pub fn trustline_headroom<'a>(
+    accepted_assets: &'a [crate::config::AcceptedAsset],
+    balances: &[AccountBalance],
+) -> Vec<(&'a crate::config::AcceptedAsset, i64)> {
+    accepted_assets
+        .iter()
+        .filter_map(|asset| {
+            let issuer = asset.issuer.as_deref()?;
+            let b = balances.iter().find(|b| {
+                b.asset_code.as_deref() == Some(asset.code.as_str())
+                    && b.asset_issuer.as_deref() == Some(issuer)
+            })?;
+            let limit = parse_stroops_opt(b.limit.as_deref())?;
+            let balance = parse_stroops_opt(b.balance.as_deref())?;
+            let headroom = limit.saturating_sub(balance);
+            Some((asset, headroom))
+        })
+        .collect()
+}
+
+/// At startup, check that the gateway account holds a trustline for every
+/// accepted non-native asset, and warn about any that are missing.
+///
+/// An accepted asset without a trustline mints unpayable intents: the gateway
+/// advertises (say) USDC, a customer pays, and the payment bounces on-chain
+/// because the account cannot receive it. Surfacing this at boot turns a silent
+/// runtime failure into an actionable startup warning.
+///
+/// Best-effort by design: a Horizon error (unreachable, account not yet funded)
+/// is returned to the caller to log, but must not abort boot — the account may
+/// be provisioned shortly after start. Returns the list of accepted asset codes
+/// that are missing a trustline (empty when all are present).
+pub async fn check_trustlines(state: &Arc<AppState>) -> anyhow::Result<Vec<String>> {
+    let url = format!(
+        "{}/accounts/{}",
+        state.config.horizon_url.trim_end_matches('/'),
+        state.config.gateway_public,
+    );
+    let account: AccountResponse = state
         .http
-        .get(url)
+        .get(&url)
         .header("Accept", "application/json")
         .send()
         .await?
         .error_for_status()?
         .json()
-        .await?)
+        .await?;
+
+    let accepted = &state.config.accepted_assets;
+    let balances = &account.balances;
+    let missing = find_missing_trustlines(accepted, balances)
+        .into_iter()
+        .map(|(asset, _)| asset.code.clone())
+        .collect::<Vec<_>>();
+
+    Ok(missing)
 }
 
 /// Check that the gateway account holds a trustline for every accepted
@@ -576,34 +486,12 @@ pub async fn check_trustlines(state: &Arc<AppState>) -> anyhow::Result<Vec<Strin
         }
     };
 
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        state.task_health.set_gateway_account_exists(false);
-        let msg = format!(
-            "STELLAR_GATEWAY_PUBLIC ({}) does not exist on the ledger. It cannot receive payments.",
-            state.config.gateway_public
-        );
-        if state.config.require_gateway_account {
-            return Err(anyhow::anyhow!(msg));
-        } else {
-            tracing::error!("{}", msg);
-            return Ok(());
-        }
-    }
-
-    let resp = resp.error_for_status().map_err(|e| {
-        anyhow::anyhow!(
-            "HTTP status client error ({}): could not verify gateway trustlines",
-            e.status()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "unknown".into())
-        )
-    })?;
-
-    state.task_health.set_gateway_account_exists(true);
-    let account: AccountResponse = resp.json().await?;
-
     // Log the native XLM balance.
-    if let Some(native_balance) = account.balances.iter().find(|b| b.asset_type.as_deref() == Some("native")) {
+    if let Some(native_balance) = account
+        .balances
+        .iter()
+        .find(|b| b.asset_type.as_deref() == Some("native"))
+    {
         if let Some(amt) = &native_balance.balance {
             info!(
                 balance = %amt,
@@ -613,253 +501,189 @@ pub async fn check_trustlines(state: &Arc<AppState>) -> anyhow::Result<Vec<Strin
         }
     }
 
+    // Collect assets that are missing a trustline entirely OR have one but are
+    // unauthorized. Both prevent incoming payments from settling.
     let missing = missing_trustlines(&state.config.accepted_assets, &account.balances);
+
+    // Among the missing set, distinguish unauthorized trustlines (present but
+    // unusable) from absent ones. Different root causes, different remedies.
+    let unauthorized_codes: Vec<String> = state
+        .config
+        .accepted_assets
+        .iter()
+        .filter_map(|asset| {
+            let issuer = asset.issuer.as_deref()?;
+            // Only flag if the balance line actually exists but is not authorized.
+            let b = account.balances.iter().find(|b| {
+                b.asset_code.as_deref() == Some(asset.code.as_str())
+                    && b.asset_issuer.as_deref() == Some(issuer)
+            })?;
+            if b.is_authorized {
+                None
+            } else {
+                Some(asset.code.clone())
+            }
+        })
+        .collect();
+
     if missing.is_empty() {
         info!("gateway trustlines verified for all accepted assets");
     } else {
         let missing_codes: Vec<_> = missing.iter().map(|a| a.code.clone()).collect();
         info!(
             missing = ?missing_codes,
-            "accepted assets with no trustline on the gateway account"
+            "accepted assets with no usable trustline on the gateway account"
         );
         for asset in &missing {
+            if unauthorized_codes.iter().any(|c| c == &asset.code) {
+                warn!(
+                    asset = %asset.code,
+                    issuer = %asset.issuer.as_deref().unwrap_or(""),
+                    "gateway account trustline exists but is not authorized; \
+                     intents in this asset will be unpayable until the issuer \
+                     grants authorization"
+                );
+            } else {
+                warn!(
+                    asset = %asset.code,
+                    issuer = %asset.issuer.as_deref().unwrap_or(""),
+                    "gateway account has no trustline for an accepted asset; intents in \
+                     this asset will be unpayable until a trustline is established"
+                );
+            }
+        }
+    }
+
+    // Compute headroom (limit - balance in stroops) for alerting on capacity.
+    let headroom = trustline_headroom(&state.config.accepted_assets, &account.balances);
+    for (asset, stroops) in &headroom {
+        // Warn when headroom is below ~10 XLM-equivalent (10_000_000 stroops)
+        // in absolute terms — an early signal that a large inbound payment could
+        // be rejected. The threshold is informational; the metric itself is the
+        // authoritative, alertable signal.
+        if *stroops < 10_000_000 {
             warn!(
                 asset = %asset.code,
-                issuer = %asset.issuer.as_deref().unwrap_or(""),
-                "gateway account has no trustline for an accepted asset; intents in \
-                 this asset will be unpayable until a trustline is established"
+                headroom_stroops = %stroops,
+                "trustline headroom is critically low; a large payment may be \
+                 rejected on-chain before the gateway receives it"
             );
         }
     }
+
     let missing_codes: Vec<String> = missing.iter().map(|a| a.code.clone()).collect();
+    let headroom_refs: Vec<(&str, i64)> = headroom
+        .iter()
+        .map(|(a, s)| (a.code.as_str(), *s))
+        .collect();
     let checked_codes = state
         .config
         .accepted_assets
         .iter()
         .filter(|a| a.issuer.is_some())
         .map(|a| a.code.as_str());
-    state
-        .trustline_metrics
-        .record_check(checked_codes, &missing_codes);
+    state.trustline_metrics.record_check(
+        checked_codes,
+        &missing_codes,
+        &unauthorized_codes,
+        &headroom_refs,
+    );
     Ok(missing_codes)
 }
 
-/// Background loop that re-runs [`check_trustlines`] on a recurring interval
-/// for as long as the process runs. Idles (without checking) while no gateway
-/// is configured, matching [`run_poller`] — without a gateway wallet there is
-/// no account to hold trustlines on.
-///
-/// Reuses the retention worker's cadence rather than introducing a dedicated
-/// interval: trustline drift is not latency-sensitive, so a purpose-built
-/// knob would only add configuration surface for no operational benefit.
-/// The boot-time check (`main::report_trustlines`) already covers the first
-/// answer, so — like the retention worker — this waits out the interval
-/// before its first check rather than repeating that one immediately.
-pub async fn run_trustline_checker(
-    state: Arc<AppState>,
-    mut shutdown: watch::Receiver<bool>,
-) -> TaskExit {
-    if !state.config.gateway_configured() {
-        return TaskExit::DisabledByConfig("STELLAR_GATEWAY_PUBLIC is unconfigured");
-    }
-
-    let interval = Duration::from_secs(state.config.retention_interval_secs.max(1));
-    info!(
-        interval_secs = state.config.retention_interval_secs,
-        "trustline checker started"
-    );
-
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
-            _ = shutdown.changed() => {
-                info!("trustline checker shutting down");
-                return TaskExit::ShutdownRequested;
-            }
-        }
-
-        match check_trustlines(&state).await {
-            Ok(missing) if missing.is_empty() => {
-                debug!("trustline check: all accepted assets have a trustline")
-            }
-            Ok(missing) => info!(
-                ?missing,
-                "accepted assets with no trustline on the gateway account"
-            ),
-            Err(e) => warn!(error = %e, "could not verify gateway trustlines"),
-        }
-    }
-}
-
-/// How many pages [`starting_cursor`] will walk backward, at most, while
-/// searching for a baseline that covers every currently open intent (issue
-/// #311). Bounds the worst case — an account with a large payment history and
-/// an old open intent — to a fixed number of Horizon requests at boot rather
-/// than an unbounded backward scan. `MAX_BASELINE_PAGES * horizon_page_limit`
-/// (5,000 records at the default page size) is the same order of magnitude as
-/// [`MAX_PAGES_PER_CYCLE`]'s per-cycle budget.
-const MAX_BASELINE_PAGES: usize = 25;
-
 /// Resolve the cursor this cycle should start paging from.
 ///
-/// From the second run onward this simply resumes from the saved token. On
-/// the very first run (no persisted cursor) it deliberately baselines with
-/// overlap rather than adopting the account's single most recent payment
-/// exactly, which used to skip two kinds of payment silently:
-///
-/// - **Reused account.** Pointing a fresh instance at an account that already
-///   received payments — a redeploy after losing the volume, a migration
-///   between hosts — would adopt whatever the account's newest payment
-///   happened to be as the floor, hiding every payment for an intent created
-///   before that point even though it is still open.
-/// - **Startup race.** A payment that lands between Horizon answering the
-///   baselining query and the first forward poll can sort at or below the
-///   single-record baseline (e.g. read-replica lag on Horizon's side), and
-///   was silently skipped.
-///
-/// Neither produces an error: the intent just stays `pending` until the
-/// sweeper expires it, with no record connecting the customer's on-chain
-/// payment to anything. Re-processing an already-settled transaction is a
-/// no-op through `processed_transactions` (issue #78), so the cost of
-/// over-scanning is a few wasted queries — cheap insurance against silently
-/// under-scanning.
-///
-/// The baseline is chosen by paging backward (`order=desc`) from the tip
-/// until the oldest record seen is older than every currently open intent's
-/// `created_at` (a payment cannot be relevant to an intent it predates), or
-/// until [`MAX_BASELINE_PAGES`] is reached, or until Horizon has no more
-/// history. When nothing is currently open (a genuinely fresh deployment),
-/// one page of backward overlap is taken anyway, purely to cover the startup
-/// race. If the account has no payments at all, baselining starts from `"0"`
-/// so the first payment that ever arrives is still captured.
+/// On the very first run (no persisted cursor) we baseline at the account's
+/// most recent payment so we don't replay its entire history; from then on we
+/// resume from the saved token. If the account has no payments yet, we start
+/// from `"0"` so the first payment that ever arrives is still captured.
 async fn starting_cursor(state: &Arc<AppState>) -> anyhow::Result<String> {
     if let Some(cursor) = db::get_state(&state.pool, PAYMENT_CURSOR_KEY).await? {
         return Ok(cursor);
     }
 
-    /* `list_pending` returns oldest-first, so the first row (if any) is the
-    earliest `created_at` we must not scan past. A payment settling this
-    intent cannot have landed before the intent existed. */
-    let earliest_open = db::list_pending(&state.pool)
-        .await?
-        .into_iter()
-        .next()
-        .map(|p| p.created_at);
-
-    let mut next_cursor: Option<String> = None;
-    let mut skipped = 0usize;
-    let mut pages = 0usize;
-
-    let token = loop {
-        let request_cursor = next_cursor.as_deref();
-        let url = horizon_payments_url(
-            &state.config.horizon_url,
-            &state.config.gateway_public,
-            PaymentsRequest::Baseline {
-                cursor: request_cursor,
-                limit: state.config.horizon_page_limit,
-            },
-        )?;
-        let resp = state
-            .http
-            .get(url)
-            .header("Accept", "application/json")
-            .send()
-            .await?;
-        let page: PaymentsPage = horizon_success(resp, request_cursor).await?.json().await?;
-        pages += 1;
-
-        let Some(oldest) = page.embedded.records.last() else {
-            /* Horizon has no more history behind us — we have walked all the
-            way back to the account's first-ever payment (or it has none at
-            all). Either way, "0" is the maximally safe baseline: nothing is
-            skipped, at the cost of a full replay on the next forward poll. */
-            return Ok("0".to_string());
-        };
-        skipped += page.embedded.records.len();
-        let token = oldest.paging_token.clone().unwrap_or_default();
-        next_cursor = Some(token.clone());
-
-        let covers_every_open_intent = match &earliest_open {
-            // Nothing open yet — one page of overlap is enough to cover the
-            // startup race; there is no older business state to protect.
-            None => true,
-            /* Strictly older, not `<=`: the boundary record itself must be
-            excluded from "covered", because the persisted cursor becomes the
-            *exclusive* start of the next forward poll. Stopping at `<=` could
-            land the cursor exactly on (or after) the earliest open intent's
-            creation instant and exclude a payment that landed in the same
-            instant — reintroducing the exact race this baselining exists to
-            close. An unparseable or absent `created_at` is treated as "not
-            proven older" so the walk keeps going rather than risk stopping
-            too early. */
-            Some(earliest) => oldest
-                .created_at
-                .as_deref()
-                .map(|ts| ts < earliest.as_str())
-                .unwrap_or(false),
-        };
-
-        if covers_every_open_intent {
-            break token;
-        }
-        if pages >= MAX_BASELINE_PAGES {
-            warn!(
-                pages,
-                skipped_records = skipped,
-                "Horizon baseline walk hit its page cap before clearing every open \
-                 intent's creation time; baselining with the overlap found so far"
-            );
-            break token;
-        }
-    };
-
-    /* Persist immediately so a crash right after this scan still leaves us
-    baselined rather than repeating a potentially multi-page walk next time. */
-    db::set_state(&state.pool, PAYMENT_CURSOR_KEY, &token).await?;
-    info!(
-        cursor = %token,
-        skipped_records = skipped,
-        pages,
-        "Horizon poller baselined with overlap"
+    let url = format!(
+        "{}/accounts/{}/payments?order=desc&limit=1",
+        state.config.horizon_url.trim_end_matches('/'),
+        state.config.gateway_public,
     );
-    Ok(token)
-}
+    let page: PaymentsPage = state
+        .http
+        .get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
 
-/// Requests a single `poll_once` call will issue before yielding back to the
-/// caller, even if Horizon still has more pages. Without this, a backlog that
-/// built up while Horizon was throttling (issue #313) would be drained in one
-/// cycle by looping until caught up — reissuing exactly the request volume
-/// that tripped the limit, immediately after it lifts. The cursor is
-/// checkpointed after every page, so stopping early costs nothing: the next
-/// cycle resumes exactly where this one stopped, `horizon_page_limit` records
-/// later per additional cycle.
-const MAX_PAGES_PER_CYCLE: usize = 25;
+    match page
+        .embedded
+        .records
+        .first()
+        .and_then(|p| p.paging_token.clone())
+    {
+        Some(token) => {
+            /* Persist immediately so a crash before the first page still leaves
+            us baselined rather than replaying history next time. */
+            db::set_state(&state.pool, PAYMENT_CURSOR_KEY, &token).await?;
+            info!(cursor = %token, "Horizon poller baselined at latest payment");
+            Ok(token)
+        }
+        None => Ok("0".to_string()),
+    }
+}
 
 /// Run one poll cycle: page forward from the persisted cursor through every
 /// payment that has landed since, settling any that satisfy a pending intent,
-/// until caught up or [`MAX_PAGES_PER_CYCLE`] pages have been fetched. The
-/// cursor is advanced (and persisted) only after a page's records have been
-/// processed, so no record is ever skipped and a restart (or the next cycle,
-/// if the page cap was hit) resumes exactly where it left off. Safe to call
-/// repeatedly; re-seeing an already-settled record is a no-op (its intent is
-/// no longer pending).
-pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
+/// until caught up. The cursor is advanced (and persisted) only after a page's
+/// records have been processed, so no record is ever skipped and a restart
+/// resumes exactly where it left off. Safe to call repeatedly; re-seeing an
+/// already-settled record is a no-op (its intent is no longer pending).
+///
+/// The cycle gives up its turn at a page boundary — always with the cursor
+/// checkpointed first — in two cases (issue #226):
+///
+/// * `shutdown` has been signalled. A gateway that has been down for a while
+///   faces a catch-up measured in minutes (each page is up to [`PAGE_LIMIT`]
+///   records, each of which means DB writes and an outbound webhook), and
+///   without this check none of it observes SIGTERM: the process would be
+///   killed mid-page once the shutdown grace expired, replaying the unfinished
+///   page on the next boot and making the *next* shutdown worse.
+/// * `POLL_MAX_PAGES_PER_CYCLE` pages have been walked. Even with no shutdown
+///   pending, one cycle must not monopolise the poller task indefinitely.
+///
+/// In both cases the remaining backlog is simply picked up by the next cycle
+/// (or the next boot) from the checkpointed cursor.
+pub async fn poll_once(
+    state: &Arc<AppState>,
+    shutdown: &watch::Receiver<bool>,
+) -> anyhow::Result<usize> {
     let mut cursor = starting_cursor(state).await?;
     let mut settled = 0;
-    let mut pages = 0usize;
+    let max_pages = state.config.poll_max_pages_per_cycle;
+    let mut pages = 0u32;
 
     loop {
+        /* Checked at the top of the iteration, i.e. after the previous page's
+        checkpoint, so returning here never loses processed work. */
+        if *shutdown.borrow() {
+            info!(
+                settled,
+                pages, "poller shutting down mid-catch-up; cursor checkpointed"
+            );
+            return Ok(settled);
+        }
+
         let page = fetch_recent_payments(
             &state.http,
             &state.config.horizon_url,
             &state.config.gateway_public,
             &cursor,
-            state.config.horizon_page_limit,
+            PAGE_LIMIT,
         )
         .await?;
         let count = page.len();
-        pages += 1;
 
         for hp in &page {
             if let Some(token) = &hp.paging_token {
@@ -878,9 +702,6 @@ pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
             .and_then(elapsed_secs)
         {
             info!(cursor_age_secs, "poller cursor advanced");
-            state
-                .horizon_metrics
-                .record_cursor_age_secs(cursor_age_secs);
         }
 
         /* Checkpoint after the whole page is processed. If we crash mid-page the
@@ -889,29 +710,32 @@ pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
         db::set_state(&state.pool, PAYMENT_CURSOR_KEY, &cursor).await?;
 
         // A short page means Horizon has nothing newer — we're caught up.
-        if count < state.config.horizon_page_limit as usize {
+        if count < PAGE_LIMIT as usize {
             break;
         }
 
-        if pages >= MAX_PAGES_PER_CYCLE {
-            debug!(
+        /* Yield the task once the per-cycle page budget is spent. `0` means
+        unlimited, for operators who would rather one cycle ran to completion. */
+        pages += 1;
+        if max_pages > 0 && pages >= max_pages {
+            info!(
                 pages,
-                "poll cycle hit its per-cycle page cap; resuming next cycle"
+                settled, "poll cycle hit its page budget; resuming from the checkpoint next cycle"
             );
             break;
         }
     }
-
-    /* A completed cycle is on-chain progress even with nothing to settle — the
-    cursor advanced and the poller is alive. This heartbeat is what /ready's
-    cursor-freshness check measures (issue #315). */
-    state.task_health.note_success();
 
     Ok(settled)
 }
 
 /// Look up the pending intent matching this Horizon payment by memo, verify it,
 /// and settle it if it matches. Returns `true` when an intent was settled.
+///
+/// When the memo matches a terminal (completed/expired) intent, the transaction
+/// is recorded and a `payment.unexpected` webhook is fired — the merchant needs
+/// to know so they can refund the funds. The intent's terminal status is never
+/// mutated (issue #232).
 ///
 /// This is intentionally `pub` so integration tests can drive concurrent
 /// reconciliations to verify the single-settlement guarantee (issue #155).
@@ -921,70 +745,152 @@ pub async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> an
         None => return Ok(false),
     };
 
-    let payment = match db::find_pending_by_memo(&state.pool, memo).await? {
-        Some(p) => p,
-        None => return Ok(false),
-    };
+    // Fast path: find a still-active (pending/underpaid) intent.
+    if let Some(payment) = db::find_pending_by_memo(&state.pool, memo).await? {
+        return reconcile_active_payment(state, hp, payment).await;
+    }
 
+    // Slow path: the memo matched no active intent. Check whether it matches a
+    // terminal one — a customer who pays after completion/expiry has lost real
+    // funds that the gateway is the only component that can see (issue #232).
+    if let Some(payment) = db::find_by_memo_any_status(&state.pool, memo).await? {
+        // Only act on terminal intents (completed/expired). An underpaid intent
+        // that somehow slipped through the active check (extremely unlikely) is
+        // simply left alone.
+        if payment.status == "completed" || payment.status == "expired" {
+            reconcile_post_terminal_payment(state, hp, &payment).await?;
+        }
+    }
+
+    Ok(false)
+}
+
+/// Handle a Horizon payment that matches an **active** (pending/underpaid)
+/// intent — the normal settlement path.
+async fn reconcile_active_payment(
+    state: &Arc<AppState>,
+    hp: &HorizonPayment,
+    payment: db::Payment,
+) -> anyhow::Result<bool> {
     let hp_hash = hp.transaction_hash.as_deref().unwrap_or("");
 
     /* Gate on a real, matching, on-chain payment before recording anything, so
-    unrelated traffic never pollutes the ledger. The matcher returns `None`
-    for anything that does not satisfy this intent (wrong type/destination/
-    memo/asset, or an unparseable amount). */
-    let matched = match matches_intent(&payment, hp) {
-        Some(matched) => matched,
-        None => return Ok(false),
-    };
+    unrelated traffic never pollutes the ledger. `verify` returns `None` for
+    anything that does not satisfy this intent (wrong type/destination/memo/
+    asset, or an unparseable amount). */
+    if verify(
+        &payment,
+        hp,
+        &state.config.accepted_assets,
+        already_paid_stroops,
+    )
+    .is_none()
+    {
+        return Ok(false);
+    }
 
     /* Record this transaction idempotently. If it was already credited — seen
     on an earlier poll cycle, redelivered over the stream, or racing a
     concurrent reconciler — the insert is a no-op and we must not settle again.
     This makes re-processing any past transaction a no-op regardless of the
     order records arrive in (issue #119). */
-    if !db::record_processed_tx(&state.pool, &payment.id, hp_hash, matched.new_stroops).await? {
+    let new_stroops = hp
+        .amount
+        .as_deref()
+        .and_then(money::parse_stroops)
+        .unwrap_or(0);
+    if !db::record_processed_tx(&state.pool, &payment.id, hp_hash, new_stroops).await? {
         return Ok(false);
     }
 
     /* Re-sum over the recorded set (now including this transaction) so the
     persisted `paid_amount` always reflects every processed transaction. */
     let total_stroops = db::sum_processed_stroops(&state.pool, &payment.id).await?;
-    let decision =
-        SettlementDecision::from_totals(total_stroops, matched.expected_stroops, hp_hash);
+    let expected_stroops = money::parse_stroops(&payment.amount).unwrap_or(0);
+    let paid_amount = money::stroops_to_string(total_stroops);
 
-    match &decision.verdict {
-        Verdict::Completed { .. } => {}
-        Verdict::Overpaid { .. } => {
-            let excess = decision.delta.as_deref().unwrap_or_default();
+    use std::cmp::Ordering;
+    let (status, event, delta) = match total_stroops.cmp(&expected_stroops) {
+        Ordering::Equal => ("completed", "payment.completed", None),
+        Ordering::Greater => {
+            let excess = money::stroops_to_string(total_stroops - expected_stroops);
             info!(
                 payment_id = %payment.id,
                 excess = %excess,
                 "overpayment — intent completed, excess should be refunded"
             );
+            ("completed", "payment.overpaid", Some(excess))
         }
-        Verdict::Underpaid { .. } => {
-            let remaining = decision.delta.as_deref().unwrap_or_default();
+        Ordering::Less => {
+            let remaining = money::stroops_to_string(expected_stroops - total_stroops);
             warn!(
                 payment_id = %payment.id,
                 expected = %payment.amount,
-                paid = %decision.verdict.paid_amount(),
+                paid = %paid_amount,
                 remaining = %remaining,
                 "underpayment — intent remains open for a top-up"
             );
+            ("underpaid", "payment.underpaid", Some(remaining))
         }
-    }
+    };
 
     let did_settle = settle(
         state,
         &payment,
-        decision.status,
-        decision.verdict.tx_hash(),
-        decision.verdict.paid_amount(),
-        decision.event,
-        decision.delta.as_deref(),
+        status,
+        hp_hash,
+        &paid_amount,
+        event,
+        delta.as_deref(),
     )
     .await;
     Ok(did_settle)
+}
+
+/// Handle a Horizon payment that matches a **terminal** (completed/expired)
+/// intent (issue #232).
+///
+/// The intent's status is NOT changed — the terminal state is authoritative.
+/// The transaction is recorded in `processed_transactions` to avoid reprocessing
+/// it on subsequent poll cycles, and a `payment.unexpected` webhook is fired so
+/// the merchant knows funds arrived and can arrange a refund.
+async fn reconcile_post_terminal_payment(
+    state: &Arc<AppState>,
+    hp: &HorizonPayment,
+    payment: &db::Payment,
+) -> anyhow::Result<()> {
+    let hp_hash = hp.transaction_hash.as_deref().unwrap_or("");
+
+    /* Verify asset and amount match the intent before treating this as a
+    meaningful post-terminal payment. An unrelated transaction to the same
+    address with a colliding memo should not fire a webhook. */
+    let matched = match matches_intent(payment, hp) {
+        Some(m) => m,
+        None => return Ok(()),
+    };
+
+    /* Record idempotently so a re-seen transaction fires no duplicate webhook.
+    If this hash is already present the payment was already handled; skip. */
+    if !db::record_processed_tx(&state.pool, &payment.id, hp_hash, matched.new_stroops).await? {
+        return Ok(());
+    }
+
+    let amount_str = money::stroops_to_string(matched.new_stroops);
+    warn!(
+        payment_id = %payment.id,
+        prior_status = %payment.status,
+        tx_hash = %hp_hash,
+        amount = %amount_str,
+        "unexpected payment received for a terminal intent; \
+         merchant must arrange a refund"
+    );
+
+    /* Fire the webhook so the merchant can act. The intent copy passed to
+    dispatch carries the original terminal status — it is not mutated. The
+    `delta` field carries the unexpected amount so the merchant knows exactly
+    how much to refund. */
+    webhook::dispatch(state, payment, "payment.unexpected", Some(&amount_str)).await;
+    Ok(())
 }
 
 /// Persist a terminal or intermediate status for `payment` and fire its webhook.
@@ -1027,135 +933,27 @@ async fn settle(
         ?settlement_latency_secs,
         "payment settled"
     );
-    state
-        .payment_metrics
-        .record_settlement(status, settlement_latency_secs);
 
     // Reflect the new state in the copy we hand to the webhook.
     let mut settled = payment.clone();
     settled.status = status.to_string();
     settled.tx_hash = Some(tx_hash.to_string());
     settled.paid_amount = Some(paid_amount.to_string());
-    /* Webhook delivery is handled asynchronously by the webhook subsystem
-    (recording here is non-blocking from reconciliation's point of view).
-
-    Design note: dispatch() still delivers inline so the common case settles and
-    notifies in one pass with no added latency. The redrive worker is a safety net
-    on top of that for the crash case, not a replacement for it — rewriting dispatch
-    to be record-only would be a bigger, riskier change than issue #156 asked for
-    and would break the existing synchronous-delivery test coverage. */
+    /* Delivered inline, deliberately: the common case settles and notifies in
+    one pass with no added latency. This does mean a slow receiver stalls this
+    poll cycle for the duration of all inline retry attempts — the redrive
+    worker is the safety net for the crash case, not a replacement for inline
+    delivery. See issue #76 for the separate task of decoupling dispatch. */
     webhook::dispatch(state, &settled, event, delta).await;
     true
 }
 
-/// Floor and cap for the poller's failure backoff. Reuses the same
-/// equal-jitter schedule (`webhook::retry_delay`) the webhook redrive worker
-/// backs off with (issue #318) — the shape solves the same problem here:
-/// growth so repeated failures stop hammering Horizon at the configured poll
-/// interval, jitter so it doesn't retry in lockstep with itself every cycle.
-const POLL_BACKOFF_BASE: Duration = Duration::from_secs(1);
-const POLL_BACKOFF_MAX: Duration = Duration::from_secs(120);
-
-/// Three consecutive non-rate-limit 4xx responses for the same cursor form one
-/// alert incident. One response is ordinary retry noise; a cursor change,
-/// success, 429, 5xx, or transport error breaks the streak. The incident emits
-/// once at the threshold and ordinary per-attempt diagnostics continue.
-const REPEATED_CURSOR_4XX_THRESHOLD: u32 = 3;
-
-#[derive(Debug, Default)]
-struct RepeatedCursor4xx {
-    cursor: Option<String>,
-    consecutive: u32,
-    alerted: bool,
-}
-
-impl RepeatedCursor4xx {
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-
-    fn observe(&mut self, error: Option<&HorizonHttpError>) -> bool {
-        let Some(error) = error.filter(|error| error.is_cursor_client_error()) else {
-            self.reset();
-            return false;
-        };
-        let Some(cursor) = error.cursor.as_deref() else {
-            self.reset();
-            return false;
-        };
-
-        if self.cursor.as_deref() == Some(cursor) {
-            self.consecutive = self.consecutive.saturating_add(1);
-        } else {
-            self.cursor = Some(cursor.to_owned());
-            self.consecutive = 1;
-            self.alerted = false;
-        }
-
-        if self.consecutive >= REPEATED_CURSOR_4XX_THRESHOLD && !self.alerted {
-            self.alerted = true;
-            return true;
-        }
-        false
-    }
-}
-
-fn record_repeated_cursor_4xx(
-    tracker: &mut RepeatedCursor4xx,
-    horizon_error: Option<&HorizonHttpError>,
-    metrics: &crate::metrics::HorizonMetrics,
-    component: &'static str,
-) -> bool {
-    if !tracker.observe(horizon_error) {
-        return false;
-    }
-
-    let Some(error) = horizon_error else {
-        return false;
-    };
-    metrics.record_repeated_cursor_4xx();
-    error!(
-        alert = "horizon_repeated_cursor_4xx",
-        component,
-        status = %error.status,
-        cursor = %error.cursor.as_deref().unwrap_or(""),
-        consecutive_failures = tracker.consecutive,
-        "same Horizon cursor produced repeated client errors; payment detection may be stalled"
-    );
-    true
-}
-
-/// Choose how long to wait before the poller's next attempt, given this
-/// cycle's outcome (issue #313).
-///
-/// A `429`/`503` that carried `Retry-After` is honored exactly — Horizon told
-/// us how long to wait, and second-guessing it with our own backoff could
-/// still be too short. Every other failure (including a rate limit with no
-/// `Retry-After`) falls back to the exponential-with-jitter schedule, keyed
-/// on `consecutive_failures` so it keeps growing across repeated failures
-/// instead of resetting each cycle.
-fn next_poll_delay(consecutive_failures: u32, retry_after: Option<Duration>) -> Duration {
-    retry_after.unwrap_or_else(|| {
-        webhook::retry_delay(consecutive_failures, POLL_BACKOFF_BASE, POLL_BACKOFF_MAX)
-    })
-}
-
 /// Background loop that polls Horizon on the configured interval until the
 /// process shuts down. Idles (without polling) while no gateway is configured.
-///
-/// A failed cycle no longer waits out the fixed `POLL_INTERVAL_SECS` before
-/// trying again at the same rate that likely caused it (issue #313): a `429`
-/// backs off for at least `Retry-After`, and repeated failures of any kind
-/// back off exponentially with jitter, both reset to the configured interval
-/// by the next success.
-pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) -> TaskExit {
+pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     if !state.config.gateway_configured() {
-        /* Previously this parked on the shutdown signal purely so the
-        supervisor would not read a deliberate idle as an unexpected return.
-        Saying so explicitly is both clearer and cheaper: the supervisor now
-        knows this is terminal-by-design, reports it once, and does not hold a
-        task open for the life of the process to convey it (issue #317). */
-        return TaskExit::DisabledByConfig("STELLAR_GATEWAY_PUBLIC is unconfigured");
+        warn!("STELLAR_GATEWAY_PUBLIC is unconfigured; Horizon poller disabled");
+        return;
     }
 
     let interval = Duration::from_secs(state.config.poll_interval_secs.max(1));
@@ -1165,65 +963,18 @@ pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool
         "Horizon poller started"
     );
 
-    let mut consecutive_failures: u32 = 0;
-    let mut next_delay = interval;
-    let mut repeated_cursor_4xx = RepeatedCursor4xx::default();
-
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(next_delay) => {}
+            _ = tokio::time::sleep(interval) => {}
             _ = shutdown.changed() => {
                 info!("Horizon poller shutting down");
-                return TaskExit::ShutdownRequested;
+                return;
             }
         }
-        
-        // Re-check account existence and trustlines periodically.
-        if let Err(e) = verify_gateway_account(&state).await {
-            warn!(error = %e, "failed to verify gateway account during polling");
-        }
-
-        match poll_once(&state).await {
-            Ok(n) => {
-                if n == 0 {
-                    debug!("poll: nothing to settle");
-                } else {
-                    info!(settled = n, "poll cycle settled payments");
-                }
-                state.horizon_metrics.record_success();
-                repeated_cursor_4xx.reset();
-                consecutive_failures = 0;
-                next_delay = interval;
-            }
-            Err(e) => {
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                let horizon_err = e.downcast_ref::<HorizonHttpError>();
-                let rate_limited = horizon_err.is_some_and(|he| he.is_rate_limited());
-                let retry_after = horizon_err.and_then(|he| he.retry_after);
-
-                if rate_limited {
-                    state.horizon_metrics.record_rate_limited();
-                } else {
-                    state.horizon_metrics.record_error();
-                }
-
-                record_repeated_cursor_4xx(
-                    &mut repeated_cursor_4xx,
-                    horizon_err,
-                    &state.horizon_metrics,
-                    "poller",
-                );
-
-                next_delay = next_poll_delay(consecutive_failures, retry_after);
-                warn!(
-                    error = %e,
-                    rate_limited,
-                    retry_after_secs = retry_after.map(|d| d.as_secs()),
-                    consecutive_failures,
-                    next_delay_secs = next_delay.as_secs(),
-                    "poll cycle failed"
-                );
-            }
+        match poll_once(&state, &shutdown).await {
+            Ok(0) => debug!("poll: nothing to settle"),
+            Ok(n) => info!(settled = n, "poll cycle settled payments"),
+            Err(e) => warn!(error = %e, "poll cycle failed"),
         }
     }
 }
@@ -1267,12 +1018,10 @@ fn parse_sse_block(block: &str) -> SseEvent {
 /// automatically with exponential backoff, resuming from the last seen cursor
 /// so no payments are missed across a dropped connection. Idles (without
 /// connecting) while no gateway is configured.
-pub async fn run_stream_listener(
-    state: Arc<AppState>,
-    mut shutdown: watch::Receiver<bool>,
-) -> TaskExit {
+pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     if !state.config.gateway_configured() {
-        return TaskExit::DisabledByConfig("STELLAR_GATEWAY_PUBLIC is unconfigured");
+        warn!("STELLAR_GATEWAY_PUBLIC is unconfigured; Horizon stream listener disabled");
+        return;
     }
 
     info!(account = %state.config.gateway_public, "Horizon payment stream listener started");
@@ -1286,57 +1035,28 @@ pub async fn run_stream_listener(
     {
         Ok(c) => c,
         Err(e) => {
-            /* The case issue #317 calls out by name: this was a `warn!`
-            followed by a permanent exit, recorded as an ordinary stop. Payment
-            detection over the stream was simply gone, and nothing said so.
-            It is a fault, not a configuration choice, so it is reported as one
-            and the supervisor retries it. */
-            return TaskExit::Fatal(format!("failed to build stream HTTP client: {e}"));
+            warn!(error = %e, "failed to build stream HTTP client; stream listener disabled");
+            return;
         }
     };
 
     let base_backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(30);
     let mut backoff = base_backoff;
-    // Start at the live edge; subsequent reconnects resume from the last event.
-    let mut cursor = "now".to_string();
-    let idle_timeout = Duration::from_secs(state.config.stream_idle_timeout_secs);
-    let mut first_connection = true;
-    let mut repeated_cursor_4xx = RepeatedCursor4xx::default();
+    let mut cursor = stream_starting_cursor(&state).await;
 
     loop {
-        if !first_connection {
-            /* Every pass through the loop body after the first is a reconnect —
-            whether the previous connection closed cleanly, errored, or (issue
-            #312) went idle past `idle_timeout` with no error at all. A
-            persistently-reconnecting stream is the alertable signal that a
-            half-open connection keeps disabling live payment detection. */
-            state.horizon_metrics.record_stream_reconnect();
-        }
-        first_connection = false;
-
         let cursor_before = cursor.clone();
         tokio::select! {
-            result = stream_once(&state, &client, &mut cursor, idle_timeout) => {
+            result = stream_once(&state, &client, &mut cursor) => {
                 match result {
-                    Ok(()) => {
-                        repeated_cursor_4xx.reset();
-                        debug!("Horizon stream closed by server; reconnecting");
-                    }
-                    Err(e) => {
-                        record_repeated_cursor_4xx(
-                            &mut repeated_cursor_4xx,
-                            e.downcast_ref::<HorizonHttpError>(),
-                            &state.horizon_metrics,
-                            "stream",
-                        );
-                        warn!(error = %e, "Horizon stream dropped; reconnecting");
-                    }
+                    Ok(()) => debug!("Horizon stream closed by server; reconnecting"),
+                    Err(e) => warn!(error = %e, "Horizon stream dropped; reconnecting"),
                 }
             }
             _ = shutdown.changed() => {
                 info!("Horizon stream listener shutting down");
-                return TaskExit::ShutdownRequested;
+                return;
             }
         }
 
@@ -1348,63 +1068,71 @@ pub async fn run_stream_listener(
             _ = tokio::time::sleep(backoff) => {}
             _ = shutdown.changed() => {
                 info!("Horizon stream listener shutting down");
-                return TaskExit::ShutdownRequested;
+                return;
             }
         }
         backoff = (backoff * 2).min(max_backoff);
     }
 }
 
-/// Open one SSE connection and process events until the stream ends, errors,
-/// or goes `idle_timeout` without delivering a single byte. Advances `cursor`
-/// to the latest event `id` so a reconnect resumes cleanly.
+/// Resolve the cursor the stream should subscribe from.
 ///
-/// The dedicated stream client (built by [`run_stream_listener`]) carries no
-/// overall request timeout — the connection is meant to live indefinitely —
-/// so nothing else bounds a half-open socket that stops delivering bytes
-/// without closing: a NAT or load balancer dropping idle state without
-/// sending `RST`, or an upstream stall. Horizon sends periodic keep-alive
-/// comment lines on its SSE endpoints, so an idle window with no bytes at all
-/// is a reliable liveness signal (issue #312): every await on the next chunk
-/// is itself bounded by `idle_timeout`, and running past it is reported as an
-/// error so the caller's existing reconnect-with-backoff path picks it up
-/// exactly as it would a dropped connection.
+/// Preference order (issue #228):
+///
+/// 1. The stream's own persisted cursor, so a restart resumes exactly where the
+///    last connection left off.
+/// 2. The poller's cursor, for a database written before the stream persisted
+///    one of its own — still far better than the live edge.
+/// 3. `"now"`, only when neither exists (a genuinely fresh deployment), which
+///    is the same baseline the poller takes on its first run.
+///
+/// Re-seeing records the poller has already reconciled is harmless: settlement
+/// is idempotent through `processed_transactions`.
+async fn stream_starting_cursor(state: &Arc<AppState>) -> String {
+    for key in [STREAM_CURSOR_KEY, PAYMENT_CURSOR_KEY] {
+        match db::get_state(&state.pool, key).await {
+            Ok(Some(cursor)) => {
+                info!(cursor = %cursor, source = key, "stream listener resuming from persisted cursor");
+                return cursor;
+            }
+            Ok(None) => {}
+            /* A read failure must not take the listener down; baseline at the
+            live edge and let the poller cover the gap. */
+            Err(e) => warn!(error = %e, key, "could not read persisted stream cursor"),
+        }
+    }
+    info!("no persisted cursor; stream listener baselining at the live edge");
+    "now".to_string()
+}
+
+/// Open one SSE connection and process events until the stream ends or errors.
+/// Advances `cursor` to the latest event `id` so a reconnect resumes cleanly.
 async fn stream_once(
     state: &Arc<AppState>,
     client: &reqwest::Client,
     cursor: &mut String,
-    idle_timeout: Duration,
 ) -> anyhow::Result<()> {
-    let url = horizon_payments_url(
-        &state.config.horizon_url,
-        &state.config.gateway_public,
-        PaymentsRequest::Stream { cursor },
-    )?;
+    let url = format!(
+        "{}/accounts/{}/payments?cursor={}&join=transactions",
+        state.config.horizon_url.trim_end_matches('/'),
+        state.config.gateway_public,
+        cursor,
+    );
 
     let resp = client
-        .get(url)
+        .get(&url)
         .header("Accept", "text/event-stream")
         .send()
-        .await?;
-    let resp = horizon_success(resp, Some(cursor)).await?;
+        .await?
+        .error_for_status()?;
 
     let mut stream = resp.bytes_stream();
     /* Accumulate raw bytes (not lossily-decoded str) so multibyte characters
     split across chunk boundaries are never corrupted. */
     let mut buf: Vec<u8> = Vec::new();
 
-    loop {
-        let chunk = match tokio::time::timeout(idle_timeout, stream.next()).await {
-            Err(_) => {
-                return Err(anyhow::anyhow!(
-                    "no data received on Horizon stream for {idle_timeout:?}; \
-                     treating the connection as dead"
-                ));
-            }
-            Ok(None) => break,
-            Ok(Some(chunk)) => chunk?,
-        };
-        buf.extend_from_slice(&chunk);
+    while let Some(chunk) = stream.next().await {
+        buf.extend_from_slice(&chunk?);
 
         /* Dispatch every complete event (terminated by a blank line) in the
         buffer, leaving any partial trailing event for the next chunk. */
@@ -1437,9 +1165,19 @@ fn find_event_end(buf: &[u8]) -> Option<usize> {
 async fn handle_stream_event(state: &Arc<AppState>, block: &str, cursor: &mut String) {
     let ev = parse_sse_block(block);
 
-    // Advance the reconnect cursor as soon as we learn a newer event id.
+    /* Advance the reconnect cursor as soon as we learn a newer event id, and
+    persist it so a restart resumes here rather than re-baselining at the live
+    edge (issue #228). Stored under the stream's own key so it never fights
+    with the poller's cursor. A write failure is logged and tolerated: the
+    in-memory cursor still covers reconnects within this process, and the
+    poller remains the backstop across restarts. */
     if let Some(id) = ev.id {
-        *cursor = id;
+        if id != *cursor {
+            if let Err(e) = db::set_state(&state.pool, STREAM_CURSOR_KEY, &id).await {
+                warn!(error = %e, "failed to persist stream cursor");
+            }
+            *cursor = id;
+        }
     }
 
     if ev.event.as_deref() == Some("open") || ev.data.is_empty() {
@@ -1450,13 +1188,7 @@ async fn handle_stream_event(state: &Arc<AppState>, block: &str, cursor: &mut St
         Ok(hp) => {
             if let Some(cursor_age_secs) = hp.created_at.as_deref().and_then(elapsed_secs) {
                 info!(cursor_age_secs, "stream cursor advanced");
-                state
-                    .horizon_metrics
-                    .record_cursor_age_secs(cursor_age_secs);
             }
-            /* Receiving a payment record means the stream is alive and the
-            cursor moved — the same heartbeat /ready's freshness check uses. */
-            state.task_health.note_success();
             if let Err(e) = reconcile_payment(state, &hp).await {
                 warn!(error = %e, "failed to reconcile streamed payment");
             }
@@ -1471,10 +1203,6 @@ mod tests {
     use super::*;
 
     fn pending(asset: &str, amount: &str) -> db::Payment {
-        let asset_issuer = match asset {
-            "USDC" => Some("GUSDC".into()),
-            _ => None,
-        };
         db::Payment {
             id: "id-1".into(),
             merchant_id: "m".into(),
@@ -1482,6 +1210,7 @@ mod tests {
             memo: "MEMO1234".into(),
             amount: amount.into(),
             asset: asset.into(),
+            asset_issuer: None,
             status: "pending".into(),
             webhook_url: None,
             tx_hash: None,
@@ -1489,7 +1218,6 @@ mod tests {
             created_at: "now".into(),
             updated_at: "now".into(),
             expires_at: "later".into(),
-            asset_issuer,
         }
     }
 
@@ -1512,101 +1240,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn payment_urls_percent_encode_opaque_cursors_and_account_segments() {
-        let base = reqwest::Url::parse("https://horizon.example/custom/base/").unwrap();
-        let account = "GACCOUNT/child?role=admin#fragment +%";
-        let cursor = "opaque&limit=1#+% \t";
-        let url =
-            horizon_payments_url(&base, account, PaymentsRequest::Poll { cursor, limit: 200 })
-                .unwrap();
-
-        assert_eq!(
-            url.path(),
-            "/custom/base/accounts/GACCOUNT%2Fchild%3Frole=admin%23fragment%20+%25/payments"
-        );
-        assert_eq!(
-            url.query(),
-            Some("order=asc&cursor=opaque%26limit%3D1%23%2B%25+%09&limit=200&join=transactions")
-        );
-        assert_eq!(
-            url.query_pairs().collect::<Vec<_>>(),
-            vec![
-                ("order".into(), "asc".into()),
-                ("cursor".into(), cursor.into()),
-                ("limit".into(), "200".into()),
-                ("join".into(), "transactions".into()),
-            ],
-            "reserved cursor characters must remain one decoded query value"
-        );
-
-        for request in [
-            PaymentsRequest::Baseline {
-                cursor: Some(cursor),
-                limit: 200,
-            },
-            PaymentsRequest::Stream { cursor },
-        ] {
-            let url = horizon_payments_url(&base, account, request).unwrap();
-            let cursor_values: Vec<_> = url
-                .query_pairs()
-                .filter_map(|(key, value)| (key == "cursor").then_some(value.into_owned()))
-                .collect();
-            assert_eq!(
-                cursor_values,
-                vec![cursor.to_string()],
-                "every affected request shape must preserve the opaque cursor as one value"
-            );
-        }
-    }
-
-    #[test]
-    fn all_three_payment_request_shapes_preserve_existing_semantics() {
-        let base = reqwest::Url::parse("https://horizon.example/").unwrap();
-        let account = "GACCOUNT";
-
-        let poll = horizon_payments_url(
-            &base,
-            account,
-            PaymentsRequest::Poll {
-                cursor: "123456789",
-                limit: 200,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            poll.as_str(),
-            "https://horizon.example/accounts/GACCOUNT/payments?order=asc&cursor=123456789&limit=200&join=transactions"
-        );
-
-        let baseline = horizon_payments_url(
-            &base,
-            account,
-            PaymentsRequest::Baseline {
-                cursor: Some("123456789"),
-                limit: 200,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            baseline.as_str(),
-            "https://horizon.example/accounts/GACCOUNT/payments?order=desc&limit=200&cursor=123456789"
-        );
-
-        let stream = horizon_payments_url(
-            &base,
-            account,
-            PaymentsRequest::Stream {
-                cursor: "123456789",
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            stream.as_str(),
-            "https://horizon.example/accounts/GACCOUNT/payments?cursor=123456789&join=transactions"
-        );
-    }
-
     fn test_assets() -> Vec<crate::config::AcceptedAsset> {
         vec![
             crate::config::AcceptedAsset {
@@ -1625,7 +1258,7 @@ mod tests {
         let p = pending("XLM", "10.00");
         let hp = native_payment("10.0000000", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp, 0),
+            verify(&p, &hp, &test_assets(), 0),
             Some(Verdict::Completed {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "10".into(),
@@ -1638,7 +1271,7 @@ mod tests {
         let p = pending("XLM", "10");
         let hp = native_payment("12.5", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp, 0),
+            verify(&p, &hp, &test_assets(), 0),
             Some(Verdict::Overpaid {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "12.5".into(),
@@ -1651,7 +1284,7 @@ mod tests {
         let p = pending("XLM", "10");
         let hp = native_payment("9.9999999", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp, 0),
+            verify(&p, &hp, &test_assets(), 0),
             Some(Verdict::Underpaid {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "9.9999999".into(),
@@ -1665,14 +1298,14 @@ mod tests {
         let p = pending("XLM", "5");
         let hp1 = native_payment("3.0000000", "MEMO1234", "GGATEWAY");
         assert!(matches!(
-            verify(&p, &hp1, 0),
+            verify(&p, &hp1, &test_assets(), 0),
             Some(Verdict::Underpaid { .. })
         ));
 
         // Top-up: 2 XLM arrives; cumulative = 5 = expected — completes exactly.
         let hp2 = native_payment("2.0000000", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp2, 30_000_000),
+            verify(&p, &hp2, &test_assets(), 30_000_000),
             Some(Verdict::Completed {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "5".into(),
@@ -1687,7 +1320,7 @@ mod tests {
         // Top-up of 3 XLM; cumulative = 6 > 5 — overpaid.
         let hp = native_payment("3.0000000", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp, 30_000_000),
+            verify(&p, &hp, &test_assets(), 30_000_000),
             Some(Verdict::Overpaid {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "6".into(),
@@ -1696,49 +1329,10 @@ mod tests {
     }
 
     #[test]
-    fn settlement_decision_from_totals_drives_production_metadata() {
-        let exact = SettlementDecision::from_totals(100_000_000, 100_000_000, "TX_EXACT");
-        assert_eq!(
-            exact.verdict,
-            Verdict::Completed {
-                tx_hash: "TX_EXACT".into(),
-                paid_amount: "10".into(),
-            }
-        );
-        assert_eq!(exact.status, "completed");
-        assert_eq!(exact.event, "payment.completed");
-        assert_eq!(exact.delta, None);
-
-        let overpaid = SettlementDecision::from_totals(125_000_000, 100_000_000, "TX_OVERPAID");
-        assert_eq!(
-            overpaid.verdict,
-            Verdict::Overpaid {
-                tx_hash: "TX_OVERPAID".into(),
-                paid_amount: "12.5".into(),
-            }
-        );
-        assert_eq!(overpaid.status, "completed");
-        assert_eq!(overpaid.event, "payment.overpaid");
-        assert_eq!(overpaid.delta.as_deref(), Some("2.5"));
-
-        let underpaid = SettlementDecision::from_totals(99_999_999, 100_000_000, "TX_UNDERPAID");
-        assert_eq!(
-            underpaid.verdict,
-            Verdict::Underpaid {
-                tx_hash: "TX_UNDERPAID".into(),
-                paid_amount: "9.9999999".into(),
-            }
-        );
-        assert_eq!(underpaid.status, "underpaid");
-        assert_eq!(underpaid.event, "payment.underpaid");
-        assert_eq!(underpaid.delta.as_deref(), Some("0.0000001"));
-    }
-
-    #[test]
     fn wrong_memo_is_ignored() {
         let p = pending("XLM", "10");
         let hp = native_payment("10", "OTHER", "GGATEWAY");
-        assert_eq!(verify(&p, &hp, 0), None);
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
     }
 
     /// A `memo_id`/`memo_hash`/`memo_return` transaction that happens to
@@ -1749,7 +1343,7 @@ mod tests {
         let p = pending("XLM", "10");
         let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
         hp.transaction.as_mut().unwrap().memo_type = Some("id".into());
-        assert_eq!(verify(&p, &hp, 0), None);
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
     }
 
     #[test]
@@ -1757,14 +1351,14 @@ mod tests {
         let p = pending("XLM", "10");
         let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
         hp.transaction.as_mut().unwrap().memo_type = None;
-        assert_eq!(verify(&p, &hp, 0), None);
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
     }
 
     #[test]
     fn wrong_destination_is_ignored() {
         let p = pending("XLM", "10");
         let hp = native_payment("10", "MEMO1234", "GSOMEONEELSE");
-        assert_eq!(verify(&p, &hp, 0), None);
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
     }
 
     #[test]
@@ -1774,7 +1368,7 @@ mod tests {
         hp.asset_type = Some("credit_alphanum4".into());
         hp.asset_code = Some("USDC".into());
         hp.asset_issuer = Some("GUSDC".into());
-        assert_eq!(verify(&p, &hp, 0), None);
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
     }
 
     #[test]
@@ -1797,7 +1391,7 @@ mod tests {
             created_at: None,
         };
         assert!(matches!(
-            verify(&p, &hp, 0),
+            verify(&p, &hp, &test_assets(), 0),
             Some(Verdict::Completed { .. })
         ));
     }
@@ -1821,67 +1415,10 @@ mod tests {
             paging_token: Some("1".into()),
             created_at: None,
         };
-        assert_eq!(verify(&p, &hp, 0), None);
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
         // Sanity: with the right issuer it would have matched.
         hp.asset_issuer = Some("GUSDC".into());
-        assert!(verify(&p, &hp, 0).is_some());
-    }
-
-    #[test]
-    fn native_payment_does_not_settle_usdc_intent_without_issuer() {
-        /* `ACCEPTED_ASSETS=XLM,USDC` (no issuer) used to persist a USDC intent
-        with `asset_issuer: None`, and `verify()` treated issuer-less as native
-        — so 100 XLM settled a 100 USDC invoice (issue #221). */
-        let mut p = pending("USDC", "100");
-        p.asset_issuer = None;
-        let hp = native_payment("100.0000000", "MEMO1234", "GGATEWAY");
-        assert_eq!(verify(&p, &hp, 0), None);
-        // A real USDC credit payment must not match either — there is no issuer
-        // to pin the intent to.
-        let credit = HorizonPayment {
-            kind: "payment".into(),
-            amount: Some("100.0".into()),
-            asset_type: Some("credit_alphanum4".into()),
-            asset_code: Some("USDC".into()),
-            asset_issuer: Some("GUSDC".into()),
-            to: Some("GGATEWAY".into()),
-            transaction_hash: Some("TXHASH".into()),
-            transaction: Some(TransactionRef {
-                memo: Some("MEMO1234".into()),
-                memo_type: Some("text".into()),
-                successful: Some(true),
-            }),
-            paging_token: Some("1".into()),
-            created_at: None,
-        };
-        assert_eq!(verify(&p, &credit, 0), None);
-    }
-
-    #[test]
-    fn same_code_from_a_different_issuer_does_not_settle() {
-        /* Intent priced in USDC from issuer A. A Horizon payment of USDC from
-        issuer B must not settle it, even though both share a code (issue #222). */
-        let mut p = pending("USDC", "5");
-        p.asset_issuer = Some("GISSUER_A".into());
-        let mut hp = HorizonPayment {
-            kind: "payment".into(),
-            amount: Some("5.0".into()),
-            asset_type: Some("credit_alphanum4".into()),
-            asset_code: Some("USDC".into()),
-            asset_issuer: Some("GISSUER_B".into()),
-            to: Some("GGATEWAY".into()),
-            transaction_hash: Some("TXHASH".into()),
-            transaction: Some(TransactionRef {
-                memo: Some("MEMO1234".into()),
-                memo_type: Some("text".into()),
-                successful: Some(true),
-            }),
-            paging_token: Some("1".into()),
-            created_at: None,
-        };
-        assert_eq!(verify(&p, &hp, 0), None);
-        hp.asset_issuer = Some("GISSUER_A".into());
-        assert!(verify(&p, &hp, 0).is_some());
+        assert!(verify(&p, &hp, &test_assets(), 0).is_some());
     }
 
     #[test]
@@ -1889,7 +1426,7 @@ mod tests {
         let p = pending("XLM", "10");
         let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
         hp.kind = "create_account".into();
-        assert_eq!(verify(&p, &hp, 0), None);
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
     }
 
     /// A transaction Horizon reports as `successful: false` must never settle an
@@ -1899,11 +1436,11 @@ mod tests {
         let p = pending("XLM", "10");
         let mut hp = native_payment("10.0000000", "MEMO1234", "GGATEWAY");
         hp.transaction.as_mut().unwrap().successful = Some(false);
-        assert_eq!(verify(&p, &hp, 0), None);
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
         // Sanity: the same record with `successful: true` would have completed.
         hp.transaction.as_mut().unwrap().successful = Some(true);
         assert!(matches!(
-            verify(&p, &hp, 0),
+            verify(&p, &hp, &test_assets(), 0),
             Some(Verdict::Completed { .. })
         ));
     }
@@ -1915,7 +1452,7 @@ mod tests {
         let p = pending("XLM", "10");
         let mut hp = native_payment("10.0000000", "MEMO1234", "GGATEWAY");
         hp.transaction.as_mut().unwrap().successful = None;
-        assert_eq!(verify(&p, &hp, 0), None);
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
     }
 
     fn native_balance() -> AccountBalance {
@@ -1923,6 +1460,9 @@ mod tests {
             asset_type: Some("native".into()),
             asset_code: None,
             asset_issuer: None,
+            balance: Some("100.0000000".into()),
+            is_authorized: true,
+            limit: None,
         }
     }
 
@@ -1931,6 +1471,16 @@ mod tests {
             asset_type: Some("credit_alphanum4".into()),
             asset_code: Some(code.into()),
             asset_issuer: Some(issuer.into()),
+            balance: Some("0.0000000".into()),
+            is_authorized: true,
+            limit: Some("922337203685.4775807".into()),
+        }
+    }
+
+    fn unauthorized_balance(code: &str, issuer: &str) -> AccountBalance {
+        AccountBalance {
+            is_authorized: false,
+            ..issued_balance(code, issuer)
         }
     }
 
@@ -1957,6 +1507,43 @@ mod tests {
         let missing = missing_trustlines(&assets, &balances);
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].code, "USDC");
+    }
+
+    #[test]
+    fn missing_trustlines_flags_unauthorized_trustline() {
+        // Trustline exists but is_authorized=false — treated as missing.
+        let assets = test_assets();
+        let balances = [native_balance(), unauthorized_balance("USDC", "GUSDC")];
+        let missing = missing_trustlines(&assets, &balances);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].code, "USDC");
+    }
+
+    #[test]
+    fn missing_trustlines_authorized_trustline_not_flagged() {
+        // is_authorized=true (the default): not flagged as missing.
+        let assets = test_assets();
+        let balances = [native_balance(), issued_balance("USDC", "GUSDC")];
+        assert!(missing_trustlines(&assets, &balances).is_empty());
+    }
+
+    #[test]
+    fn trustline_headroom_computes_limit_minus_balance() {
+        let assets = test_assets();
+        // 1000 limit, 300 balance → 700 XLM headroom = 7_000_000_000 stroops
+        let b = AccountBalance {
+            asset_type: Some("credit_alphanum4".into()),
+            asset_code: Some("USDC".into()),
+            asset_issuer: Some("GUSDC".into()),
+            balance: Some("300.0000000".into()),
+            is_authorized: true,
+            limit: Some("1000.0000000".into()),
+        };
+        let headroom = trustline_headroom(&assets, &[b]);
+        assert_eq!(headroom.len(), 1);
+        assert_eq!(headroom[0].0.code, "USDC");
+        // 700 * 10_000_000 stroops = 7_000_000_000
+        assert_eq!(headroom[0].1, 7_000_000_000);
     }
 
     #[test]
@@ -2011,7 +1598,7 @@ mod tests {
         let hp: HorizonPayment = serde_json::from_str(data).unwrap();
         let p = pending("XLM", "10.00");
         assert!(matches!(
-            verify(&p, &hp, 0),
+            verify(&p, &hp, &test_assets(), 0),
             Some(Verdict::Completed { .. })
         ));
     }
@@ -2045,188 +1632,5 @@ mod tests {
             page.embedded.records[0].paging_token.as_deref(),
             Some("123456789-1")
         );
-    }
-
-    // ── Poller backoff (issue #313) ──────────────────────────────────────────
-
-    #[test]
-    fn retry_after_header_parses_delta_seconds() {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(reqwest::header::RETRY_AFTER, "30".parse().unwrap());
-        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(30)));
-    }
-
-    #[test]
-    fn retry_after_header_absent_is_none() {
-        assert_eq!(parse_retry_after(&reqwest::header::HeaderMap::new()), None);
-    }
-
-    /// The HTTP-date form is deliberately not parsed (see `parse_retry_after`'s
-    /// doc comment) — an unrecognised value must fall back to `None`, not panic
-    /// or misparse into a nonsense duration.
-    #[test]
-    fn retry_after_header_http_date_form_is_ignored() {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::RETRY_AFTER,
-            "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
-        );
-        assert_eq!(parse_retry_after(&headers), None);
-    }
-
-    #[test]
-    fn is_rate_limited_true_for_429_and_503() {
-        for status in [
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            reqwest::StatusCode::SERVICE_UNAVAILABLE,
-        ] {
-            let err = HorizonHttpError {
-                status,
-                retry_after: None,
-                cursor: None,
-                body: String::new(),
-            };
-            assert!(err.is_rate_limited(), "{status} must be rate_limited");
-        }
-    }
-
-    #[test]
-    fn is_rate_limited_false_for_an_ordinary_server_error() {
-        let err = HorizonHttpError {
-            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-            retry_after: None,
-            cursor: None,
-            body: String::new(),
-        };
-        assert!(!err.is_rate_limited());
-    }
-
-    fn cursor_error(status: reqwest::StatusCode, cursor: &str) -> HorizonHttpError {
-        HorizonHttpError {
-            status,
-            retry_after: None,
-            cursor: Some(cursor.to_owned()),
-            body: String::new(),
-        }
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn third_same_cursor_4xx_emits_one_distinct_alert_and_metric() {
-        let error = cursor_error(reqwest::StatusCode::BAD_REQUEST, "opaque&cursor");
-        let metrics = crate::metrics::HorizonMetrics::new();
-        let mut tracker = RepeatedCursor4xx::default();
-
-        assert!(!record_repeated_cursor_4xx(
-            &mut tracker,
-            Some(&error),
-            &metrics,
-            "test"
-        ));
-        assert!(!record_repeated_cursor_4xx(
-            &mut tracker,
-            Some(&error),
-            &metrics,
-            "test"
-        ));
-        assert_eq!(metrics.repeated_cursor_4xx(), 0);
-
-        assert!(record_repeated_cursor_4xx(
-            &mut tracker,
-            Some(&error),
-            &metrics,
-            "test"
-        ));
-        assert_eq!(metrics.repeated_cursor_4xx(), 1);
-        assert!(logs_contain("horizon_repeated_cursor_4xx"));
-
-        assert!(!record_repeated_cursor_4xx(
-            &mut tracker,
-            Some(&error),
-            &metrics,
-            "test"
-        ));
-        assert_eq!(
-            metrics.repeated_cursor_4xx(),
-            1,
-            "one unchanged streak must create only one alert incident"
-        );
-    }
-
-    #[test]
-    fn single_changed_or_rate_limited_cursor_does_not_alert() {
-        let bad_a = cursor_error(reqwest::StatusCode::BAD_REQUEST, "cursor-a");
-        let bad_b = cursor_error(reqwest::StatusCode::BAD_REQUEST, "cursor-b");
-        let rate_limited = cursor_error(reqwest::StatusCode::TOO_MANY_REQUESTS, "cursor-b");
-        let metrics = crate::metrics::HorizonMetrics::new();
-        let mut tracker = RepeatedCursor4xx::default();
-
-        assert!(!record_repeated_cursor_4xx(
-            &mut tracker,
-            Some(&bad_a),
-            &metrics,
-            "test"
-        ));
-        assert!(!record_repeated_cursor_4xx(
-            &mut tracker,
-            Some(&bad_b),
-            &metrics,
-            "test"
-        ));
-        assert!(!record_repeated_cursor_4xx(
-            &mut tracker,
-            Some(&bad_b),
-            &metrics,
-            "test"
-        ));
-        for _ in 0..REPEATED_CURSOR_4XX_THRESHOLD {
-            assert!(!record_repeated_cursor_4xx(
-                &mut tracker,
-                Some(&rate_limited),
-                &metrics,
-                "test"
-            ));
-        }
-        assert_eq!(metrics.repeated_cursor_4xx(), 0);
-    }
-
-    /// A `Retry-After` from Horizon is honored exactly, not folded into or
-    /// capped by the exponential schedule.
-    #[test]
-    fn next_delay_honors_retry_after_over_the_backoff_schedule() {
-        assert_eq!(
-            next_poll_delay(1, Some(Duration::from_secs(300))),
-            Duration::from_secs(300),
-            "a large Retry-After must not be clamped by POLL_BACKOFF_MAX"
-        );
-        assert_eq!(
-            next_poll_delay(1, Some(Duration::from_millis(500))),
-            Duration::from_millis(500),
-            "a small Retry-After must still be honored, not raised to a floor"
-        );
-    }
-
-    /// Without a `Retry-After`, repeated failures back off exponentially:
-    /// equal jitter keeps each delay within `[ceiling/2, ceiling]`
-    /// (`webhook::retry_delay`'s contract), and the ceiling for
-    /// `consecutive_failures=10` has long since saturated at
-    /// `POLL_BACKOFF_MAX` (`POLL_BACKOFF_BASE * 2^9` vastly exceeds it) — so
-    /// unlike failure 1, whose ceiling is still `POLL_BACKOFF_BASE`, every
-    /// draw for failure 10 must land in the top half of the max.
-    #[test]
-    fn next_delay_without_retry_after_grows_with_consecutive_failures() {
-        let first = next_poll_delay(1, None);
-        assert!(
-            first <= POLL_BACKOFF_BASE,
-            "failure 1's ceiling must still be POLL_BACKOFF_BASE, got {first:?}"
-        );
-
-        for _ in 0..20 {
-            let tenth = next_poll_delay(10, None);
-            assert!(
-                tenth >= POLL_BACKOFF_MAX / 2 && tenth <= POLL_BACKOFF_MAX,
-                "failure 10 must be within [MAX/2, MAX], got {tenth:?}"
-            );
-        }
     }
 }

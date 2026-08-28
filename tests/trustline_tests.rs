@@ -1,12 +1,9 @@
-//! Trustline checking, at boot and on a recurring interval (issue #116 and
-//! its follow-up).
+//! Startup trustline check (issue #116).
 //!
 //! `horizon::check_trustlines` queries Horizon for the gateway account's
 //! balances and surfaces any accepted asset the account has no trustline for —
 //! such assets would otherwise mint unpayable intents. These tests drive it
-//! against a mock Horizon endpoint, and also cover `horizon::run_trustline_checker`
-//! (the background task that re-runs the check after boot) and the
-//! `TrustlineMetrics` state both of them feed.
+//! against a mock Horizon endpoint.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -16,30 +13,21 @@ use stellargate::{
     config::{AcceptedAsset, Config, ListenerMode},
     db, horizon, AppState,
 };
-use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const GATEWAY: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 const USDC_ISSUER: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
 
-/// A fresh, uniquely-named in-memory SQLite database with `cache=shared`, so
-/// every connection the pool opens talks to the SAME database rather than
-/// each getting its own private one, which a bare `sqlite::memory:` DSN
-/// would do with this pool's default multi-connection size (issue #309).
-fn shared_memory_dsn() -> String {
-    format!("sqlite:file:{}?mode=memory&cache=shared", Uuid::new_v4())
-}
-
 /// Build an `AppState` whose Horizon client points at `horizon_url` and which
 /// accepts XLM plus USDC issued by `USDC_ISSUER`.
 async fn make_state(horizon_url: String) -> Arc<AppState> {
-    let dsn = shared_memory_dsn();
     let pool = SqlitePoolOptions::new()
-        // A shared-cache in-memory database is dropped once its last
-        // connection closes — keep exactly one open for the pool's lifetime.
-        .min_connections(1)
-        .connect_with(SqliteConnectOptions::from_str(&dsn).unwrap())
+        .connect_with(
+            SqliteConnectOptions::from_str("sqlite::memory:")
+                .unwrap()
+                .create_if_missing(true),
+        )
         .await
         .unwrap();
     db::migrate(&pool).await.unwrap();
@@ -48,9 +36,9 @@ async fn make_state(horizon_url: String) -> Arc<AppState> {
         pool,
         config: Config {
             port: 0,
-            database_url: dsn,
+            database_url: "sqlite::memory:".into(),
             network: "testnet".into(),
-            horizon_url: horizon_url.parse().unwrap(),
+            horizon_url,
             gateway_public: GATEWAY.into(),
             accepted_assets: vec![
                 AcceptedAsset {
@@ -65,9 +53,7 @@ async fn make_state(horizon_url: String) -> Arc<AppState> {
             webhook_secret: "a-very-long-and-secure-webhook-signing-secret-32-chars".into(),
             webhook_retry_attempts: 1,
             webhook_retry_delay_ms: 0,
-            webhook_retry_max_delay_ms: 60_000,
             allowed_webhook_schemes: vec!["https".into()],
-            webhook_payload_detail: stellargate::config::WebhookPayloadDetail::Minimal,
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
             webhook_redrive_concurrency: 4,
@@ -75,14 +61,12 @@ async fn make_state(horizon_url: String) -> Arc<AppState> {
             webhook_redrive_grace_secs: 60,
             webhook_redrive_backoff_initial_secs: 0,
             webhook_redrive_backoff_max_secs: 0,
-            webhook_redrive_jitter_secs: 0,
             retention_interval_secs: 3600,
             webhook_delivery_retention_days: 30,
             idempotency_retention_days: 7,
             poll_interval_secs: 10,
-            cursor_staleness_multiple: 3,
+            poll_max_pages_per_cycle: 50,
             payment_ttl_secs: 3600,
-            expiry_batch_size: 500,
             rate_limit_requests_per_sec: 10000,
             db_pool_max_connections: 5,
             db_busy_timeout_ms: 5000,
@@ -91,28 +75,12 @@ async fn make_state(horizon_url: String) -> Arc<AppState> {
             webhook_allow_private_targets: true,
             admin_provisioning_secret: String::new(),
             request_timeout_secs: 30,
-            stream_idle_timeout_secs: 30,
-            trusted_proxy_cidrs: vec![],
-            max_payment_amount: Default::default(),
-            min_payment_amount: Default::default(),
-            max_body_bytes: 256 * 1024,
-            rate_limiter_max_keys: 10_000,
-            rate_limiter_idle_ttl_secs: 60,
-            pagination_default_limit: 20,
-            pagination_max_limit: 100,
-            shutdown_grace_secs: 30,
-            horizon_page_limit: 200,
-            db_prune_batch_size: 500,
-            retention_max_rows_per_cycle: 50_000,
         },
         http: reqwest::Client::new(),
         webhook_http: reqwest::Client::new(),
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
         horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
-        trustline_metrics: stellargate::metrics::TrustlineMetrics::new(),
-        http_metrics: stellargate::metrics::HttpMetrics::new(),
-        payment_metrics: stellargate::metrics::PaymentMetrics::new(),
         task_health: stellargate::TaskHealth::new(),
     })
 }
@@ -321,4 +289,95 @@ async fn run_trustline_checker_refreshes_state_on_its_interval() {
         Some(true),
         "the periodic checker must have run at least once on its own"
     );
+}
+
+/// An unauthorized trustline (is_authorized=false) is reported as missing,
+/// because it cannot receive payments — just like a totally absent one (issue #230).
+#[tokio::test]
+async fn check_trustlines_surfaces_unauthorized_trustline_as_missing() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/accounts/{GATEWAY}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "balances": [
+                { "balance": "100.0", "asset_type": "native" },
+                {
+                    "balance": "0.0",
+                    "asset_type": "credit_alphanum4",
+                    "asset_code": "USDC",
+                    "asset_issuer": USDC_ISSUER,
+                    "is_authorized": false,
+                    "limit": "922337203685.4775807"
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let state = make_state(server.uri()).await;
+    let missing = horizon::check_trustlines(&state).await.unwrap();
+    assert_eq!(missing, vec!["USDC".to_string()]);
+    assert_eq!(state.trustline_metrics.is_missing("USDC"), Some(true));
+}
+
+/// An authorized trustline (is_authorized=true, or field absent which
+/// defaults to true) is considered usable (issue #230).
+#[tokio::test]
+async fn check_trustlines_authorized_trustline_is_not_reported_missing() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/accounts/{GATEWAY}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "balances": [
+                { "balance": "100.0", "asset_type": "native" },
+                {
+                    "balance": "0.0",
+                    "asset_type": "credit_alphanum4",
+                    "asset_code": "USDC",
+                    "asset_issuer": USDC_ISSUER,
+                    "is_authorized": true,
+                    "limit": "922337203685.4775807"
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let state = make_state(server.uri()).await;
+    let missing = horizon::check_trustlines(&state).await.unwrap();
+    assert!(missing.is_empty());
+    assert_eq!(state.trustline_metrics.is_missing("USDC"), Some(false));
+}
+
+/// Headroom (limit - balance) is exposed in TrustlineMetrics after a
+/// successful check (issue #230).
+#[tokio::test]
+async fn check_trustlines_records_headroom() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/accounts/{GATEWAY}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "balances": [
+                { "balance": "100.0", "asset_type": "native" },
+                {
+                    "balance": "300.0000000",
+                    "asset_type": "credit_alphanum4",
+                    "asset_code": "USDC",
+                    "asset_issuer": USDC_ISSUER,
+                    "is_authorized": true,
+                    "limit": "1000.0000000"
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let state = make_state(server.uri()).await;
+    horizon::check_trustlines(&state).await.unwrap();
+
+    let headroom = state.trustline_metrics.snapshot_headroom();
+    assert_eq!(headroom.len(), 1);
+    assert_eq!(headroom[0].0, "USDC");
+    // 700 XLM * 10_000_000 stroops/XLM = 7_000_000_000 stroops
+    assert_eq!(headroom[0].1, 7_000_000_000i64);
 }

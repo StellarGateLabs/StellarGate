@@ -11,6 +11,13 @@
 {$DOMAIN} {
 	encode zstd gzip
 
+	# Caddy defaults to TLS 1.2+ already; pinned explicitly so a future Caddy
+	# default change can't silently reopen 1.0/1.1 for a service handling
+	# payment data.
+	tls {
+		protocols tls1.2 tls1.3
+	}
+
 	# The gateway is not published on a host port; this is the only route in.
 	reverse_proxy app:3000 {
 		# Preserve the client IP. The rate limiter and the auth failure logs
@@ -28,6 +35,9 @@
 		X-Content-Type-Options "nosniff"
 		X-Frame-Options "DENY"
 		Referrer-Policy "strict-origin-when-cross-origin"
+		# This is a JSON API with no camera/mic/geolocation surface of its
+		# own; deny every browser feature a client might otherwise inherit.
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
 		# The dashboard sets its own CSP per-response; don't override it here.
 		-Server
 	}

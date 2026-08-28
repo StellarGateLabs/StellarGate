@@ -92,7 +92,7 @@ cat <<'EOF'
 EOF
 
 # ── Source ────────────────────────────────────────────────────────────────
-if [[ -d $APP_DIR/.git ]]; then
+if [[ -d "$APP_DIR/.git" ]]; then
 	log "Updating existing checkout at $APP_DIR"
 	git -C "$APP_DIR" pull --ff-only
 else

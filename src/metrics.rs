@@ -9,9 +9,8 @@
 //! `GET /metrics` returns a plain-text Prometheus-compatible snapshot so any
 //! standard scraper can ingest the data with zero configuration.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Histogram buckets for webhook delivery latency (milliseconds).
 /// Covers the range from sub-10 ms fast paths up to the 10 s default timeout.
@@ -208,49 +207,20 @@ impl Default for AuthMetrics {
     }
 }
 
-/// Outcome counters for the Horizon poller's cycles, so throttling or
-/// sustained failure is a queryable fact on the `/metrics` scrape rather than
-/// only a `warn!` line indistinguishable from a one-off blip (issue #313).
+/// Counters for Horizon record handling that would otherwise only be visible in
+/// logs. Currently tracks records the reconciler refused to credit.
 #[derive(Clone)]
 pub struct HorizonMetrics {
     inner: Arc<HorizonMetricsInner>,
 }
 
+#[derive(Default)]
 struct HorizonMetricsInner {
-    /// Cycles that completed without error (whether or not anything settled).
-    success: AtomicU64,
-    /// Cycles that failed on a `429`/`503` from Horizon.
-    rate_limited: AtomicU64,
-    /// Cycles that failed for any other reason.
-    error: AtomicU64,
-    /// Distinct incidents where one cursor produced three consecutive
-    /// non-rate-limit 4xx responses. Incremented once per streak so alerts are
-    /// actionable without turning every retry into a second incident.
-    repeated_cursor_4xx: AtomicU64,
-    /// Times the SSE stream listener reconnected — a closed connection, an
-    /// HTTP error, or (issue #312) an idle timeout with no error at all. A
-    /// persistently-reconnecting stream is the alertable signal that a
-    /// half-open connection is repeatedly disabling live payment detection.
-    stream_reconnects: AtomicU64,
-    /// Age, in seconds, of the most recently processed Horizon payment record
-    /// — the same value `poll_once` and `handle_stream_event` already compute
-    /// via `elapsed_secs` and previously only logged. This is the sharpest
-    /// signal of whether payment detection is falling behind, and was
-    /// unavailable to alerting until exported here (missing-metrics issue).
-    cursor_age_secs: AtomicI64,
-}
-
-impl Default for HorizonMetricsInner {
-    fn default() -> Self {
-        Self {
-            success: AtomicU64::new(0),
-            rate_limited: AtomicU64::new(0),
-            error: AtomicU64::new(0),
-            repeated_cursor_4xx: AtomicU64::new(0),
-            stream_reconnects: AtomicU64::new(0),
-            cursor_age_secs: AtomicI64::new(0),
-        }
-    }
+    /// Horizon payment records skipped because they carried no usable
+    /// `transaction_hash`. A healthy Horizon never produces these, so any
+    /// non-zero value means an unexpected payload (a proxy, a mock, a
+    /// truncated response) is reaching the reconciler (issue #224).
+    unhashed_records_skipped: AtomicU64,
 }
 
 impl HorizonMetrics {
@@ -260,51 +230,15 @@ impl HorizonMetrics {
         }
     }
 
-    pub fn record_success(&self) {
-        self.inner.success.fetch_add(1, Ordering::Relaxed);
-    }
-    pub fn record_rate_limited(&self) {
-        self.inner.rate_limited.fetch_add(1, Ordering::Relaxed);
-    }
-    pub fn record_error(&self) {
-        self.inner.error.fetch_add(1, Ordering::Relaxed);
-    }
-    pub fn record_repeated_cursor_4xx(&self) {
+    /// Record one Horizon record skipped for having no transaction hash.
+    pub fn record_unhashed_record_skipped(&self) {
         self.inner
-            .repeated_cursor_4xx
+            .unhashed_records_skipped
             .fetch_add(1, Ordering::Relaxed);
     }
-    pub fn record_stream_reconnect(&self) {
-        self.inner.stream_reconnects.fetch_add(1, Ordering::Relaxed);
-    }
 
-    /// Record the age (in seconds) of the most recently processed Horizon
-    /// payment record. Called from `poll_once` after each page and from
-    /// `handle_stream_event` for each streamed record, alongside the
-    /// existing `info!(cursor_age_secs, ...)` log lines.
-    pub fn record_cursor_age_secs(&self, secs: i64) {
-        self.inner.cursor_age_secs.store(secs, Ordering::Relaxed);
-    }
-
-    // ── Snapshot accessors ────────────────────────────────────────────────
-
-    pub fn success(&self) -> u64 {
-        self.inner.success.load(Ordering::Relaxed)
-    }
-    pub fn rate_limited(&self) -> u64 {
-        self.inner.rate_limited.load(Ordering::Relaxed)
-    }
-    pub fn error(&self) -> u64 {
-        self.inner.error.load(Ordering::Relaxed)
-    }
-    pub fn repeated_cursor_4xx(&self) -> u64 {
-        self.inner.repeated_cursor_4xx.load(Ordering::Relaxed)
-    }
-    pub fn stream_reconnects(&self) -> u64 {
-        self.inner.stream_reconnects.load(Ordering::Relaxed)
-    }
-    pub fn cursor_age_secs(&self) -> i64 {
-        self.inner.cursor_age_secs.load(Ordering::Relaxed)
+    pub fn unhashed_records_skipped(&self) -> u64 {
+        self.inner.unhashed_records_skipped.load(Ordering::Relaxed)
     }
 }
 
@@ -342,6 +276,9 @@ impl RouteLatency {
                 self.buckets[i] += 1;
             }
         }
+        // SAFETY: the `is_empty()` branch above always populates `buckets`
+        // with HTTP_LATENCY_BUCKETS_MS.len() + 1 (>= 1) slots before this
+        // line runs, so `last_mut()` can never return None.
         *self.buckets.last_mut().unwrap() += 1;
     }
 }
@@ -375,7 +312,10 @@ impl HttpMetrics {
 
     /// Record one completed HTTP request.
     pub fn record(&self, method: &str, route: &str, status: u16, elapsed_ms: u64) {
-        let mut inner = self.inner.lock().unwrap();
+        // A poisoned metrics mutex means a previous worker panicked while the
+        // lock was held. Recover the underlying state instead of crashing the
+        // process and continue recording metrics.
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         *inner
             .requests
             .entry((method.to_string(), route.to_string(), status))
@@ -389,7 +329,7 @@ impl HttpMetrics {
 
     /// Snapshot of request counts, sorted for deterministic exposition.
     fn requests_snapshot(&self) -> Vec<(String, String, u16, u64)> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut rows: Vec<_> = inner
             .requests
             .iter()
@@ -403,7 +343,7 @@ impl HttpMetrics {
 
     /// Snapshot of latency distributions, sorted for deterministic exposition.
     fn latency_snapshot(&self) -> Vec<(String, String, RouteLatency)> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut rows: Vec<_> = inner
             .latency
             .iter()
@@ -583,10 +523,16 @@ pub struct TrustlineMetrics {
 }
 
 struct TrustlineMetricsInner {
-    /// Asset code -> confirmed missing (`true`) or confirmed present
-    /// (`false`). Only ever written by a successful check; a code absent from
-    /// the map has simply never been confirmed either way.
+    /// Asset code -> confirmed missing/unauthorized (`true`) or confirmed
+    /// usable (`false`). Only ever written by a successful check; a code
+    /// absent from the map has simply never been confirmed either way.
     missing: Mutex<HashMap<String, bool>>,
+    /// Asset code -> confirmed unauthorized (trustline exists but `is_authorized`
+    /// is false). Only ever written by a successful check.
+    unauthorized: Mutex<HashMap<String, bool>>,
+    /// Asset code -> remaining headroom in stroops (limit - balance).
+    /// Present only when both `limit` and `balance` were parseable.
+    headroom_stroops: Mutex<HashMap<String, i64>>,
     /// Checks that could not reach Horizon or got a non-2xx response.
     check_failures: AtomicU64,
     /// Unix timestamp of the last check that got a confirmed answer from
@@ -598,6 +544,8 @@ impl Default for TrustlineMetricsInner {
     fn default() -> Self {
         Self {
             missing: Mutex::new(HashMap::new()),
+            unauthorized: Mutex::new(HashMap::new()),
+            headroom_stroops: Mutex::new(HashMap::new()),
             check_failures: AtomicU64::new(0),
             last_success_unix: AtomicI64::new(0),
         }
@@ -611,18 +559,64 @@ impl TrustlineMetrics {
         }
     }
 
-    /// Record a successful check: `checked` is every non-native accepted
-    /// asset the check evaluated, `missing` the subset with no trustline.
+    /// Record a successful check.
+    ///
+    /// - `checked` — every non-native accepted asset the check evaluated.
+    /// - `missing` — the subset with no usable trustline (absent or
+    ///   unauthorized).
+    /// - `unauthorized` — the subset where a trustline exists but
+    ///   `is_authorized` is `false`.
+    /// - `headroom` — per-asset remaining capacity in stroops (`limit -
+    ///   balance`), for assets where both values were parseable.
+    ///
     /// Replaces the prior state for exactly the assets checked, so an asset
     /// removed from `ACCEPTED_ASSETS` between checks simply stops being
     /// reported rather than lingering at its last known value.
-    pub fn record_check<'a>(&self, checked: impl IntoIterator<Item = &'a str>, missing: &[String]) {
-        let mut map = self.inner.missing.lock().unwrap();
+    pub fn record_check<'a>(
+        &self,
+        checked: impl IntoIterator<Item = &'a str>,
+        missing: &[String],
+        unauthorized: &[String],
+        headroom: &[(&str, i64)],
+    ) {
+        let checked_codes: Vec<&str> = checked.into_iter().collect();
+
+        let mut map = self
+            .inner
+            .missing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         map.clear();
-        for code in checked {
+        for &code in &checked_codes {
             map.insert(code.to_string(), missing.iter().any(|m| m == code));
         }
         drop(map);
+
+        let mut unauth_map = self
+            .inner
+            .unauthorized
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unauth_map.clear();
+        for &code in &checked_codes {
+            unauth_map.insert(
+                code.to_string(),
+                unauthorized.iter().any(|u| u == code),
+            );
+        }
+        drop(unauth_map);
+
+        let mut hr_map = self
+            .inner
+            .headroom_stroops
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        hr_map.clear();
+        for (code, stroops) in headroom {
+            hr_map.insert((*code).to_string(), *stroops);
+        }
+        drop(hr_map);
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -634,11 +628,16 @@ impl TrustlineMetrics {
         self.inner.check_failures.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// `Some(true)` — confirmed missing. `Some(false)` — confirmed present.
-    /// `None` — never confirmed either way (not yet checked, or dropped from
-    /// `ACCEPTED_ASSETS`).
+    /// `Some(true)` — confirmed missing/unusable. `Some(false)` — confirmed
+    /// usable. `None` — never confirmed either way (not yet checked, or
+    /// dropped from `ACCEPTED_ASSETS`).
     pub fn is_missing(&self, code: &str) -> Option<bool> {
-        self.inner.missing.lock().unwrap().get(code).copied()
+        self.inner
+            .missing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(code)
+            .copied()
     }
 
     pub fn check_failures(&self) -> u64 {
@@ -649,9 +648,38 @@ impl TrustlineMetrics {
         self.inner.last_success_unix.load(Ordering::Relaxed)
     }
 
-    /// Snapshot for rendering, sorted by asset code for deterministic output.
+    /// Snapshot of missing/usable state, sorted by asset code for
+    /// deterministic output.
     pub fn snapshot(&self) -> Vec<(String, bool)> {
-        let map = self.inner.missing.lock().unwrap();
+        let map = self
+            .inner
+            .missing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut out: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Snapshot of unauthorized state, sorted by asset code.
+    pub fn snapshot_unauthorized(&self) -> Vec<(String, bool)> {
+        let map = self
+            .inner
+            .unauthorized
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut out: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Snapshot of headroom (limit - balance) in stroops, sorted by asset code.
+    pub fn snapshot_headroom(&self) -> Vec<(String, i64)> {
+        let map = self
+            .inner
+            .headroom_stroops
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut out: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
@@ -666,21 +694,10 @@ impl Default for TrustlineMetrics {
 
 // ── Prometheus text exposition ────────────────────────────────────────────────
 
-/// Render webhook delivery, auth outcome, background-task, Horizon poll, HTTP
-/// traffic, payment lifecycle, and database metrics as a Prometheus-compatible
+/// Render webhook delivery and auth outcome metrics as a Prometheus-compatible
 /// plain-text snapshot. Called by `GET /metrics`.
-#[allow(clippy::too_many_arguments)]
-pub fn render(
-    webhook: &WebhookMetrics,
-    auth: &AuthMetrics,
-    tasks: &crate::TaskHealth,
-    horizon: &HorizonMetrics,
-    http: &HttpMetrics,
-    payments: &PaymentMetrics,
-    db: &DbSnapshot,
-    trustlines: &TrustlineMetrics,
-) -> String {
-    let mut out = String::with_capacity(2048);
+pub fn render(webhook: &WebhookMetrics, auth: &AuthMetrics, horizon: &HorizonMetrics) -> String {
+    let mut out = String::with_capacity(1024);
 
     // stellargate_webhook_deliveries_total — counter vec by outcome
     out.push_str(
@@ -749,24 +766,11 @@ pub fn render(
         auth.failure_internal_error()
     ));
 
-    // Background task counters (issue #316): a crash-looping worker must be
-    // visible on the scrape, not only as a log line at shutdown.
+    // stellargate_horizon_records_skipped_total — counter vec by reason
     out.push_str(
-        "# HELP stellargate_tasks_started_total Total background task starts (including restarts).\n",
+        "# HELP stellargate_horizon_records_skipped_total Horizon payment records the reconciler refused to credit, by reason.\n",
     );
-    out.push_str("# TYPE stellargate_tasks_started_total counter\n");
-    out.push_str(&format!(
-        "stellargate_tasks_started_total {}\n",
-        tasks.started()
-    ));
-    out.push_str("# HELP stellargate_tasks_stopped_total Total background task clean stops.\n");
-    out.push_str("# TYPE stellargate_tasks_stopped_total counter\n");
-    out.push_str(&format!(
-        "stellargate_tasks_stopped_total {}\n",
-        tasks.stopped()
-    ));
-    out.push_str("# HELP stellargate_tasks_failed_total Total background task panics.\n");
-    out.push_str("# TYPE stellargate_tasks_failed_total counter\n");
+    out.push_str("# TYPE stellargate_horizon_records_skipped_total counter\n");
     out.push_str(&format!(
         "stellargate_tasks_failed_total {}\n",
         tasks.failed()
@@ -1035,13 +1039,41 @@ pub fn render(
 
     // stellargate_missing_trustlines — gauge vec by asset
     out.push_str(
-        "# HELP stellargate_missing_trustlines Whether the gateway account is currently confirmed to have no trustline for an accepted asset (1) or confirmed to have one (0). An asset is absent from this metric until the first successful trustline check evaluates it.\n",
+        "# HELP stellargate_missing_trustlines Whether the gateway account is currently confirmed to have no usable trustline for an accepted asset (1) or confirmed to have one (0). A trustline is unusable when absent or when is_authorized=false. An asset is absent from this metric until the first successful trustline check evaluates it.\n",
     );
     out.push_str("# TYPE stellargate_missing_trustlines gauge\n");
     for (asset, missing) in trustlines.snapshot() {
         out.push_str(&format!(
             "stellargate_missing_trustlines{{asset=\"{asset}\"}} {}\n",
             if missing { 1 } else { 0 }
+        ));
+    }
+
+    // stellargate_trustline_unauthorized — gauge vec by asset
+    // Distinguishes a trustline that is present but unauthorized from a
+    // missing trustline entirely; both surface as stellargate_missing_trustlines=1,
+    // but only the former shows here.
+    out.push_str(
+        "# HELP stellargate_trustline_unauthorized Whether the gateway account's trustline for this asset is present but unauthorized (is_authorized=false). 1 means the issuer has not granted (or has revoked) authorization; payments in this asset will be rejected on-chain.\n",
+    );
+    out.push_str("# TYPE stellargate_trustline_unauthorized gauge\n");
+    for (asset, unauth) in trustlines.snapshot_unauthorized() {
+        out.push_str(&format!(
+            "stellargate_trustline_unauthorized{{asset=\"{asset}\"}} {}\n",
+            if unauth { 1 } else { 0 }
+        ));
+    }
+
+    // stellargate_trustline_headroom_stroops — gauge vec by asset
+    // Remaining capacity (limit - balance) so an approaching ceiling is
+    // visible before payments start bouncing.
+    out.push_str(
+        "# HELP stellargate_trustline_headroom_stroops Remaining trustline capacity in stroops (limit - balance). A payment that would push balance past limit fails on-chain. Alert when this approaches the typical payment size.\n",
+    );
+    out.push_str("# TYPE stellargate_trustline_headroom_stroops gauge\n");
+    for (asset, headroom) in trustlines.snapshot_headroom() {
+        out.push_str(&format!(
+            "stellargate_trustline_headroom_stroops{{asset=\"{asset}\"}} {headroom}\n"
         ));
     }
 
@@ -1070,7 +1102,7 @@ pub fn render(
 mod tests {
     use super::*;
 
-    fn empty_db_snapshot() -> DbSnapshot {
+        fn empty_db_snapshot() -> DbSnapshot {
         DbSnapshot {
             pool_size: 3,
             pool_idle: 1,
@@ -1079,6 +1111,24 @@ mod tests {
             wal_bytes: None,
             shm_bytes: None,
         }
+    }
+
+    #[test]
+    fn poisoned_metrics_mutex_does_not_panic() {
+        let http = HttpMetrics::new();
+
+        let panic_handle = std::thread::spawn({
+            let http = http.clone();
+            move || {
+                let _guard = http.inner.lock().unwrap();
+                panic!("deliberate poison");
+            }
+        });
+        let _ = panic_handle.join();
+
+        http.record("GET", "/health", 200, 7);
+        assert_eq!(http.requests_snapshot().len(), 1);
+        assert_eq!(http.latency_snapshot().len(), 1);
     }
 
     fn render_all(
@@ -1336,5 +1386,308 @@ mod tests {
         assert!(rendered.contains("stellargate_db_file_size_bytes{file=\"main\"} 4096"));
         assert!(rendered.contains("stellargate_db_file_size_bytes{file=\"wal\"} 128"));
         assert!(!rendered.contains("stellargate_db_file_size_bytes{file=\"shm\"}"));
+    }
+
+    // ── #440 new tests ────────────────────────────────────────────────────
+
+    // WebhookMetrics ─────────────────────────────────────────────────────
+
+    #[test]
+    fn webhook_counters_increment_independently() {
+        let wm = WebhookMetrics::new();
+        wm.record_delivered();
+        wm.record_delivered();
+        wm.record_delivered();
+        wm.record_failed();
+        wm.record_failed();
+        wm.record_retry();
+
+        assert_eq!(wm.delivered(), 3);
+        assert_eq!(wm.failed(), 2);
+        assert_eq!(wm.retried(), 1);
+    }
+
+    #[test]
+    fn webhook_latency_histogram_buckets_are_cumulative_75ms() {
+        let wm = WebhookMetrics::new();
+        wm.record_latency_ms(75);
+
+        // LATENCY_BUCKETS_MS = [10, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000]
+        // 75 <= 100 (index 2), so buckets 2..=8 (all from le=100 up) and +Inf increment.
+        // le=50 (index 1) should be 0; le=100 (index 2) should be 1.
+        assert_eq!(wm.latency_bucket(1), 0, "le=50 bucket should be 0 for 75ms");
+        assert_eq!(wm.latency_bucket(2), 1, "le=100 bucket should be 1 for 75ms");
+        // +Inf bucket is always at index LATENCY_BUCKETS_MS.len() = 9
+        assert_eq!(
+            wm.latency_bucket(LATENCY_BUCKETS_MS.len()),
+            1,
+            "+Inf bucket should be 1"
+        );
+        assert_eq!(wm.latency_sum_ms(), 75);
+        assert_eq!(wm.latency_count(), 1);
+    }
+
+    #[test]
+    fn webhook_latency_histogram_exact_boundary_100ms() {
+        let wm = WebhookMetrics::new();
+        wm.record_latency_ms(100);
+
+        // 100 <= 100 (index 2) — increments le=100.
+        // 100 > 50 — le=50 (index 1) stays 0.
+        assert_eq!(wm.latency_bucket(1), 0, "le=50 bucket should be 0 for 100ms");
+        assert_eq!(
+            wm.latency_bucket(2),
+            1,
+            "le=100 bucket should be 1 for exactly 100ms"
+        );
+        assert_eq!(
+            wm.latency_bucket(LATENCY_BUCKETS_MS.len()),
+            1,
+            "+Inf bucket should be 1"
+        );
+    }
+
+    #[test]
+    fn webhook_latency_record_zero_ms() {
+        let wm = WebhookMetrics::new();
+        wm.record_latency_ms(0);
+
+        // 0 <= 10 (index 0, smallest bucket) — increments le=10 and +Inf.
+        assert_eq!(wm.latency_bucket(0), 1, "le=10 bucket should be 1 for 0ms");
+        assert_eq!(
+            wm.latency_bucket(LATENCY_BUCKETS_MS.len()),
+            1,
+            "+Inf bucket should be 1"
+        );
+    }
+
+    #[test]
+    fn webhook_latency_large_value_only_inf_bucket() {
+        let wm = WebhookMetrics::new();
+        wm.record_latency_ms(99_999);
+
+        // 99_999 exceeds all named buckets (max is 10_000).
+        // All named buckets (indices 0..8) should be 0.
+        for i in 0..LATENCY_BUCKETS_MS.len() {
+            assert_eq!(
+                wm.latency_bucket(i),
+                0,
+                "named bucket {i} (le={}) should be 0 for 99_999ms",
+                LATENCY_BUCKETS_MS[i]
+            );
+        }
+        assert_eq!(
+            wm.latency_bucket(LATENCY_BUCKETS_MS.len()),
+            1,
+            "+Inf bucket should be 1 for 99_999ms"
+        );
+    }
+
+    // AuthMetrics ────────────────────────────────────────────────────────
+
+    #[test]
+    fn auth_counters_are_independent() {
+        let am = AuthMetrics::new();
+        am.record_success();
+        am.record_success();
+        am.record_success();
+        am.record_failure_missing_key();
+        am.record_failure_missing_key();
+        am.record_failure_invalid_key();
+        am.record_failure_internal_error();
+        am.record_failure_internal_error();
+        am.record_failure_internal_error();
+        am.record_failure_internal_error();
+
+        assert_eq!(am.success(), 3);
+        assert_eq!(am.failure_missing_key(), 2);
+        assert_eq!(am.failure_invalid_key(), 1);
+        assert_eq!(am.failure_internal_error(), 4);
+    }
+
+    // HorizonMetrics ─────────────────────────────────────────────────────
+
+    #[test]
+    fn horizon_all_five_counters_are_independent() {
+        let hm = HorizonMetrics::new();
+        hm.record_success();
+        hm.record_success();
+        hm.record_rate_limited();
+        hm.record_rate_limited();
+        hm.record_rate_limited();
+        hm.record_error();
+        hm.record_repeated_cursor_4xx();
+        hm.record_repeated_cursor_4xx();
+        hm.record_repeated_cursor_4xx();
+        hm.record_repeated_cursor_4xx();
+        hm.record_stream_reconnect();
+
+        assert_eq!(hm.success(), 2);
+        assert_eq!(hm.rate_limited(), 3);
+        assert_eq!(hm.error(), 1);
+        assert_eq!(hm.repeated_cursor_4xx(), 4);
+        assert_eq!(hm.stream_reconnects(), 1);
+    }
+
+    #[test]
+    fn horizon_cursor_age_stores_and_overwrites() {
+        let hm = HorizonMetrics::new();
+        hm.record_cursor_age_secs(100);
+        assert_eq!(hm.cursor_age_secs(), 100);
+        hm.record_cursor_age_secs(5);
+        assert_eq!(hm.cursor_age_secs(), 5, "store should overwrite, not add");
+    }
+
+    // TrustlineMetrics ───────────────────────────────────────────────────
+
+    #[test]
+    fn trustline_record_check_marks_assets_correctly() {
+        let tm = TrustlineMetrics::new();
+        tm.record_check(["USDC", "BTC"], &["USDC".to_string()]);
+
+        assert_eq!(tm.is_missing("USDC"), Some(true), "USDC should be missing");
+        assert_eq!(tm.is_missing("BTC"), Some(false), "BTC should be present");
+        assert_eq!(tm.is_missing("ETH"), None, "ETH was never checked");
+    }
+
+    #[test]
+    fn trustline_record_check_replaces_prior_state() {
+        let tm = TrustlineMetrics::new();
+        // First check: USDC is missing.
+        tm.record_check(["USDC"], &["USDC".to_string()]);
+        assert_eq!(tm.is_missing("USDC"), Some(true));
+        // Second check: USDC now has a trustline.
+        tm.record_check(["USDC"], &[]);
+        assert_eq!(
+            tm.is_missing("USDC"),
+            Some(false),
+            "second check should mark USDC as present"
+        );
+    }
+
+    #[test]
+    fn trustline_record_check_clears_dropped_assets() {
+        let tm = TrustlineMetrics::new();
+        // First check evaluates both USDC and BTC.
+        tm.record_check(["USDC", "BTC"], &[]);
+        assert_eq!(tm.is_missing("BTC"), Some(false));
+        // Second check only evaluates USDC; BTC is dropped.
+        tm.record_check(["USDC"], &[]);
+        assert_eq!(
+            tm.is_missing("BTC"),
+            None,
+            "BTC dropped from checked set should become None"
+        );
+    }
+
+    #[test]
+    fn trustline_record_check_failure_increments_and_does_not_update_last_success() {
+        let tm = TrustlineMetrics::new();
+        tm.record_check_failure();
+        tm.record_check_failure();
+        tm.record_check_failure();
+
+        assert_eq!(tm.check_failures(), 3);
+        assert_eq!(
+            tm.last_success_unix(),
+            0,
+            "failures must not update last_success_unix"
+        );
+    }
+
+    #[test]
+    fn trustline_snapshot_is_sorted_by_asset_code() {
+        let tm = TrustlineMetrics::new();
+        tm.record_check(["USDC", "BTC", "ETH"], &[]);
+
+        let snap = tm.snapshot();
+        assert_eq!(snap.len(), 3);
+        assert_eq!(snap[0].0, "BTC");
+        assert_eq!(snap[1].0, "ETH");
+        assert_eq!(snap[2].0, "USDC");
+    }
+
+    #[test]
+    fn trustline_last_success_unix_is_set_after_record_check() {
+        let tm = TrustlineMetrics::new();
+        assert_eq!(tm.last_success_unix(), 0, "should start at 0");
+        tm.record_check(["USDC"], &[]);
+        assert!(
+            tm.last_success_unix() > 0,
+            "last_success_unix should be set after record_check"
+        );
+    }
+
+    // render() — trustline output ─────────────────────────────────────────
+
+    #[test]
+    fn render_includes_missing_trustlines_as_1() {
+        let trustlines = TrustlineMetrics::new();
+        trustlines.record_check(["USDC"], &["USDC".to_string()]);
+
+        let rendered = render(
+            &WebhookMetrics::new(),
+            &AuthMetrics::new(),
+            &crate::TaskHealth::new(),
+            &HorizonMetrics::new(),
+            &HttpMetrics::new(),
+            &PaymentMetrics::new(),
+            &empty_db_snapshot(),
+            &trustlines,
+        );
+
+        assert!(
+            rendered.contains("stellargate_missing_trustlines{asset=\"USDC\"} 1"),
+            "missing trustline must render as 1:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_includes_present_trustlines_as_0() {
+        let trustlines = TrustlineMetrics::new();
+        trustlines.record_check(["USDC"], &[]);
+
+        let rendered = render(
+            &WebhookMetrics::new(),
+            &AuthMetrics::new(),
+            &crate::TaskHealth::new(),
+            &HorizonMetrics::new(),
+            &HttpMetrics::new(),
+            &PaymentMetrics::new(),
+            &empty_db_snapshot(),
+            &trustlines,
+        );
+
+        assert!(
+            rendered.contains("stellargate_missing_trustlines{asset=\"USDC\"} 0"),
+            "present trustline must render as 0:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_includes_check_failures_and_last_success() {
+        let trustlines = TrustlineMetrics::new();
+        trustlines.record_check_failure();
+
+        let rendered = render(
+            &WebhookMetrics::new(),
+            &AuthMetrics::new(),
+            &crate::TaskHealth::new(),
+            &HorizonMetrics::new(),
+            &HttpMetrics::new(),
+            &PaymentMetrics::new(),
+            &empty_db_snapshot(),
+            &trustlines,
+        );
+
+        assert!(
+            rendered.contains("stellargate_trustline_check_failures_total 1"),
+            "check_failures counter must be rendered:\n{rendered}"
+        );
+        // last_success_unix should be 0 (no successful check yet).
+        assert!(
+            rendered.contains("stellargate_trustline_check_last_success_timestamp_seconds 0"),
+            "last_success_unix must be 0 when no check has succeeded:\n{rendered}"
+        );
     }
 }

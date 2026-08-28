@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -12,10 +13,8 @@ use stellargate::{
     api,
     config::{Config, ListenerMode},
     db, expiry, horizon,
-    metrics::{
-        AuthMetrics, HorizonMetrics, HttpMetrics, PaymentMetrics, TrustlineMetrics, WebhookMetrics,
-    },
-    retention, supervise, webhook, AppState, TaskHealth,
+    metrics::{AuthMetrics, HorizonMetrics, WebhookMetrics},
+    retention, webhook, AppState, TaskHealth,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -24,140 +23,77 @@ use tracing_subscriber::EnvFilter;
 
 const USER_AGENT: &str = concat!("StellarGate/", env!("CARGO_PKG_VERSION"));
 
+/// Timeout for general outbound HTTP (Horizon). Webhook delivery uses its own
+/// configurable per-attempt timeout instead.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long shutdown waits for background tasks to drain before forcing exit.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
-
-    // `docker healthcheck` invokes the running binary itself (`stellargate
-    // healthcheck [path]`) rather than shelling out to curl, so the runtime
-    // image doesn't need a general-purpose HTTP client (issue #400).
-    let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("healthcheck") {
-        return run_healthcheck(args.next()).await;
-    }
-
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+    dotenvy::dotenv().ok();
 
     let cfg = Config::from_env()?;
-
-    /* Client-IP trust boundary (issue #330): make the effective strategy
-    visible at boot so an operator can confirm forwarding headers are honored
-    exactly where they intend — only from configured trusted proxies, never
-    from arbitrary callers. */
-    if cfg.trusted_proxy_cidrs.is_empty() {
-        info!(
-            "client IP strategy: no trusted proxies configured — \
-             X-Forwarded-For/X-Real-IP are ignored; the socket peer address is \
-             used for rate limiting and auth attribution"
-        );
-    } else {
-        info!(
-            trusted_proxies = ?cfg.trusted_proxy_cidrs,
-            "client IP strategy: forwarding headers are honored only from \
-             trusted proxies; all other peers are attributed by socket address"
-        );
-    }
-
     let pool = open_pool(&cfg).await?;
     db::migrate(&pool).await?;
+    /* One-off, best-effort reconstruction of `payments.asset_issuer` for rows
+    created before the column existed. Needs the accepted-asset allow-list, so
+    it runs here rather than inside `migrate`. */
     db::backfill_asset_issuers(&pool, &cfg.accepted_assets).await?;
-    db::optimize(&pool).await?;
 
     let state = Arc::new(AppState {
         pool,
-        http: http_client(Duration::from_secs(cfg.horizon_timeout_secs))?,
+        http: http_client(HTTP_TIMEOUT)?,
         webhook_http: http_client(Duration::from_secs(cfg.webhook_timeout_secs))?,
         webhook_metrics: WebhookMetrics::new(),
         auth_metrics: AuthMetrics::new(),
         horizon_metrics: HorizonMetrics::new(),
-        trustline_metrics: TrustlineMetrics::new(),
         task_health: TaskHealth::new(),
-        http_metrics: HttpMetrics::new(),
-        payment_metrics: PaymentMetrics::new(),
         config: cfg,
     });
 
     if state.config.gateway_configured() {
-        horizon::verify_gateway_account(&state).await?;
+        report_trustlines(&state).await;
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let health = state.task_health.clone();
 
-    /* Declare which background tasks are expected to keep running: `/health`
-    fails while any required task is not running, so a poller or listener that
-    died at startup stops being invisible (issue #315). The poller and stream
-    are only expected once a gateway wallet is configured — without one they
-    idle by design ("the listener stays idle until this is set"). */
-    if state.config.gateway_configured() {
-        health.require("poller");
-        health.require("trustline_checker");
-        if state.config.listener_mode == ListenerMode::Stream {
-            health.require("stream");
-        }
-    }
-    health.require("sweeper");
-    health.require("retention");
-    health.require("redrive");
-
     let stream = (state.config.listener_mode == ListenerMode::Stream).then(|| {
-        let state = state.clone();
-        let rx = shutdown_rx.clone();
-        supervise::supervise(health.clone(), "stream", shutdown_rx.clone(), move || {
-            horizon::run_stream_listener(state.clone(), rx.clone())
-        })
+        spawn_task(
+            &health,
+            "stream",
+            horizon::run_stream_listener(state.clone(), shutdown_rx.clone()),
+        )
     });
-    let poller = {
-        let state = state.clone();
-        let rx = shutdown_rx.clone();
-        supervise::supervise(health.clone(), "poller", shutdown_rx.clone(), move || {
-            horizon::run_poller(state.clone(), rx.clone())
-        })
-    };
-    let sweeper = {
-        let state = state.clone();
-        let rx = shutdown_rx.clone();
-        supervise::supervise(health.clone(), "sweeper", shutdown_rx.clone(), move || {
-            expiry::run_sweeper(state.clone(), rx.clone())
-        })
-    };
-    let retention = {
-        let state = state.clone();
-        let rx = shutdown_rx.clone();
-        supervise::supervise(
-            health.clone(),
-            "retention",
-            shutdown_rx.clone(),
-            move || retention::run_retention_worker(state.clone(), rx.clone()),
-        )
-    };
-    let redrive = {
-        let state = state.clone();
-        let rx = shutdown_rx.clone();
-        supervise::supervise(health.clone(), "redrive", shutdown_rx.clone(), move || {
-            webhook::run_redrive_worker(state.clone(), rx.clone())
-        })
-    };
-    let trustline_checker = {
-        let state = state.clone();
-        let rx = shutdown_rx.clone();
-        supervise::supervise(
-            health.clone(),
-            "trustline_checker",
-            shutdown_rx.clone(),
-            move || horizon::run_trustline_checker(state.clone(), rx.clone()),
-        )
-    };
+    let poller = spawn_task(
+        &health,
+        "poller",
+        horizon::run_poller(state.clone(), shutdown_rx.clone()),
+    );
+    let sweeper = spawn_task(
+        &health,
+        "sweeper",
+        expiry::run_sweeper(state.clone(), shutdown_rx.clone()),
+    );
+    let retention = spawn_task(
+        &health,
+        "retention",
+        retention::run_retention_worker(state.clone(), shutdown_rx.clone()),
+    );
+    let redrive = spawn_task(
+        &health,
+        "redrive",
+        webhook::run_redrive_worker(state.clone(), shutdown_rx),
+    );
 
     let addr = format!("0.0.0.0:{}", state.config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("StellarGate API listening on {addr}");
-
-    // Captured before `state` is moved into `api::router` below.
-    let shutdown_grace = Duration::from_secs(state.config.shutdown_grace_secs);
-    let pool_for_optimize = state.pool.clone();
 
     axum::serve(
         listener,
@@ -168,26 +104,19 @@ async fn main() -> Result<()> {
 
     let _ = shutdown_tx.send(true);
     let drain = async {
-        join_task(poller, &health, "poller").await;
-        join_task(sweeper, &health, "sweeper").await;
-        join_task(redrive, &health, "redrive").await;
-        join_task(retention, &health, "retention").await;
-        join_task(trustline_checker, &health, "trustline_checker").await;
+        join_task(poller, "poller", &health).await;
+        join_task(sweeper, "sweeper", &health).await;
+        join_task(redrive, "redrive", &health).await;
+        join_task(retention, "retention", &health).await;
         if let Some(handle) = stream {
-            join_task(handle, &health, "stream").await;
+            join_task(handle, "stream", &health).await;
         }
     };
-    if tokio::time::timeout(shutdown_grace, drain).await.is_err() {
+    if tokio::time::timeout(SHUTDOWN_GRACE, drain).await.is_err() {
         info!(
-            timeout_secs = shutdown_grace.as_secs(),
+            timeout_secs = SHUTDOWN_GRACE.as_secs(),
             "background tasks did not drain in time; forcing exit"
         );
-    }
-
-    // Run PRAGMA optimize before final shutdown to update query planner stats
-    // for the next boot. This is SQLite's recommended shutdown sequence.
-    if let Err(e) = db::optimize(&pool_for_optimize).await {
-        warn!(error = %e, "PRAGMA optimize failed during shutdown");
     }
 
     info!("shutdown complete");
@@ -196,57 +125,17 @@ async fn main() -> Result<()> {
 
 /// Open the SQLite pool in WAL mode so a single writer and many readers can
 /// proceed concurrently.
-///
-/// `wal_autocheckpoint` and `journal_size_limit` are set explicitly rather
-/// than left at SQLite's compiled-in defaults (issue #274):
-///
-/// - `wal_autocheckpoint = 1000` (SQLite's own default, made explicit here
-///   as a documented choice rather than an inherited one) triggers a
-///   `PASSIVE` checkpoint after roughly 1000 pages (~4 MB at the default
-///   4 KiB page size) accumulate in the WAL following a commit.
-/// - `journal_size_limit = 67108864` (64 MiB) is the backstop `PASSIVE`
-///   checkpointing alone does not provide: a `PASSIVE` checkpoint skips
-///   rather than blocks when it cannot get the read lock it needs, so a
-///   long-lived reader can defer it indefinitely and let the WAL grow
-///   without bound under sustained write load. Configurable via
-///   `SQLITE_WAL_AUTOCHECKPOINT` and capped by `SQLITE_JOURNAL_SIZE_LIMIT`,
-///   which truncates the -wal file at a hard ceiling regardless of whether
-///   checkpoints are starved.
 async fn open_pool(cfg: &Config) -> Result<db::Db> {
     let opts = SqliteConnectOptions::from_str(&cfg.database_url)?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(Duration::from_millis(cfg.db_busy_timeout_ms))
-        .pragma("wal_autocheckpoint", cfg.sqlite_wal_autocheckpoint.to_string())
-        .pragma("journal_size_limit", cfg.sqlite_journal_size_limit.to_string())
-        .pragma("cache_size", cfg.sqlite_cache_size.to_string());
+        .busy_timeout(Duration::from_millis(cfg.db_busy_timeout_ms));
 
     Ok(SqlitePoolOptions::new()
         .max_connections(cfg.db_pool_max_connections)
         .connect_with(opts)
         .await?)
-}
-
-/// `stellargate healthcheck [path]`: probe this same container's own HTTP
-/// server and exit 0/1, so `HEALTHCHECK` in the Dockerfile doesn't need
-/// `curl` (or any other general-purpose HTTP client) in the runtime image.
-/// Reads `PORT` directly rather than going through `Config::from_env`, since
-/// a probe shouldn't fail on unrelated config validation.
-async fn run_healthcheck(path: Option<String>) -> Result<()> {
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(3000);
-    let path = path.unwrap_or_else(|| "health".to_string());
-    let url = format!("http://127.0.0.1:{port}/{}", path.trim_start_matches('/'));
-
-    let healthy = reqwest::get(&url)
-        .await
-        .map(|resp| resp.status().is_success())
-        .unwrap_or(false);
-
-    std::process::exit(if healthy { 0 } else { 1 });
 }
 
 fn http_client(timeout: Duration) -> Result<reqwest::Client> {
@@ -256,13 +145,43 @@ fn http_client(timeout: Duration) -> Result<reqwest::Client> {
         .build()?)
 }
 
-/// Await a supervisor during shutdown. Panics are caught inside the
-/// supervisor's child spawn, so a `JoinError` here means the supervisor
-/// itself failed — record it so the failure counter still fires.
-async fn join_task(handle: JoinHandle<()>, health: &TaskHealth, name: &'static str) {
+/// Report whether every accepted asset has a trustline on the gateway account.
+/// Advisory only: a missing trustline doesn't block boot, it just means
+/// payments in that asset will bounce until the trustline is added.
+async fn report_trustlines(state: &Arc<AppState>) {
+    match horizon::check_trustlines(state).await {
+        Ok(missing) if missing.is_empty() => {
+            info!("gateway trustlines verified for all accepted assets")
+        }
+        Ok(missing) => info!(
+            ?missing,
+            "accepted assets with no trustline on the gateway account"
+        ),
+        Err(e) => warn!(error = %e, "could not verify gateway trustlines at startup"),
+    }
+}
+
+/// Spawn a background task, keeping [`TaskHealth`] accurate across its
+/// lifetime: counted as started before it runs and as stopped when it returns
+/// normally. A panic is recorded instead by [`join_task`] at shutdown.
+fn spawn_task<F>(health: &TaskHealth, name: &'static str, task: F) -> JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let health = health.clone();
+    health.task_started(name);
+    tokio::spawn(async move {
+        task.await;
+        health.task_stopped(name);
+    })
+}
+
+/// Await a background task. A `JoinError` means it panicked, which is recorded
+/// so the failure counter — and any alert watching it — fires.
+async fn join_task(handle: JoinHandle<()>, name: &'static str, health: &TaskHealth) {
     if let Err(e) = handle.await {
         if e.is_panic() {
-            warn!(task = name, "supervisor panicked");
+            warn!("background task panicked");
             health.task_failed(name);
         }
     }

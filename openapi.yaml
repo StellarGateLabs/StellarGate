@@ -154,6 +154,12 @@ paths:
         (every request gets 401), rather than leaving it open.
       security:
         - adminSecret: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProvisionMerchantRequest"
       responses:
         "201":
           description: Merchant provisioned
@@ -161,6 +167,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ProvisionMerchantResponse"
+        "400":
+          description: rate_limit_per_sec is not a positive integer, or the body has an unrecognised field
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalid_rate_limit:
+                  summary: Non-positive rate limit
+                  value:
+                    error: rate_limit_per_sec must be positive
+                    code: invalid_rate_limit
         "401":
           $ref: "#/components/responses/AdminUnauthorized"
 
@@ -369,6 +387,65 @@ paths:
                   value:
                     error: no active key with that id for this merchant
                     code: key_not_found
+
+  /merchants/{id}/rate-limit:
+    put:
+      operationId: setMerchantRateLimit
+      summary: Set or clear a merchant's per-second rate-limit override
+      description: >-
+        Sets (or clears) an individual per-merchant quota on the authenticated
+        rate limiter, independent of the global `RATE_LIMIT_REQUESTS_PER_SEC`
+        default. Passing `null` for `rate_limit_per_sec` removes the override
+        and returns the merchant to the configured default. Admin only.
+      security:
+        - adminSecret: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Merchant ID
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetRateLimitRequest"
+      responses:
+        "200":
+          description: Rate limit updated (or cleared)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SetRateLimitResponse"
+        "400":
+          description: rate_limit_per_sec is not a positive integer, or the request body has an unrecognised field
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalid_rate_limit:
+                  summary: Non-positive rate limit
+                  value:
+                    error: rate_limit_per_sec must be positive
+                    code: invalid_rate_limit
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+        "404":
+          description: No merchant with that ID
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                merchant_not_found:
+                  summary: Merchant not found
+                  value:
+                    error: merchant not found
+                    code: merchant_not_found
 
   /payments:
     post:
@@ -598,6 +675,140 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  /v1/payments/webhooks:
+    get:
+      operationId: listMerchantWebhooks
+      summary: Dead-letter view — all failed deliveries across a merchant's payments
+      description: >-
+        Returns webhook deliveries across **all** of the authenticated
+        merchant's payments, defaulting to `status=failed`. This is the
+        endpoint to reach for when a merchant says they are missing events,
+        because that question arrives without a payment id —
+        `GET /v1/payments/{id}/webhooks` can only answer it if you already
+        know where to look.
+
+
+        The parameter set is closed: an unrecognised query parameter is
+        rejected with `400 unknown_parameter`. This matters most here where
+        `status` defaults to `failed`: a typo'd filter would otherwise return
+        the full dead-letter list and look entirely plausible.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, delivered, failed]
+            default: failed
+          description: Filter deliveries by status. Defaults to failed.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: Page size
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque cursor for keyset pagination (returned as next_cursor)
+      responses:
+        "200":
+          description: A page of the merchant's webhook deliveries
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListMerchantDeliveriesResponse"
+        "400":
+          description: Invalid query parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalid_status:
+                  summary: Invalid status filter
+                  value:
+                    error: "invalid delivery status 'foo'; valid: pending, delivered, failed"
+                    code: invalid_status
+                invalid_cursor:
+                  summary: Invalid cursor
+                  value:
+                    error: invalid cursor
+                    code: invalid_cursor
+                invalid_limit:
+                  summary: limit outside 1..=100
+                  value:
+                    error: "limit must be between 1 and 100 (got 5000)"
+                    code: invalid_limit
+                unknown_parameter:
+                  summary: Unrecognised query parameter
+                  value:
+                    error: "invalid query string: Failed to deserialize query string: unknown field `staus`, expected one of `status`, `limit`, `cursor`"
+                    code: unknown_parameter
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/payments/webhooks/redeliver:
+    post:
+      operationId: redeliverWebhooksBulk
+      summary: Bulk-requeue failed webhook deliveries for retry
+      description: >-
+        Requeues failed deliveries so the background redrive worker retries
+        them. Omit `delivery_ids` (or send an empty body) to requeue every
+        failed delivery for this merchant; supply a list to requeue specific
+        ones (max 100 per request).
+
+
+        **This endpoint sends nothing itself.** It resets matching rows to
+        `pending` with `attempts = 0` and hands them to the redrive worker,
+        whose `WEBHOOK_REDRIVE_CONCURRENCY` and exponential backoff already
+        bound the outbound rate. Requeueing thousands of deliveries therefore
+        costs one `UPDATE` and cannot stampede a receiver that has only just
+        come back up.
+
+
+        Requeueing also acknowledges the deliveries, returning them to ordinary
+        retention.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RedeliverBulkRequest"
+      responses:
+        "200":
+          description: Deliveries requeued for the redrive worker
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RedeliverBulkResponse"
+        "400":
+          description: More than 100 delivery_ids supplied, or the body has an unrecognised field
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                too_many_delivery_ids:
+                  summary: Delivery id list exceeds the cap
+                  value:
+                    error: "at most 100 delivery_ids per request; omit the field to requeue every failed delivery"
+                    code: too_many_delivery_ids
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /v1/payments/{id}:
     get:
       operationId: getPayment
@@ -733,18 +944,53 @@ paths:
     post:
       operationId: redeliverWebhook
       summary: Re-attempt a webhook delivery
+      description: |
+        Re-sends the stored payload with a fresh timestamp and signature.
+        The SSRF guard is re-evaluated against the stored target on every call.
+
+        A delivery already marked `delivered` is refused with `409 already_delivered`
+        unless `?force=true` is passed — accidental double-clicks on the dashboard
+        button must not silently send a duplicate event (issue #236).
       security:
         - bearerAuth: []
       parameters:
         - $ref: "#/components/parameters/PaymentId"
         - $ref: "#/components/parameters/DeliveryId"
+        - name: force
+          in: query
+          required: false
+          description: |
+            Pass `true` to redeliver a webhook that was already successfully delivered.
+            Without it, an `already_delivered` `409` is returned for a `delivered` row.
+          schema:
+            type: boolean
       responses:
         "200":
           description: Redelivery succeeded
+        "400":
+          description: Webhook target rejected by the SSRF guard
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "webhook target is not allowed"
+                code: "webhook_target_blocked"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: |
+            Delivery was already successfully delivered.
+            Pass `?force=true` to redeliver anyway.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "this webhook was already successfully delivered; pass ?force=true to redeliver anyway"
+                code: "already_delivered"
         "502":
           $ref: "#/components/responses/WebhookBadGateway"
 
@@ -828,6 +1074,72 @@ paths:
         "400":
           $ref: "#/components/responses/DeprecatedValidationError"
 
+  /payments/webhooks:
+    get:
+      operationId: listMerchantWebhooksLegacy
+      summary: Dead-letter view — all failed deliveries (deprecated)
+      description: Deprecated alias of `GET /v1/payments/webhooks`.
+      deprecated: true
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, delivered, failed]
+            default: failed
+          description: Filter deliveries by status
+        - $ref: "#/components/parameters/LimitParam"
+        - $ref: "#/components/parameters/CursorParam"
+      responses:
+        "200":
+          description: A page of the merchant's webhook deliveries
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            Deprecation:
+              $ref: "#/components/headers/Deprecation"
+            Link:
+              $ref: "#/components/headers/Link"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListMerchantDeliveriesResponse"
+        "400":
+          $ref: "#/components/responses/DeprecatedValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /payments/webhooks/redeliver:
+    post:
+      operationId: redeliverWebhooksBulkLegacy
+      summary: Bulk-requeue failed webhook deliveries (deprecated)
+      description: Deprecated alias of `POST /v1/payments/webhooks/redeliver`.
+      deprecated: true
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RedeliverBulkRequest"
+      responses:
+        "200":
+          description: Deliveries requeued
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            Deprecation:
+              $ref: "#/components/headers/Deprecation"
+            Link:
+              $ref: "#/components/headers/Link"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RedeliverBulkResponse"
+        "400":
+          $ref: "#/components/responses/DeprecatedValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /payments/{id}:
     get:
       operationId: getPaymentLegacy
@@ -889,6 +1201,14 @@ paths:
       parameters:
         - $ref: "#/components/parameters/PaymentId"
         - $ref: "#/components/parameters/DeliveryId"
+        - name: force
+          in: query
+          required: false
+          description: |
+            Pass `true` to redeliver a webhook that was already successfully delivered.
+            Without it, an `already_delivered` `409` is returned for a `delivered` row.
+          schema:
+            type: boolean
       responses:
         "200":
           description: Redelivery succeeded
@@ -901,6 +1221,17 @@ paths:
               $ref: "#/components/headers/Link"
         "404":
           $ref: "#/components/responses/DeprecatedNotFound"
+        "409":
+          description: |
+            Delivery was already successfully delivered.
+            Pass `?force=true` to redeliver anyway.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "this webhook was already successfully delivered; pass ?force=true to redeliver anyway"
+                code: "already_delivered"
         "502":
           $ref: "#/components/responses/DeprecatedWebhookBadGateway"
 
@@ -1231,6 +1562,18 @@ components:
           description: Present only when status is unavailable
           example: database unreachable
 
+    ProvisionMerchantRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        rate_limit_per_sec:
+          type: ["integer", "null"]
+          description: >-
+            Optional per-merchant rate-limit override, in requests per second.
+            Omit to leave the merchant on the global RATE_LIMIT_REQUESTS_PER_SEC
+            default. Must be a positive integer.
+          example: 50
+
     ProvisionMerchantResponse:
       type: object
       required: [merchant_id, api_key, key_id]
@@ -1250,6 +1593,12 @@ components:
           type: string
           format: uuid
           description: ID of the API key created alongside the merchant
+        rate_limit_per_sec:
+          type: ["integer", "null"]
+          description: >-
+            Per-merchant rate-limit override set at provisioning time, in
+            requests per second. Null when the merchant uses the global
+            default (RATE_LIMIT_REQUESTS_PER_SEC).
 
     IssueKeyRequest:
       type: object
@@ -1279,8 +1628,7 @@ components:
           description: First characters of the key, safe to display in a list
           example: sg_9f8e7d6c
         label:
-          type: string
-          nullable: true
+          type: [string, "null"]
 
     ApiKeySummary:
       type: object
@@ -1294,19 +1642,16 @@ components:
           type: string
           example: sg_9f8e7d6c
         label:
-          type: string
-          nullable: true
+          type: [string, "null"]
         created_at:
           type: string
           format: date-time
         last_used_at:
-          type: string
+          type: [string, "null"]
           format: date-time
-          nullable: true
         revoked_at:
-          type: string
+          type: [string, "null"]
           format: date-time
-          nullable: true
         active:
           type: boolean
           description: true when revoked_at is null
@@ -1325,8 +1670,7 @@ components:
         limit:
           type: integer
         next_cursor:
-          type: string
-          nullable: true
+          type: [string, "null"]
           description: Pass as cursor on the next request to get the following page
 
     RevokeApiKeyResponse:
@@ -1379,6 +1723,16 @@ components:
         asset:
           type: string
           enum: [XLM, USDC]
+        asset_issuer:
+          type: string
+          nullable: true
+          description: >-
+            Issuer account of `asset`, recorded when the intent was created.
+            `null` for the native asset (XLM), which has no issuer. Persisted
+            with the intent, so it always reflects the asset the payment was
+            priced in even if the gateway's accepted-asset configuration
+            changes later.
+          example: GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5
         status:
           $ref: "#/components/schemas/PaymentStatus"
         tx_hash:
@@ -1511,6 +1865,14 @@ components:
         last_attempt:
           type: [string, "null"]
           format: date-time
+        acknowledged_at:
+          type: [string, "null"]
+          format: date-time
+          description: >-
+            Set when the delivery is requeued via POST .../redeliver or
+            POST /v1/payments/webhooks/redeliver. A non-null value means
+            somebody has acted on this failure, and the row returns to
+            ordinary retention.
         created_at:
           type: string
           format: date-time
@@ -1526,6 +1888,80 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/WebhookDelivery"
+        limit:
+          type: integer
+          description: Page size applied to this response
+        next_cursor:
+          type: [string, "null"]
+          description: Pass as cursor on the next request to get the following page
+
+    SetRateLimitRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        rate_limit_per_sec:
+          type: ["integer", "null"]
+          description: >-
+            Per-second request quota for this merchant on the authenticated
+            rate limiter. Pass null (or omit) to remove the override and
+            return the merchant to the global default.
+          example: 50
+
+    SetRateLimitResponse:
+      type: object
+      required: [merchant_id]
+      properties:
+        merchant_id:
+          type: string
+          format: uuid
+        rate_limit_per_sec:
+          type: ["integer", "null"]
+          description: The new effective override, or null if the override was cleared.
+
+    RedeliverBulkRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        delivery_ids:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+            format: uuid
+          description: >-
+            Specific delivery IDs to requeue. Omit the field (or send an
+            empty list) to requeue every failed delivery this merchant has.
+            Maximum 100 per request.
+
+    RedeliverBulkResponse:
+      type: object
+      required: [requeued, detail]
+      properties:
+        requeued:
+          type: integer
+          description: Number of delivery rows reset to pending for the redrive worker.
+        detail:
+          type: string
+          description: Human-readable note explaining what happens next.
+          example: >-
+            requeued deliveries are retried by the background redrive worker,
+            subject to its concurrency limit and backoff
+
+    ListMerchantDeliveriesResponse:
+      type: object
+      required: [deliveries, status, limit]
+      description: >-
+        Dead-letter view: all webhook deliveries for the authenticated
+        merchant, across all of their payments. Defaults to failed deliveries.
+      properties:
+        deliveries:
+          type: array
+          items:
+            $ref: "#/components/schemas/WebhookDelivery"
+        status:
+          type: string
+          enum: [pending, delivered, failed]
+          description: The status filter that was applied
         limit:
           type: integer
           description: Page size applied to this response

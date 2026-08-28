@@ -1,14 +1,13 @@
 use crate::{api::AuthenticatedMerchant, db, money, AppState};
 use axum::{
     async_trait,
-    extract::{ConnectInfo, Extension, FromRequest, FromRequestParts, Path, Query, Request, State},
-    http::{request::Parts, HeaderMap, StatusCode},
+    extract::{Extension, FromRequest, Path, Query, Request, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -17,7 +16,6 @@ pub struct AppError {
     status: StatusCode,
     code: &'static str,
     message: String,
-    retry_after_secs: Option<u64>,
 }
 
 impl AppError {
@@ -26,7 +24,6 @@ impl AppError {
             status,
             code,
             message: message.into(),
-            retry_after_secs: None,
         }
     }
 
@@ -41,37 +38,15 @@ impl AppError {
     pub fn not_found(code: &'static str, message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, code, message)
     }
-
-    pub fn service_unavailable(code: &'static str, message: impl Into<String>) -> Self {
-        Self::new(StatusCode::SERVICE_UNAVAILABLE, code, message)
-    }
-
-    pub fn conflict(code: &'static str, message: impl Into<String>) -> Self {
-        Self::new(StatusCode::CONFLICT, code, message)
-    }
-
-    /// Attaches a `Retry-After` header, in delta-seconds, to the response.
-    pub fn with_retry_after(mut self, secs: u64) -> Self {
-        self.retry_after_secs = Some(secs);
-        self
-    }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let mut response = (
+        (
             self.status,
             Json(json!({ "error": self.message, "code": self.code })),
         )
-            .into_response();
-        if let Some(secs) = self.retry_after_secs {
-            if let Ok(value) = axum::http::HeaderValue::from_str(&secs.to_string()) {
-                response
-                    .headers_mut()
-                    .insert(axum::http::header::RETRY_AFTER, value);
-            }
-        }
-        response
+            .into_response()
     }
 }
 
@@ -83,17 +58,6 @@ impl From<anyhow::Error> for AppError {
             "internal_error",
             "internal server error",
         )
-    }
-}
-
-/// Stable machine-readable code for a `JsonRejection` variant not given its
-/// own dedicated code, keyed on the HTTP status axum already chose for it —
-/// `413` for an oversized body (issue #257), `400` for everything else this
-/// catch-all can still see.
-fn rejection_code(status: StatusCode) -> &'static str {
-    match status {
-        StatusCode::PAYLOAD_TOO_LARGE => "payload_too_large",
-        _ => "invalid_request",
     }
 }
 
@@ -116,25 +80,10 @@ where
             Err(rejection) => {
                 use axum::extract::rejection::JsonRejection;
                 match &rejection {
-                    JsonRejection::JsonDataError(_) => {
-                        let detail = rejection.body_text();
-                        /* An unrecognised field is its own failure mode, not a
-                        generic deserialization error: it almost always means a
-                        typo or a client written against an older spec, and the
-                        fix is different from "the value had the wrong type".
-                        Give it a dedicated code so a client can branch on it,
-                        and keep serde's message — it names the offending field
-                        and lists the accepted ones. */
-                        let code = if detail.contains("unknown field") {
-                            "unknown_field"
-                        } else {
-                            "invalid_request"
-                        };
-                        Err(AppError::bad_request(
-                            code,
-                            format!("invalid request body: {detail}"),
-                        ))
-                    }
+                    JsonRejection::JsonDataError(_) => Err(AppError::bad_request(
+                        "invalid_request",
+                        format!("invalid request body: {}", rejection.body_text()),
+                    )),
                     JsonRejection::JsonSyntaxError(_) => Err(AppError::bad_request(
                         "invalid_request",
                         "request body contains malformed JSON",
@@ -145,126 +94,10 @@ where
                             "Content-Type must be application/json",
                         ))
                     }
-                    // `JsonRejection` is `#[non_exhaustive]`, so a catch-all is
-                    // required — but it must preserve the rejection's own status
-                    // and reason rather than flattening everything into a
-                    // generic 400. This is where `BytesRejection` lands,
-                    // covering an oversized body (`RequestBodyLimitLayer`) and a
-                    // truncated/aborted one: telling a client its JSON was
-                    // malformed when the real problem was the body's size or a
-                    // dropped connection sends it chasing the wrong fix (issue
-                    // #257).
-                    other => {
-                        tracing::debug!(rejection = %other, "unhandled JSON rejection");
-                        Err(AppError::new(
-                            other.status(),
-                            rejection_code(other.status()),
-                            other.body_text(),
-                        ))
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// The `POST /payments` body.
-///
-/// `deny_unknown_fields` because silently discarding what serde does not
-/// recognise is the wrong default for a payments API (issue #329). Without it a
-/// client could send `merchant_id` — which older revisions of `openapi.yaml`
-/// still advertised — and get a `201` describing an intent on whichever
-/// merchant owns the API key, believing it had chosen the tenant itself.
-///
-/// The interaction with `asset` is what makes silence expensive rather than
-/// merely untidy: `asset` defaults to `XLM` when absent, so `{"amount":"100",
-/// "assset":"USDC"}` — one transposed character — used to mint a 100 XLM intent
-/// and return `201`. Rejecting the field name is the only point at which that
-/// typo is still cheap to fix.
-///
-/// This matches how the rest of the API already treats input it does not
-/// understand: `status` is checked against an allow-list, an undecodable
-/// `cursor` is `400 invalid_cursor`, an unaccepted asset is `400
-/// unsupported_asset`. Strictness previously stopped at field names.
-/// A JSON body that may be omitted entirely, but must be valid when present.
-///
-/// `Option<JsonBody<T>>` cannot express this. Axum's `Option` extractor maps
-/// *every* rejection to `None`, so a body carrying a mistyped field would be
-/// discarded in exactly the same way as no body at all — reintroducing, on the
-/// one endpoint with an optional body, the silence issue #329 is about.
-///
-/// An absent or empty body is `None`; anything else is deserialized strictly
-/// and its failures surface as the [`JsonBody`] rejection they are.
-pub struct OptionalJsonBody<T>(pub Option<T>);
-
-#[async_trait]
-impl<T, S> FromRequest<S> for OptionalJsonBody<T>
-where
-    T: serde::de::DeserializeOwned,
-    S: Send + Sync,
-{
-    type Rejection = AppError;
-
-    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let (parts, body) = req.into_parts();
-
-        /* `RequestBodyLimitLayer` already caps the body well below this, and
-        exceeding it fails there rather than here; `usize::MAX` just means "no
-        second, lower limit of our own". */
-        let bytes = axum::body::to_bytes(body, usize::MAX).await.map_err(|_| {
-            AppError::bad_request("invalid_request", "could not read the request body")
-        })?;
-
-        if bytes.is_empty() {
-            return Ok(OptionalJsonBody(None));
-        }
-
-        let req = Request::from_parts(parts, axum::body::Body::from(bytes));
-        JsonBody::<T>::from_request(req, state)
-            .await
-            .map(|JsonBody(value)| OptionalJsonBody(Some(value)))
-    }
-}
-
-/// A drop-in replacement for `Query<T>` that maps a query-string failure into
-/// our standard `{"code": "...", "error": "..."}` 400 instead of axum's
-/// plaintext rejection.
-///
-/// Paired with `#[serde(deny_unknown_fields)]` on the target struct, this is
-/// what makes an unrecognised *parameter* a first-class error: serde raises
-/// "unknown field `stauts`, expected one of ..." and this turns it into
-/// `400 unknown_parameter` with that message intact, so the response names the
-/// offending key and lists the accepted ones.
-pub struct QueryParams<T>(pub T);
-
-#[async_trait]
-impl<T, S> FromRequestParts<S> for QueryParams<T>
-where
-    T: serde::de::DeserializeOwned,
-    S: Send + Sync,
-{
-    type Rejection = AppError;
-
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        match Query::<T>::from_request_parts(parts, state).await {
-            Ok(Query(value)) => Ok(QueryParams(value)),
-            Err(rejection) => {
-                let detail = rejection.body_text();
-                /* An unrecognised parameter is its own failure mode, not a
-                generic deserialization error: it almost always means a typo or
-                a client written against an older spec, and the fix is
-                different from "the value had the wrong type". This mirrors the
-                `unknown_field` split `JsonBody` already makes for bodies. */
-                if detail.contains("unknown field") {
-                    Err(AppError::bad_request(
-                        "unknown_parameter",
-                        format!("invalid query string: {detail}"),
-                    ))
-                } else {
-                    Err(AppError::bad_request(
-                        "invalid_query",
-                        format!("invalid query string: {detail}"),
-                    ))
+                    _ => Err(AppError::bad_request(
+                        "invalid_request",
+                        "invalid request body",
+                    )),
                 }
             }
         }
@@ -272,7 +105,6 @@ where
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CreatePaymentRequest {
     pub amount: String,
     #[serde(default = "default_asset")]
@@ -287,98 +119,32 @@ fn default_asset() -> String {
 pub async fn create(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     JsonBody(body): JsonBody<CreatePaymentRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let asset = body.asset.to_uppercase();
     let accepted = &state.config.accepted_assets;
-    let matched: Vec<_> = accepted.iter().filter(|a| a.code == asset).collect();
-    let accepted_asset = match matched.as_slice() {
-        [] => {
-            let codes = accepted
-                .iter()
-                .map(|a| a.code.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(AppError::bad_request(
-                "unsupported_asset",
-                format!("unsupported asset '{}'; supported: {}", body.asset, codes),
-            ));
-        }
-        [one] => *one,
-        _ => {
-            return Err(AppError::bad_request(
-                "ambiguous_asset",
-                format!(
-                    "asset '{asset}' maps to more than one issuer; pin ACCEPTED_ASSETS to a single issuer per code"
-                ),
-            ));
-        }
-    };
-    let asset_issuer = accepted_asset.issuer.as_deref();
-
-    /* A trustline confirmed missing means any intent minted here will bounce
-    on-chain — reject at creation rather than let the customer pay into a
-    black hole (issue: report_trustlines only ran once, at boot). Native XLM
-    never needs a trustline, so it's exempt. An asset never yet checked, or
-    whose last check errored contacting Horizon, is NOT treated as missing
-    here — `is_missing` returns `None` for either, and a Horizon outage must
-    not fail every payment creation on top of already failing the check. */
-    if asset_issuer.is_some()
-        && state.trustline_metrics.is_missing(&accepted_asset.code) == Some(true)
-    {
-        return Err(AppError::service_unavailable(
-            "trustline_missing",
-            format!(
-                "the gateway account currently has no trustline for {}; payments in this \
-                 asset cannot be received until one is established",
-                accepted_asset.code
-            ),
+    /* Resolve the *whole* asset identity, not just the code: the issuer is
+    persisted with the intent so the pair can be audited, reported to the
+    merchant, and reconciled against an external ledger later (issue #223).
+    Where the allow-list carries two entries for one code, the first wins —
+    the same entry the previous code-only check would have accepted. */
+    let Some(accepted_asset) = accepted.iter().find(|a| a.code == asset) else {
+        let codes = accepted
+            .iter()
+            .map(|a| a.code.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(AppError::bad_request(
+            "unsupported_asset",
+            format!("unsupported asset '{}'; supported: {}", body.asset, codes),
         ));
-    }
-
-    let stroops = money::parse_stroops(&body.amount).ok_or_else(|| {
-        AppError::bad_request(
+    };
+    if !money::is_valid_amount(&body.amount) {
+        return Err(AppError::bad_request(
             "invalid_amount",
             "amount must be a positive number with at most 7 decimal places",
-        )
-    })?;
-    /* The overflow bound `parse_stroops` already enforces is an implementation
-    artifact (roughly 922 billion units of any asset), not a business rule —
-    an intent above it is unpayable and misleadingly reported as malformed.
-    These configured bounds are optional and asset-specific (issue #310). */
-    if let Some(max) = state
-        .config
-        .max_payment_amount
-        .for_asset(&accepted_asset.code)
-    {
-        if stroops > max {
-            return Err(AppError::bad_request(
-                "amount_out_of_range",
-                format!(
-                    "amount exceeds the configured maximum of {} {} for this asset",
-                    money::stroops_to_string(max),
-                    accepted_asset.code
-                ),
-            ));
-        }
-    }
-    if let Some(min) = state
-        .config
-        .min_payment_amount
-        .for_asset(&accepted_asset.code)
-    {
-        if stroops < min {
-            return Err(AppError::bad_request(
-                "amount_out_of_range",
-                format!(
-                    "amount is below the configured minimum of {} {} for this asset",
-                    money::stroops_to_string(min),
-                    accepted_asset.code
-                ),
-            ));
-        }
+        ));
     }
     if let Some(url) = &body.webhook_url {
         if url.len() > 2048 {
@@ -472,93 +238,39 @@ pub async fn create(
     if let Some(key) = idempotency_key {
         let canonical_id = db::save_idempotency_key(&state.pool, &merchant_id, key, &id).await?;
         if canonical_id != id {
-            /* Lost the race — the winner is about to create its payment,
-            typically within a few ms (a single local INSERT). Give it a
-            short, bounded chance to land before telling the client to come
-            back: a busy-wait that holds a connection and a pool slot is not
-            an acceptable price for closing a race window this narrow. */
-            const IDEMPOTENCY_POLL_ATTEMPTS: u32 = 5;
-            const IDEMPOTENCY_POLL_INTERVAL: std::time::Duration =
-                std::time::Duration::from_millis(10);
-
-            for _ in 0..IDEMPOTENCY_POLL_ATTEMPTS {
+            /* Lost the race — the winner is about to create its payment. Wait
+            for it with a short retry loop and then return that payment. */
+            for _ in 0..50 {
                 if let Some(payment) = db::get_payment(&state.pool, &canonical_id).await? {
                     return Ok((StatusCode::OK, Json(to_json(&payment))));
                 }
-                tokio::time::sleep(IDEMPOTENCY_POLL_INTERVAL).await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            /* Not a server error — the winner just hasn't committed yet.
-            409 tells the client this is a transient, retryable conflict
-            rather than an outage; Retry-After gives it a cheap, concrete
-            backoff instead of a busy-wait on our side. */
-            return Err(AppError::conflict(
+            return Err(AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
                 "idempotency_conflict",
                 "concurrent request conflict, please retry",
-            )
-            .with_retry_after(1));
+            ));
         }
     }
 
-    // Retry loop to handle UNIQUE constraint violations on memo generation.
-    // Each iteration generates a fresh memo and attempts to create the payment.
-    // If the memo collides (concurrent request claimed the same memo), we retry
-    // with a new memo. Any other error is returned immediately.
-    let payment = 'retry: {
-        for _ in 0..10 {
-            let memo = generate_unique_memo();
-            match db::create_payment(
-                &state.pool,
-                db::NewPayment {
-                    id: &id,
-                    merchant_id: &merchant_id,
-                    destination_address: &state.config.gateway_public,
-                    memo: &memo,
-                    amount: &body.amount,
-                    asset: &asset,
-                    asset_issuer,
-                    webhook_url: body.webhook_url.as_deref(),
-                    ttl_secs: state.config.payment_ttl_secs as i64,
-                },
-            )
-            .await
-            {
-                Ok(p) => break 'retry p,
-                Err(err) if is_unique_violation(&err) => continue,
-                Err(err) => return Err(err.into()),
-            }
-        }
-        // Exhausted retries after UNIQUE constraint violations
-        return Err(AppError::new(
-            StatusCode::CONFLICT,
-            "memo_collision_exhausted",
-            "unable to generate a unique memo after multiple retries",
-        ));
-    };
-    state.payment_metrics.record_created();
+    let memo = generate_unique_memo(&state.pool).await?;
 
-    /* A merchant disputing a charge, or investigating a burst of unexpected
-    intents, starts from "which merchant created this and from where" — which
-    previously had no answer in the logs at all (issue #305). `audit = true`
-    lets this be routed to a separate sink from ordinary operational logs;
-    see the "Audit events" section of the README for the full field schema. */
-    let source_ip = crate::api::client_ip_key_from_parts(
-        Some(peer),
-        &headers,
-        &state.config.trusted_proxy_cidrs,
-    );
-    tracing::info!(
-        audit = true,
-        action = "payment.create",
-        actor = "merchant",
-        outcome = "created",
-        %merchant_id,
-        payment_id = %payment.id,
-        amount = %payment.amount,
-        asset = %payment.asset,
-        source_ip = %source_ip,
-        request_id = %crate::api::request_id(&headers),
-        "payment created"
-    );
+    let payment = db::create_payment(
+        &state.pool,
+        db::NewPayment {
+            id: &id,
+            merchant_id: &merchant_id,
+            destination_address: &state.config.gateway_public,
+            memo: &memo,
+            amount: &body.amount,
+            asset: &asset,
+            asset_issuer: accepted_asset.issuer.as_deref(),
+            webhook_url: body.webhook_url.as_deref(),
+            ttl_secs: state.config.payment_ttl_secs as i64,
+        },
+    )
+    .await?;
 
     Ok((StatusCode::CREATED, Json(to_json(&payment))))
 }
@@ -631,42 +343,16 @@ fn public_view(p: &db::Payment) -> Value {
     })
 }
 
-/// Query parameters for the payments listing.
-///
-/// `deny_unknown_fields` because a discarded parameter is a silently
-/// unfiltered page (issue #352). `?stauts=completed` — one transposed
-/// character — used to return `200 OK` listing *every* payment including
-/// pending ones, so a merchant reconciliation script that filters server-side
-/// and trusts the result would read unpaid intents as paid.
-///
-/// It also keeps the parameter set evolvable: while unknown parameters were
-/// ignored, adding a real `page` later would change the behaviour of requests
-/// that appeared to work before.
-///
-/// This matches how the rest of the API already treats input it does not
-/// understand: `status` is checked against an allow-list, an undecodable
-/// `cursor` is `400 invalid_cursor`, an unrecognised body field is `400
-/// unknown_field`. Strictness previously stopped at parameter names.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ListQuery {
     pub status: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub cursor: Option<String>,
-    /// Opt in to a `total` field on the offset-paginated response. Defaults to
-    /// omitted: SQLite has no cached row count, so computing it is a full
-    /// `COUNT(*)` scan over every matching row, on every request — including
-    /// the first page — for a field most callers never read (issue #320).
-    /// Has no effect in cursor (keyset) mode, which has never returned `total`.
-    pub include_total: Option<bool>,
 }
 
-/// Offset pagination is `O(offset)` in SQLite — it produces and discards
-/// every skipped row. This ceiling (generous for any real UI) keeps a deep,
-/// expensive scan-and-skip from being answered at all; the keyset (`cursor`)
-/// path stays `O(log n)` regardless of depth (issue #303).
-const MAX_OFFSET: i64 = 10_000;
+const DEFAULT_LIMIT: i64 = 20;
+const MAX_LIMIT: i64 = 100;
 /// Statuses a payment can actually hold, and therefore the only ones worth
 /// filtering on: `pending` at creation, `completed`/`underpaid` from
 /// settlement (`horizon::settle`), and `expired` from the TTL sweeper
@@ -674,34 +360,10 @@ const MAX_OFFSET: i64 = 10_000;
 /// a guaranteed-empty filter and is rejected as invalid.
 const VALID_STATUSES: [&str; 4] = ["pending", "completed", "underpaid", "expired"];
 
-/// Validates a caller-supplied `limit` against `(1..=max)`, rather than
-/// silently clamping it. Clamping absorbs three distinct bad inputs — too
-/// large, zero, negative — into a `200` that gives the caller no signal
-/// anything was wrong; a client paginating past `max` would read the
-/// silently-shortened page as "end of results" and stop early (issue #258).
-/// Matches the existing `invalid_status`/`invalid_cursor` convention: reject
-/// rather than coerce.
-pub fn validate_limit(limit: Option<i64>, default: i64, max: i64) -> Result<i64, AppError> {
-    match limit {
-        None => Ok(default),
-        Some(n) if (1..=max).contains(&n) => Ok(n),
-        Some(n) => Err(AppError::bad_request(
-            "invalid_limit",
-            format!("limit must be between 1 and {max} (got {n})"),
-        )),
-    }
-}
-
-/// Statuses a webhook delivery can hold: `pending` while attempts are still
-/// possible, `delivered` on success, `failed` when the attempt budget is
-/// exhausted. Nothing writes any other value, so a filter on anything else is
-/// a guaranteed-empty query and is rejected as invalid.
-const VALID_DELIVERY_STATUSES: [&str; 3] = ["pending", "delivered", "failed"];
-
 pub async fn list(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
-    QueryParams(q): QueryParams<ListQuery>,
+    Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, AppError> {
     if let Some(s) = &q.status {
         if !VALID_STATUSES.contains(&s.as_str()) {
@@ -716,25 +378,7 @@ pub async fn list(
         }
     }
 
-    /* A client migrating from offset to keyset pagination naturally sends both
-    for a request or two — the offset branch hands out a `next_cursor` to invite
-    exactly that. Answering from the cursor branch would discard `offset` with
-    no signal, and return a differently shaped body while it's at it, so refuse
-    rather than guess which mode was meant (issue #259). Presence, not value: an
-    explicit `offset=0` alongside a cursor is still a caller asserting a
-    pagination mode. */
-    if q.cursor.is_some() && q.offset.is_some() {
-        return Err(AppError::bad_request(
-            "conflicting_pagination",
-            "cursor and offset are mutually exclusive; use cursor for keyset pagination",
-        ));
-    }
-
-    let limit = validate_limit(
-        q.limit,
-        state.config.pagination_default_limit,
-        state.config.pagination_max_limit,
-    )?;
+    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
     if let Some(raw_cursor) = &q.cursor {
         // Keyset (cursor) pagination — stable, O(log n) regardless of page depth.
@@ -764,16 +408,7 @@ pub async fn list(
     } else {
         // Legacy offset pagination — kept for backward compatibility.
         let offset = q.offset.unwrap_or(0).max(0);
-        if offset > MAX_OFFSET {
-            return Err(AppError::bad_request(
-                "invalid_offset",
-                format!(
-                    "offset exceeds maximum of {MAX_OFFSET}; use cursor pagination instead \
-                     (see the `cursor` parameter and `next_cursor` in the response)"
-                ),
-            ));
-        }
-        let payments = db::list_payments(
+        let (payments, total) = db::list_payments(
             &state.pool,
             &merchant_id,
             q.status.as_deref(),
@@ -782,71 +417,40 @@ pub async fn list(
         )
         .await?;
 
-        // A migration affordance, not a second pagination model: the caller
-        // may take this cursor as the *first* cursor and then stay in pure
-        // cursor mode from the next request on. `list_payments` orders by
-        // (created_at DESC, id DESC), identical to the keyset query, so the
-        // cursor resumes at the row after this page and never re-reads the
-        // whole-second tie group that ends it. A short page returns null,
-        // mirroring cursor mode.
-        let next_cursor = if payments.len() == limit as usize {
-            payments.last().map(|p| encode_cursor(&p.created_at, &p.id))
-        } else {
-            None
-        };
+        // Provide next_cursor to ease migration to keyset pagination.
+        let next_cursor = payments.last().map(|p| encode_cursor(&p.created_at, &p.id));
 
-        let mut body = json!({
+        Ok(Json(json!({
             "payments": payments.iter().map(to_json).collect::<Vec<_>>(),
+            "total": total,
             "limit": limit,
             "offset": offset,
             "next_cursor": next_cursor,
-        });
-
-        // `total` costs a full COUNT(*) scan (issue #320) — computed only when
-        // asked for, and entirely absent from the response otherwise rather
-        // than sent as null, so a caller can tell "not computed" from "zero".
-        if q.include_total == Some(true) {
-            let total = db::count_payments(&state.pool, &merchant_id, q.status.as_deref()).await?;
-            body["total"] = json!(total);
-        }
-
-        Ok(Json(body))
+        })))
     }
 }
 
-pub fn encode_cursor(ts: &str, id: &str) -> String {
+fn encode_cursor(ts: &str, id: &str) -> String {
     hex::encode(format!("{ts}\t{id}"))
 }
 
-/// A legitimate cursor is the hex encoding of `"{rfc3339}\t{uuid}"` — 57
-/// bytes, so 114 hex characters. This ceiling is deliberately generous, not
-/// tight, so it rejects only what could not possibly be a real cursor.
-const MAX_CURSOR_HEX_LEN: usize = 256;
-
-pub fn decode_cursor(raw: &str) -> Option<(String, String)> {
-    // Cheap rejections first: an oversized or non-hex string is rejected
-    // before it is ever allocated or decoded (issue #304).
-    if raw.len() > MAX_CURSOR_HEX_LEN || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let s = String::from_utf8(hex::decode(raw).ok()?).ok()?;
+fn decode_cursor(raw: &str) -> Option<(String, String)> {
+    let bytes = hex::decode(raw).ok()?;
+    let s = String::from_utf8(bytes).ok()?;
     let (ts, id) = s.split_once('\t')?;
-    /* Both halves have known shapes — validate rather than trusting them.
-    `ts` is always `strftime('%Y-%m-%dT%H:%M:%SZ', ...)`, exactly 20 bytes.
-    `id` is a payment or webhook-delivery primary key: always non-empty and,
-    in practice, a UUID — but this helper backs cursors over both tables, and
-    nothing schema-enforces UUID shape on either, so a bounded length check is
-    the strongest assumption that holds for every caller. */
-    if ts.len() != 20 || id.is_empty() || id.len() > 64 {
-        return None;
-    }
     Some((ts.to_string(), id.to_string()))
 }
 
 /// Generates an 8-character uppercase-hex `text` memo (32 bits of entropy,
-/// well within Stellar's 28-byte text memo limit). Unlike a pre-check approach,
-/// this function does not verify uniqueness — the database UNIQUE constraint
-/// on the memo column is relied upon to enforce it.
+/// well within Stellar's 28-byte text memo limit) and confirms it hasn't been
+/// used by *any* payment intent before — `memo_exists` checks the entire
+/// `payments` table, not just pending ones, so a memo is never reused for the
+/// lifetime of the database. That makes the collision probability for a
+/// single call simply `rows-in-table / 2^32`, and the loop retries up to 10
+/// times before giving up; exhausting that before billions of payments exist
+/// is effectively impossible. If traffic ever approaches that scale, widen
+/// the memo (more hex chars, still under the 28-byte limit) rather than
+/// switching scheme.
 ///
 /// We chose a `text` memo over `memo_id` (a u64) or `memo_hash`/`memo_return`
 /// (32-byte) because it's the simplest scheme that round-trips a
@@ -857,19 +461,18 @@ pub fn decode_cursor(raw: &str) -> Option<(String, String)> {
 /// same text as one of our hex memos. `horizon::HorizonPayment::memo()`
 /// guards against this by only matching when Horizon reports `memo_type:
 /// "text"` (see issue #17).
-fn generate_unique_memo() -> String {
-    Uuid::new_v4().to_string().replace('-', "")[..8].to_uppercase()
-}
-
-/// Checks if an error is a UNIQUE constraint violation.
-fn is_unique_violation(err: &anyhow::Error) -> bool {
-    if let Some(sqlx::Error::Database(db_error)) = err.downcast_ref::<sqlx::Error>() {
-        // Check for UNIQUE constraint violation
-        // SQLite error message format: "UNIQUE constraint failed: table.column"
-        let msg = db_error.message();
-        return msg.contains("UNIQUE constraint failed");
+async fn generate_unique_memo(pool: &db::Db) -> Result<String, AppError> {
+    for _ in 0..10 {
+        let memo = Uuid::new_v4().to_string().replace('-', "")[..8].to_uppercase();
+        if !db::memo_exists(pool, &memo).await? {
+            return Ok(memo);
+        }
     }
-    false
+    Err(AppError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal_error",
+        "memo generation failed",
+    ))
 }
 
 fn to_json(p: &db::Payment) -> Value {
@@ -895,6 +498,7 @@ fn to_json(p: &db::Payment) -> Value {
         "memo": p.memo,
         "amount": canonical_amount,
         "asset": p.asset,
+        // `null` for the native asset, which has no issuer.
         "asset_issuer": p.asset_issuer,
         "status": p.status,
         "tx_hash": p.tx_hash,
@@ -905,38 +509,11 @@ fn to_json(p: &db::Payment) -> Value {
     })
 }
 
-/// Query parameters for the webhook-delivery listing. Matches the payments
-/// listing conventions: a `status` filter, a `limit` (default 20, max 100),
-/// and an opaque keyset `cursor` whose value comes from a previous response's
-/// `next_cursor`. `deny_unknown_fields` for the same reason as [`ListQuery`]:
-/// a mistyped parameter must not read as an applied filter (issue #352).
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ListDeliveryQuery {
-    pub status: Option<String>,
-    pub limit: Option<i64>,
-    pub cursor: Option<String>,
-}
-
 pub async fn list_webhooks(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
     Path(payment_id): Path<String>,
-    QueryParams(q): QueryParams<ListDeliveryQuery>,
 ) -> Result<Json<Value>, AppError> {
-    if let Some(s) = &q.status {
-        if !VALID_DELIVERY_STATUSES.contains(&s.as_str()) {
-            return Err(AppError::bad_request(
-                "invalid_status",
-                format!(
-                    "invalid status '{}'; valid: {}",
-                    s,
-                    VALID_DELIVERY_STATUSES.join(", ")
-                ),
-            ));
-        }
-    }
-
     // Verify payment exists and belongs to the caller. A payment owned by
     // another merchant reports the same 404 as a missing one, so this can't
     // be used to enumerate which payment ids exist for other tenants.
@@ -951,39 +528,7 @@ pub async fn list_webhooks(
             )
         })?;
 
-    let limit = validate_limit(
-        q.limit,
-        state.config.pagination_default_limit,
-        state.config.pagination_max_limit,
-    )?;
-
-    let cursor = match q.cursor.as_deref() {
-        Some(raw_cursor) => {
-            let (ts, id) = decode_cursor(raw_cursor)
-                .ok_or_else(|| AppError::bad_request("invalid_cursor", "invalid cursor"))?;
-            Some((ts, id))
-        }
-        None => None,
-    };
-
-    let deliveries = db::list_webhook_deliveries_keyset(
-        &state.pool,
-        &payment_id,
-        q.status.as_deref(),
-        limit,
-        cursor.as_ref().map(|(ts, id)| (ts.as_str(), id.as_str())),
-    )
-    .await?;
-
-    // A full page mints a cursor from its last row (created_at, id); a short
-    // page means we've reached the end and null signals "no more".
-    let next_cursor = if deliveries.len() == limit as usize {
-        deliveries
-            .last()
-            .map(|d| encode_cursor(&d.created_at, &d.id))
-    } else {
-        None
-    };
+    let deliveries = db::list_webhook_deliveries(&state.pool, &payment_id).await?;
 
     Ok(Json(json!({
         "payment_id": payment.id,
@@ -993,161 +538,23 @@ pub async fn list_webhooks(
             "event": d.event(),
             "status": d.status,
             "attempts": d.attempts,
-            "manual_attempts": d.manual_attempts,
             "last_attempt": d.last_attempt,
             "created_at": d.created_at,
         })).collect::<Vec<_>>(),
-        "limit": limit,
-        "next_cursor": next_cursor,
     })))
 }
 
-// ── Dead-letter view (issue #319) ────────────────────────────────────────────
-
-/// `deny_unknown_fields` for the same reason as [`ListQuery`]: a mistyped
-/// parameter must not read as an applied filter (issue #352). It matters more
-/// here than elsewhere, because `status` defaults to `failed` when absent — so
-/// a typo'd `?staus=pending` would answer the dead-letter question with the
-/// dead-letter list and look entirely plausible.
+/// Query parameters accepted by `POST /payments/:id/webhooks/:delivery_id/redeliver`.
+/// `deny_unknown_fields` so a typo'd param is rejected rather than silently
+/// ignored — the same strictness applied to every other query string in the API.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ListDeliveriesQuery {
-    /// Defaults to `failed` — the dead-letter case this endpoint exists for.
-    pub status: Option<String>,
-    pub limit: Option<i64>,
-    pub cursor: Option<String>,
-}
-
-/// `GET /payments/webhooks` — a merchant's deliveries across *all* their
-/// payments, defaulting to the failed ones.
-///
-/// Before this, a permanently-failed delivery was reachable only by knowing the
-/// payment id and calling `GET /payments/:id/webhooks`. That is backwards: the
-/// reason to go looking is almost always "a merchant says they are missing
-/// events", and a payment id is precisely what the person asking does not have.
-/// Answering it meant querying SQLite directly on the production volume, and a
-/// merchant could not self-serve at all.
-pub async fn list_merchant_webhooks(
-    State(state): State<Arc<AppState>>,
-    Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
-    QueryParams(q): QueryParams<ListDeliveriesQuery>,
-) -> Result<Json<Value>, AppError> {
-    let status = q.status.as_deref().unwrap_or("failed");
-    if !VALID_DELIVERY_STATUSES.contains(&status) {
-        return Err(AppError::bad_request(
-            "invalid_status",
-            format!(
-                "invalid delivery status '{}'; valid: {}",
-                status,
-                VALID_DELIVERY_STATUSES.join(", ")
-            ),
-        ));
-    }
-
-    let limit = validate_limit(
-        q.limit,
-        state.config.pagination_default_limit,
-        state.config.pagination_max_limit,
-    )?;
-
-    let cursor = match &q.cursor {
-        Some(raw) => Some(
-            decode_cursor(raw)
-                .ok_or_else(|| AppError::bad_request("invalid_cursor", "invalid cursor"))?,
-        ),
-        None => None,
-    };
-
-    let deliveries = db::list_deliveries_for_merchant(
-        &state.pool,
-        &merchant_id,
-        status,
-        limit,
-        cursor.as_ref().map(|(ts, id)| (ts.as_str(), id.as_str())),
-    )
-    .await?;
-
-    let next_cursor = if deliveries.len() == limit as usize {
-        deliveries
-            .last()
-            .map(|d| encode_cursor(&d.created_at, &d.id))
-    } else {
-        None
-    };
-
-    Ok(Json(json!({
-        "deliveries": deliveries.iter().map(delivery_to_json).collect::<Vec<_>>(),
-        "status": status,
-        "limit": limit,
-        "next_cursor": next_cursor,
-    })))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RedeliverBulkRequest {
-    /// Specific deliveries to requeue. Omit (or send an empty list) to requeue
-    /// every failed delivery this merchant has.
-    pub delivery_ids: Option<Vec<String>>,
-}
-
-/// Cap on explicitly-listed ids per request, so the generated `IN (...)` stays
-/// a sane size. Requeueing *everything* is unaffected — it needs no id list.
-const MAX_BULK_DELIVERY_IDS: usize = 100;
-
-/// `POST /payments/webhooks/redeliver` — bulk recovery after a merchant has
-/// fixed their endpoint.
-///
-/// This endpoint sends nothing itself. It resets matching failed rows to
-/// `pending` with `attempts = 0` and hands them to the redrive worker, whose
-/// `WEBHOOK_REDRIVE_CONCURRENCY` and exponential backoff already bound the
-/// outbound rate. So requeueing ten thousand deliveries costs one `UPDATE`,
-/// cannot exhaust the redrive budget, and cannot stampede a receiver that has
-/// only just come back up (coordinating with issue #235).
-///
-/// Requeueing also acknowledges: somebody has now acted on these failures, so
-/// they stop being exempt from retention.
-pub async fn redeliver_webhooks_bulk(
-    State(state): State<Arc<AppState>>,
-    Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    OptionalJsonBody(body): OptionalJsonBody<RedeliverBulkRequest>,
-) -> Result<Json<Value>, AppError> {
-    let ids = body.and_then(|b| b.delivery_ids).unwrap_or_default();
-    if ids.len() > MAX_BULK_DELIVERY_IDS {
-        return Err(AppError::bad_request(
-            "too_many_delivery_ids",
-            format!(
-                "at most {MAX_BULK_DELIVERY_IDS} delivery_ids per request; \
-                 omit the field to requeue every failed delivery"
-            ),
-        ));
-    }
-
-    let requeued = db::requeue_failed_deliveries(&state.pool, &merchant_id, &ids).await?;
-    let source_ip = crate::api::client_ip_key_from_parts(
-        Some(peer),
-        &headers,
-        &state.config.trusted_proxy_cidrs,
-    );
-    tracing::info!(
-        audit = true,
-        action = "webhook.redeliver_bulk",
-        actor = "merchant",
-        outcome = "requeued",
-        %merchant_id,
-        requeued,
-        source_ip = %source_ip,
-        request_id = %crate::api::request_id(&headers),
-        "failed webhook deliveries requeued for redrive"
-    );
-
-    Ok(Json(json!({
-        "requeued": requeued,
-        "detail": "requeued deliveries are retried by the background redrive \
-                   worker, subject to its concurrency limit and backoff",
-    })))
+pub struct RedeliverQuery {
+    /// Pass `?force=true` to redeliver a webhook that was already successfully
+    /// delivered. Without it, a delivery whose status is `"delivered"` is
+    /// refused with `409 already_delivered` so that an accidental double-click
+    /// on the dashboard does not silently send a duplicate event (issue #236).
+    pub force: Option<bool>,
 }
 
 /// One delivery as the API exposes it. The stored `payload` is deliberately
@@ -1174,6 +581,7 @@ pub async fn redeliver_webhook(
     Path((payment_id, delivery_id)): Path<(String, String)>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    QueryParams(query): QueryParams<RedeliverQuery>,
 ) -> Result<StatusCode, AppError> {
     // Verify payment exists and belongs to the caller. A payment owned by
     // another merchant reports the same 404 as a missing one.
@@ -1205,6 +613,22 @@ pub async fn redeliver_webhook(
             StatusCode::NOT_FOUND,
             "delivery_not_found",
             "delivery not found",
+        ));
+    }
+
+    /* Guard against silent duplicate events on an already-successful delivery
+    (issue #236). An accidental double-click on the dashboard redeliver button,
+    or an API client that does not check status before calling this endpoint,
+    would otherwise send a second copy of the event — and overwrite the
+    audit row if the second attempt failed, permanently losing the evidence
+    that the original delivery succeeded. Require explicit opt-in via
+    `?force=true` so callers cannot hit this path accidentally. */
+    if delivery.status == "delivered" && !query.force.unwrap_or(false) {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "already_delivered",
+            "this webhook was already successfully delivered; \
+             pass ?force=true to redeliver anyway",
         ));
     }
 
@@ -1248,33 +672,8 @@ pub async fn redeliver_webhook(
         _ => "failed",
     };
 
-    /* Manual redelivery must not share the automatic redrive budget or refresh
-    `last_attempt` — otherwise a merchant clicking "resend" can exhaust
-    `WEBHOOK_REDRIVE_MAX_ATTEMPTS` and permanently disable background recovery
-    (issue #235). */
-    db::record_manual_redelivery(&state.pool, &delivery_id, new_status).await?;
-
-    /* A burst of redeliveries previously had no attributable origin in the
-    logs at all (issue #305). Logged regardless of outcome — `outcome` here
-    is the delivery result, not whether the redelivery *request* succeeded;
-    the request itself always reached this point. */
-    let source_ip = crate::api::client_ip_key_from_parts(
-        Some(peer),
-        &headers,
-        &state.config.trusted_proxy_cidrs,
-    );
-    tracing::info!(
-        audit = true,
-        action = "webhook.redeliver",
-        actor = "merchant",
-        outcome = %new_status,
-        %merchant_id,
-        payment_id = %payment_id,
-        delivery_id = %delivery_id,
-        source_ip = %source_ip,
-        request_id = %crate::api::request_id(&headers),
-        "webhook redelivery triggered"
-    );
+    db::update_webhook_delivery(&state.pool, &delivery_id, new_status, delivery.attempts + 1)
+        .await?;
 
     if new_status == "delivered" {
         Ok(StatusCode::OK)
@@ -1284,70 +683,5 @@ pub async fn redeliver_webhook(
             "webhook_delivery_failed",
             "webhook delivery failed",
         ))
-    }
-}
-
-#[cfg(test)]
-mod cursor_tests {
-    use super::*;
-
-    /// A cursor minted by `encode_cursor` must always decode back to the same
-    /// `(timestamp, id)` pair (issue #304).
-    #[test]
-    fn decode_cursor_round_trips_encode_cursor() {
-        let ts = "2026-01-01T00:00:00Z";
-        let id = Uuid::new_v4().to_string();
-        let cursor = encode_cursor(ts, &id);
-        assert_eq!(decode_cursor(&cursor), Some((ts.to_string(), id)));
-    }
-
-    #[test]
-    fn decode_cursor_rejects_oversized_input() {
-        let huge = "a".repeat(MAX_CURSOR_HEX_LEN + 1);
-        assert_eq!(decode_cursor(&huge), None);
-    }
-
-    #[test]
-    fn decode_cursor_rejects_non_hex_input() {
-        assert_eq!(decode_cursor("not-valid-hex!!"), None);
-    }
-
-    #[test]
-    fn decode_cursor_rejects_malformed_timestamp() {
-        // Valid hex, valid UTF-8, valid UUID — but the timestamp half is the
-        // wrong length.
-        let id = Uuid::new_v4().to_string();
-        let cursor = encode_cursor("2026-01-01", &id);
-        assert_eq!(decode_cursor(&cursor), None);
-    }
-
-    #[test]
-    fn decode_cursor_accepts_non_uuid_ids() {
-        // Webhook-delivery cursors share this helper, and delivery ids are
-        // not schema-enforced to be UUIDs (test fixtures use short ids like
-        // "delivery-1") — only a bounded length is required.
-        let cursor = encode_cursor("2026-01-01T00:00:00Z", "delivery-1");
-        assert_eq!(
-            decode_cursor(&cursor),
-            Some(("2026-01-01T00:00:00Z".to_string(), "delivery-1".to_string()))
-        );
-    }
-
-    #[test]
-    fn decode_cursor_rejects_empty_id() {
-        let cursor = encode_cursor("2026-01-01T00:00:00Z", "");
-        assert_eq!(decode_cursor(&cursor), None);
-    }
-
-    #[test]
-    fn decode_cursor_rejects_oversized_id() {
-        let cursor = encode_cursor("2026-01-01T00:00:00Z", &"x".repeat(65));
-        assert_eq!(decode_cursor(&cursor), None);
-    }
-
-    #[test]
-    fn decode_cursor_rejects_missing_separator() {
-        let cursor = hex::encode("no-tab-in-here");
-        assert_eq!(decode_cursor(&cursor), None);
     }
 }
