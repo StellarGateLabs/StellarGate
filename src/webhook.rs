@@ -69,8 +69,9 @@ pub fn redact_url(raw: &str) -> String {
 /// string and reject the request if `timestamp` is too far from their own clock
 /// (see the README), which is what prevents replay of an old, valid signature.
 pub fn sign(secret: &str, timestamp: i64, body: &[u8]) -> String {
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
+    let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) else {
+        return String::new();
+    };
     mac.update(timestamp.to_string().as_bytes());
     mac.update(b".");
     mac.update(body);
@@ -304,10 +305,9 @@ pub async fn redrive_once(state: &Arc<AppState>) -> usize {
         let state = state.clone();
         let semaphore = semaphore.clone();
         tasks.push(tokio::spawn(async move {
-            let _permit = semaphore
-                .acquire_owned()
-                .await
-                .expect("semaphore is never closed");
+            let Ok(_permit) = semaphore.acquire_owned().await else {
+                return;
+            };
             redrive_one(&state, delivery).await;
         }));
     }

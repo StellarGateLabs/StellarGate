@@ -495,7 +495,8 @@ async fn rate_limit_middleware(
         below. */
         let limiter = rate_limit.limiters.get_with(key, || {
             Arc::new(governor::RateLimiter::direct(governor::Quota::per_second(
-                NonZeroU32::new(effective_rps).unwrap(),
+                NonZeroU32::new(effective_rps)
+                    .expect("effective_rps is clamped to at least 1"),
             )))
         });
 
@@ -823,7 +824,8 @@ mod tests {
 
     #[tokio::test]
     async fn slow_handler_is_aborted_with_408() {
-        let server = TestServer::new(timeout_test_router(Duration::from_millis(20))).unwrap();
+        let server = TestServer::new(timeout_test_router(Duration::from_millis(20)))
+            .expect("timeout test router should build");
         let response = server.get("/slow").await;
         response.assert_status(StatusCode::REQUEST_TIMEOUT);
     }

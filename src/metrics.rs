@@ -323,7 +323,7 @@ impl HttpMetrics {
         // A poisoned metrics mutex means a previous worker panicked while the
         // lock was held. Recover the underlying state instead of crashing the
         // process and continue recording metrics.
-        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut inner = lock_or_recover(&self.inner, "http_metrics.inner");
         *inner
             .requests
             .entry((method.to_string(), route.to_string(), status))
@@ -337,7 +337,7 @@ impl HttpMetrics {
 
     /// Snapshot of request counts, sorted for deterministic exposition.
     fn requests_snapshot(&self) -> Vec<(String, String, u16, u64)> {
-        let inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let inner = lock_or_recover(&self.inner, "http_metrics.inner");
         let mut rows: Vec<_> = inner
             .requests
             .iter()
@@ -351,7 +351,7 @@ impl HttpMetrics {
 
     /// Snapshot of latency distributions, sorted for deterministic exposition.
     fn latency_snapshot(&self) -> Vec<(String, String, RouteLatency)> {
-        let inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let inner = lock_or_recover(&self.inner, "http_metrics.inner");
         let mut rows: Vec<_> = inner
             .latency
             .iter()
@@ -600,11 +600,10 @@ impl TrustlineMetrics {
         }
         drop(map);
 
-        let mut unauth_map = self
-            .inner
-            .unauthorized
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut unauth_map = lock_or_recover(
+            &self.inner.unauthorized,
+            "trustline_metrics.unauthorized",
+        );
         unauth_map.clear();
         for &code in &checked_codes {
             unauth_map.insert(
@@ -614,11 +613,10 @@ impl TrustlineMetrics {
         }
         drop(unauth_map);
 
-        let mut hr_map = self
-            .inner
-            .headroom_stroops
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut hr_map = lock_or_recover(
+            &self.inner.headroom_stroops,
+            "trustline_metrics.headroom_stroops",
+        );
         hr_map.clear();
         for (code, stroops) in headroom {
             hr_map.insert((*code).to_string(), *stroops);
@@ -640,10 +638,7 @@ impl TrustlineMetrics {
     /// usable. `None` — never confirmed either way (not yet checked, or
     /// dropped from `ACCEPTED_ASSETS`).
     pub fn is_missing(&self, code: &str) -> Option<bool> {
-        self.inner
-            .missing
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        lock_or_recover(&self.inner.missing, "trustline_metrics.missing")
             .get(code)
             .copied()
     }
@@ -659,11 +654,7 @@ impl TrustlineMetrics {
     /// Snapshot of missing/usable state, sorted by asset code for
     /// deterministic output.
     pub fn snapshot(&self) -> Vec<(String, bool)> {
-        let map = self
-            .inner
-            .missing
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let map = lock_or_recover(&self.inner.missing, "trustline_metrics.missing");
         let mut out: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
@@ -671,11 +662,10 @@ impl TrustlineMetrics {
 
     /// Snapshot of unauthorized state, sorted by asset code.
     pub fn snapshot_unauthorized(&self) -> Vec<(String, bool)> {
-        let map = self
-            .inner
-            .unauthorized
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let map = lock_or_recover(
+            &self.inner.unauthorized,
+            "trustline_metrics.unauthorized",
+        );
         let mut out: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
@@ -683,11 +673,10 @@ impl TrustlineMetrics {
 
     /// Snapshot of headroom (limit - balance) in stroops, sorted by asset code.
     pub fn snapshot_headroom(&self) -> Vec<(String, i64)> {
-        let map = self
-            .inner
-            .headroom_stroops
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let map = lock_or_recover(
+            &self.inner.headroom_stroops,
+            "trustline_metrics.headroom_stroops",
+        );
         let mut out: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
