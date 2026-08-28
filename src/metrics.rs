@@ -10,7 +10,14 @@
 //! standard scraper can ingest the data with zero configuration.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+fn lock_or_recover<T>(mutex: &Mutex<T>, what: &str) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!(mutex = what, "mutex poisoned; recovering and continuing");
+        poisoned.into_inner()
+    })
+}
 
 /// Histogram buckets for webhook delivery latency (milliseconds).
 /// Covers the range from sub-10 ms fast paths up to the 10 s default timeout.
@@ -276,10 +283,11 @@ impl RouteLatency {
                 self.buckets[i] += 1;
             }
         }
-        // SAFETY: the `is_empty()` branch above always populates `buckets`
-        // with HTTP_LATENCY_BUCKETS_MS.len() + 1 (>= 1) slots before this
-        // line runs, so `last_mut()` can never return None.
-        *self.buckets.last_mut().unwrap() += 1;
+        if let Some(last) = self.buckets.last_mut() {
+            *last += 1;
+        } else {
+            self.buckets.push(1);
+        }
     }
 }
 
@@ -312,10 +320,7 @@ impl HttpMetrics {
 
     /// Record one completed HTTP request.
     pub fn record(&self, method: &str, route: &str, status: u16, elapsed_ms: u64) {
-        // SAFETY: poisoning only occurs if a prior holder panicked while
-        // holding this lock; nothing in the critical sections below can
-        // panic, so `.unwrap()` here is unreachable in practice.
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock_or_recover(&self.inner, "http metrics");
         *inner
             .requests
             .entry((method.to_string(), route.to_string(), status))
@@ -329,9 +334,7 @@ impl HttpMetrics {
 
     /// Snapshot of request counts, sorted for deterministic exposition.
     fn requests_snapshot(&self) -> Vec<(String, String, u16, u64)> {
-        // SAFETY: see the justification in `record` above — nothing in this
-        // struct's critical sections panics, so the lock can't be poisoned.
-        let inner = self.inner.lock().unwrap();
+        let inner = lock_or_recover(&self.inner, "http metrics requests");
         let mut rows: Vec<_> = inner
             .requests
             .iter()
@@ -345,8 +348,7 @@ impl HttpMetrics {
 
     /// Snapshot of latency distributions, sorted for deterministic exposition.
     fn latency_snapshot(&self) -> Vec<(String, String, RouteLatency)> {
-        // SAFETY: see the justification in `record` above.
-        let inner = self.inner.lock().unwrap();
+        let inner = lock_or_recover(&self.inner, "http metrics latency");
         let mut rows: Vec<_> = inner
             .latency
             .iter()
@@ -582,19 +584,16 @@ impl TrustlineMetrics {
         unauthorized: &[String],
         headroom: &[(&str, i64)],
     ) {
-        // SAFETY: poisoning only occurs if a prior holder panicked while
-        // holding this lock; nothing in this struct's critical sections
-        // panics, so `.unwrap()` here is unreachable in practice.
         let checked_codes: Vec<&str> = checked.into_iter().collect();
 
-        let mut map = self.inner.missing.lock().unwrap();
+        let mut map = lock_or_recover(&self.inner.missing, "missing trustlines");
         map.clear();
         for &code in &checked_codes {
             map.insert(code.to_string(), missing.iter().any(|m| m == code));
         }
         drop(map);
 
-        let mut unauth_map = self.inner.unauthorized.lock().unwrap();
+        let mut unauth_map = lock_or_recover(&self.inner.unauthorized, "unauthorized trustlines");
         unauth_map.clear();
         for &code in &checked_codes {
             unauth_map.insert(
@@ -604,7 +603,7 @@ impl TrustlineMetrics {
         }
         drop(unauth_map);
 
-        let mut hr_map = self.inner.headroom_stroops.lock().unwrap();
+        let mut hr_map = lock_or_recover(&self.inner.headroom_stroops, "trustline headroom");
         hr_map.clear();
         for (code, stroops) in headroom {
             hr_map.insert((*code).to_string(), *stroops);
@@ -626,8 +625,9 @@ impl TrustlineMetrics {
     /// usable. `None` — never confirmed either way (not yet checked, or
     /// dropped from `ACCEPTED_ASSETS`).
     pub fn is_missing(&self, code: &str) -> Option<bool> {
-        // SAFETY: see the justification in `record_check` above.
-        self.inner.missing.lock().unwrap().get(code).copied()
+        lock_or_recover(&self.inner.missing, "missing trustlines lookup")
+            .get(code)
+            .copied()
     }
 
     pub fn check_failures(&self) -> u64 {
@@ -641,8 +641,7 @@ impl TrustlineMetrics {
     /// Snapshot of missing/usable state, sorted by asset code for
     /// deterministic output.
     pub fn snapshot(&self) -> Vec<(String, bool)> {
-        // SAFETY: see the justification in `record_check` above.
-        let map = self.inner.missing.lock().unwrap();
+        let map = lock_or_recover(&self.inner.missing, "missing trustlines snapshot");
         let mut out: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
@@ -650,7 +649,7 @@ impl TrustlineMetrics {
 
     /// Snapshot of unauthorized state, sorted by asset code.
     pub fn snapshot_unauthorized(&self) -> Vec<(String, bool)> {
-        let map = self.inner.unauthorized.lock().unwrap();
+        let map = lock_or_recover(&self.inner.unauthorized, "unauthorized trustlines snapshot");
         let mut out: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
@@ -658,7 +657,7 @@ impl TrustlineMetrics {
 
     /// Snapshot of headroom (limit - balance) in stroops, sorted by asset code.
     pub fn snapshot_headroom(&self) -> Vec<(String, i64)> {
-        let map = self.inner.headroom_stroops.lock().unwrap();
+        let map = lock_or_recover(&self.inner.headroom_stroops, "headroom snapshot");
         let mut out: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
@@ -1111,6 +1110,21 @@ mod tests {
             db,
             &TrustlineMetrics::new(),
         )
+    }
+
+    #[test]
+    fn metrics_lock_poison_is_recovered_without_panicking() {
+        let http = HttpMetrics::new();
+
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = http.inner.lock().unwrap();
+            panic!("poison the metrics mutex");
+        }));
+        assert!(poison.is_err(), "test must intentionally poison the lock");
+
+        http.record("GET", "/health", 200, 42);
+        assert_eq!(http.requests_snapshot().len(), 1);
+        assert_eq!(http.latency_snapshot().len(), 1);
     }
 
     // ── HttpMetrics ──────────────────────────────────────────────────────
