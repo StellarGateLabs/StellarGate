@@ -156,7 +156,7 @@ mod tests {
             },
         )
         .await
-        .unwrap();
+        .expect("expired payment fixture should be created");
 
         let expired_count = sweep_once(&state).await.unwrap();
         assert_eq!(expired_count, 1, "the overdue intent must be swept");
