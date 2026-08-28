@@ -167,7 +167,10 @@ mod tests {
             .unwrap();
         assert_eq!(updated.status, "expired");
 
-        let received = server.received_requests().await.unwrap();
+        let received = server
+            .received_requests()
+            .await
+            .expect("mock server should record the first expiry webhook only");
         assert_eq!(received.len(), 1, "exactly one webhook POST must be sent");
         let req = &received[0];
         assert_eq!(
