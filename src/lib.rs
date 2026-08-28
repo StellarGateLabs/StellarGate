@@ -26,8 +26,22 @@ pub struct TaskSnapshot {
     pub disabled_reason: Option<&'static str>,
 }
 
-/// Tracks background task health: started, stopped, and failure counts.
-/// Used for liveness monitoring and alerting on task crashes.
+/// Consecutive panics at or above this mark a required task as crash-looping.
+/// `/health` fails while any required task is crash-looping, even if the
+/// supervisor has already spawned a replacement.
+pub const CRASH_LOOP_THRESHOLD: u32 = 3;
+
+/// Snapshot of one background task, used to render `/metrics`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSnapshot {
+    pub name: &'static str,
+    pub running: bool,
+    pub restarts: u64,
+    pub consecutive_failures: u32,
+    pub disabled_reason: Option<&'static str>,
+}
+
+/// Tracks background task health for liveness, readiness, and monitoring.
 #[derive(Clone)]
 pub struct TaskHealth {
     inner: Arc<TaskHealthInner>,
@@ -155,7 +169,7 @@ impl TaskHealth {
     pub fn crash_looping_required_tasks(&self) -> Vec<&'static str> {
         let consecutive = lock(&self.inner.consecutive_failures);
         let required = lock(&self.inner.required);
-        required.iter().copied()
+1        required.iter().copied()
             .filter(|name| consecutive.get(name).copied().unwrap_or(0) >= CRASH_LOOP_THRESHOLD)
             .collect()
     }
