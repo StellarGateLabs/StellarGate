@@ -441,7 +441,16 @@ pub async fn check_trustlines(state: &Arc<AppState>) -> anyhow::Result<Vec<Strin
         .await?
         .error_for_status()?
         .json()
-        .await?)
+        .await?;
+
+    let accepted = &state.config.accepted_assets;
+    let balances = &account.balances;
+    let missing = find_missing_trustlines(accepted, balances)
+        .into_iter()
+        .map(|(asset, _)| asset.code.clone())
+        .collect::<Vec<_>>();
+
+    Ok(missing)
 }
 
 /// Check that the gateway account holds a trustline for every accepted
