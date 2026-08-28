@@ -10,7 +10,14 @@
 //! standard scraper can ingest the data with zero configuration.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+fn lock_or_recover<T>(mutex: &Mutex<T>, what: &str) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!(mutex = what, "mutex poisoned; recovering and continuing");
+        poisoned.into_inner()
+    })
+}
 
 /// Histogram buckets for webhook delivery latency (milliseconds).
 /// Covers the range from sub-10 ms fast paths up to the 10 s default timeout.
@@ -276,10 +283,11 @@ impl RouteLatency {
                 self.buckets[i] += 1;
             }
         }
-        // SAFETY: the `is_empty()` branch above always populates `buckets`
-        // with HTTP_LATENCY_BUCKETS_MS.len() + 1 (>= 1) slots before this
-        // line runs, so `last_mut()` can never return None.
-        *self.buckets.last_mut().unwrap() += 1;
+        if let Some(last) = self.buckets.last_mut() {
+            *last += 1;
+        } else {
+            self.buckets.push(1);
+        }
     }
 }
 
@@ -1150,6 +1158,21 @@ mod tests {
             db,
             &TrustlineMetrics::new(),
         )
+    }
+
+    #[test]
+    fn metrics_lock_poison_is_recovered_without_panicking() {
+        let http = HttpMetrics::new();
+
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = http.inner.lock().unwrap();
+            panic!("poison the metrics mutex");
+        }));
+        assert!(poison.is_err(), "test must intentionally poison the lock");
+
+        http.record("GET", "/health", 200, 42);
+        assert_eq!(http.requests_snapshot().len(), 1);
+        assert_eq!(http.latency_snapshot().len(), 1);
     }
 
     // ── HttpMetrics ──────────────────────────────────────────────────────
