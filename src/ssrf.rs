@@ -124,7 +124,7 @@ mod tests {
             "192.168.1.1",
         ] {
             assert!(
-                is_blocked_ipv4(ip.parse().unwrap()),
+                is_blocked_ipv4(ip.parse().expect("private IPv4 fixture should parse")),
                 "{ip} should be blocked"
             );
         }
@@ -161,7 +161,7 @@ mod tests {
     fn blocks_loopback_link_local_and_unique_local_v6() {
         for ip in ["::1", "fe80::1", "fc00::1", "fd00::1"] {
             assert!(
-                is_blocked_ipv6(ip.parse().unwrap()),
+                is_blocked_ipv6(ip.parse().expect("private IPv6 fixture should parse")),
                 "{ip} should be blocked"
             );
         }

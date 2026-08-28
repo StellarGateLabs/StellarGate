@@ -823,7 +823,8 @@ mod tests {
 
     #[tokio::test]
     async fn slow_handler_is_aborted_with_408() {
-        let server = TestServer::new(timeout_test_router(Duration::from_millis(20))).unwrap();
+        let server = TestServer::new(timeout_test_router(Duration::from_millis(20)))
+            .expect("timeout test router should build");
         let response = server.get("/slow").await;
         response.assert_status(StatusCode::REQUEST_TIMEOUT);
     }
