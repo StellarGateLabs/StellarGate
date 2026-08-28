@@ -323,7 +323,7 @@ impl HttpMetrics {
         // A poisoned metrics mutex means a previous worker panicked while the
         // lock was held. Recover the underlying state instead of crashing the
         // process and continue recording metrics.
-        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut inner = lock_or_recover(&self.inner, "http_metrics.inner");
         *inner
             .requests
             .entry((method.to_string(), route.to_string(), status))
@@ -337,7 +337,7 @@ impl HttpMetrics {
 
     /// Snapshot of request counts, sorted for deterministic exposition.
     fn requests_snapshot(&self) -> Vec<(String, String, u16, u64)> {
-        let inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let inner = lock_or_recover(&self.inner, "http_metrics.inner");
         let mut rows: Vec<_> = inner
             .requests
             .iter()
@@ -351,7 +351,7 @@ impl HttpMetrics {
 
     /// Snapshot of latency distributions, sorted for deterministic exposition.
     fn latency_snapshot(&self) -> Vec<(String, String, RouteLatency)> {
-        let inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let inner = lock_or_recover(&self.inner, "http_metrics.inner");
         let mut rows: Vec<_> = inner
             .latency
             .iter()
@@ -640,10 +640,7 @@ impl TrustlineMetrics {
     /// usable. `None` — never confirmed either way (not yet checked, or
     /// dropped from `ACCEPTED_ASSETS`).
     pub fn is_missing(&self, code: &str) -> Option<bool> {
-        self.inner
-            .missing
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        lock_or_recover(&self.inner.missing, "trustline_metrics.missing")
             .get(code)
             .copied()
     }
