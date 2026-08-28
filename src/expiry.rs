@@ -167,7 +167,10 @@ mod tests {
             .unwrap();
         assert_eq!(updated.status, "expired");
 
-        let received = server.received_requests().await.unwrap();
+        let received = server
+            .received_requests()
+            .await
+            .expect("mock server should capture the expiry webhook");
         assert_eq!(received.len(), 1, "exactly one webhook POST must be sent");
         let req = &received[0];
         assert_eq!(
@@ -175,7 +178,8 @@ mod tests {
             EXPIRED_EVENT
         );
 
-        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&req.body)
+            .expect("expiry webhook body should be valid JSON");
         assert_eq!(body["event"], EXPIRED_EVENT);
         assert_eq!(body["payment_id"], payment.id);
         assert_eq!(body["status"], "expired");
@@ -184,11 +188,11 @@ mod tests {
         let timestamp: i64 = req
             .headers
             .get("X-StellarGate-Timestamp")
-            .unwrap()
+            .expect("expiry webhook should include a timestamp header")
             .to_str()
-            .unwrap()
+            .expect("expiry webhook timestamp should be ASCII")
             .parse()
-            .unwrap();
+            .expect("expiry webhook timestamp should parse as i64");
         let expected_sig = crate::webhook::sign(&state.config.webhook_secret, timestamp, &req.body);
         assert_eq!(
             req.headers
@@ -201,7 +205,7 @@ mod tests {
 
         let deliveries = db::list_webhook_deliveries(&state.pool, &payment.id)
             .await
-            .unwrap();
+            .expect("expiry webhook delivery should be recorded");
         assert_eq!(deliveries.len(), 1);
         assert_eq!(deliveries[0].status, "delivered");
         assert_eq!(deliveries[0].event(), EXPIRED_EVENT);
