@@ -15,6 +15,17 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub const CRASH_LOOP_THRESHOLD: u32 = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSnapshot {
+    pub name: &'static str,
+    pub running: bool,
+    pub restarts: u64,
+    pub consecutive_failures: u32,
+    pub disabled_reason: Option<&'static str>,
+}
+
 /// Consecutive panics at or above this mark a required task as crash-looping.
 /// `/health` fails while any required task is crash-looping, even if the
 /// supervisor has already spawned a replacement.
@@ -37,11 +48,8 @@ pub struct TaskHealth {
 }
 
 struct TaskHealthInner {
-    /// Count of task starts.
     started: AtomicU64,
-    /// Count of task stops.
     stopped: AtomicU64,
-    /// Count of task panics/failures.
     failed: AtomicU64,
     running: Mutex<HashMap<&'static str, bool>>,
     restarts: Mutex<HashMap<&'static str, u64>>,
@@ -126,10 +134,9 @@ impl TaskHealth {
         let running = lock(&self.inner.running);
         let required = lock(&self.inner.required);
         let disabled = lock(&self.inner.disabled);
-        required
-            .iter()
+        required.iter()
             .filter(|name| !disabled.contains_key(*name))
-            .filter(|name| running.get(name) == Some(&true))
+            .filter(|name| running.get(*name) == Some(&true))
             .count()
     }
 
@@ -137,36 +144,23 @@ impl TaskHealth {
         lock(&self.inner.consecutive_failures).insert(name, 0);
     }
 
-    pub fn started(&self) -> u64 {
-        self.inner.started.load(Ordering::Relaxed)
-    }
-
-    pub fn stopped(&self) -> u64 {
-        self.inner.stopped.load(Ordering::Relaxed)
-    }
-
-    pub fn failed(&self) -> u64 {
-        self.inner.failed.load(Ordering::Relaxed)
-    }
+    pub fn started(&self) -> u64 { self.inner.started.load(Ordering::Relaxed) }
+    pub fn stopped(&self) -> u64 { self.inner.stopped.load(Ordering::Relaxed) }
+    pub fn failed(&self) -> u64 { self.inner.failed.load(Ordering::Relaxed) }
 
     pub fn restarts(&self, name: &'static str) -> u64 {
         lock(&self.inner.restarts).get(name).copied().unwrap_or(0)
     }
 
     pub fn consecutive_failures(&self, name: &'static str) -> u32 {
-        lock(&self.inner.consecutive_failures)
-            .get(name)
-            .copied()
-            .unwrap_or(0)
+        lock(&self.inner.consecutive_failures).get(name).copied().unwrap_or(0)
     }
 
     pub fn dead_required_tasks(&self) -> Vec<&'static str> {
         let running = lock(&self.inner.running);
         let required = lock(&self.inner.required);
         let disabled = lock(&self.inner.disabled);
-        required
-            .iter()
-            .copied()
+        required.iter().copied()
             .filter(|name| !disabled.contains_key(name))
             .filter(|name| running.get(name) != Some(&true))
             .collect()
@@ -175,9 +169,7 @@ impl TaskHealth {
     pub fn crash_looping_required_tasks(&self) -> Vec<&'static str> {
         let consecutive = lock(&self.inner.consecutive_failures);
         let required = lock(&self.inner.required);
-        required
-            .iter()
-            .copied()
+1        required.iter().copied()
             .filter(|name| consecutive.get(name).copied().unwrap_or(0) >= CRASH_LOOP_THRESHOLD)
             .collect()
     }
@@ -189,15 +181,8 @@ impl TaskHealth {
         let required = lock(&self.inner.required);
         let disabled = lock(&self.inner.disabled);
         let mut names = required.clone();
-        for name in running
-            .keys()
-            .chain(restarts.keys())
-            .chain(consecutive.keys())
-            .chain(disabled.keys())
-        {
-            if !names.contains(name) {
-                names.push(*name);
-            }
+        for name in running.keys().chain(restarts.keys()).chain(consecutive.keys()).chain(disabled.keys()) {
+            if !names.contains(name) { names.push(*name); }
         }
         names.sort_unstable();
         names.into_iter().map(|name| TaskSnapshot {
