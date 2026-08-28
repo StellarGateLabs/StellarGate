@@ -66,23 +66,28 @@ async fn main() -> Result<()> {
     let stream = (state.config.listener_mode == ListenerMode::Stream).then(|| {
         spawn_task(
             &health,
+            "stream",
             horizon::run_stream_listener(state.clone(), shutdown_rx.clone()),
         )
     });
     let poller = spawn_task(
         &health,
+        "poller",
         horizon::run_poller(state.clone(), shutdown_rx.clone()),
     );
     let sweeper = spawn_task(
         &health,
+        "sweeper",
         expiry::run_sweeper(state.clone(), shutdown_rx.clone()),
     );
     let retention = spawn_task(
         &health,
+        "retention",
         retention::run_retention_worker(state.clone(), shutdown_rx.clone()),
     );
     let redrive = spawn_task(
         &health,
+        "redrive",
         webhook::run_redrive_worker(state.clone(), shutdown_rx),
     );
 
@@ -99,12 +104,12 @@ async fn main() -> Result<()> {
 
     let _ = shutdown_tx.send(true);
     let drain = async {
-        join_task(poller, &health).await;
-        join_task(sweeper, &health).await;
-        join_task(redrive, &health).await;
-        join_task(retention, &health).await;
+        join_task(poller, "poller", &health).await;
+        join_task(sweeper, "sweeper", &health).await;
+        join_task(redrive, "redrive", &health).await;
+        join_task(retention, "retention", &health).await;
         if let Some(handle) = stream {
-            join_task(handle, &health).await;
+            join_task(handle, "stream", &health).await;
         }
     };
     if tokio::time::timeout(SHUTDOWN_GRACE, drain).await.is_err() {
@@ -159,25 +164,25 @@ async fn report_trustlines(state: &Arc<AppState>) {
 /// Spawn a background task, keeping [`TaskHealth`] accurate across its
 /// lifetime: counted as started before it runs and as stopped when it returns
 /// normally. A panic is recorded instead by [`join_task`] at shutdown.
-fn spawn_task<F>(health: &TaskHealth, task: F) -> JoinHandle<()>
+fn spawn_task<F>(health: &TaskHealth, name: &'static str, task: F) -> JoinHandle<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
     let health = health.clone();
-    health.task_started();
+    health.task_started(name);
     tokio::spawn(async move {
         task.await;
-        health.task_stopped();
+        health.task_stopped(name);
     })
 }
 
 /// Await a background task. A `JoinError` means it panicked, which is recorded
 /// so the failure counter — and any alert watching it — fires.
-async fn join_task(handle: JoinHandle<()>, health: &TaskHealth) {
+async fn join_task(handle: JoinHandle<()>, name: &'static str, health: &TaskHealth) {
     if let Err(e) = handle.await {
         if e.is_panic() {
             warn!("background task panicked");
-            health.task_failed();
+            health.task_failed(name);
         }
     }
 }
