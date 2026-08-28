@@ -222,7 +222,11 @@ impl TaskHealth {
     /// service is healthy; drives `/health`.
     pub fn dead_required_tasks(&self) -> Vec<&'static str> {
         let running = self.inner.running.lock().unwrap();
-        let required = self.inner.required.lock().unwrap();
+        let required = self
+            .inner
+            .required
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let disabled = self.inner.disabled.lock().unwrap();
         required
             .iter()
