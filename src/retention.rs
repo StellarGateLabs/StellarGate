@@ -159,7 +159,7 @@ mod tests {
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
-            .unwrap();
+            .expect("pruned delivery ids should load from sqlite");
         db::migrate(&pool).await.unwrap();
         Arc::new(AppState {
             pool,
@@ -195,7 +195,7 @@ mod tests {
             .bind(format!("-{age_days} days"))
             .execute(&state.pool)
             .await
-            .unwrap();
+            .expect("pending delivery count should load from sqlite");
         }
 
         let (deliveries, _) = prune_once(&state).await.unwrap();
@@ -204,7 +204,7 @@ mod tests {
         let left: Vec<String> = sqlx::query_scalar("SELECT id FROM webhook_deliveries ORDER BY id")
             .fetch_all(&state.pool)
             .await
-            .unwrap();
+            .expect("backlog drain should leave no deliveries behind");
         assert_eq!(left, vec!["new-delivered", "old-pending"]);
     }
 
