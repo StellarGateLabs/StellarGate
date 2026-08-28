@@ -600,11 +600,10 @@ impl TrustlineMetrics {
         }
         drop(map);
 
-        let mut unauth_map = self
-            .inner
-            .unauthorized
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut unauth_map = lock_or_recover(
+            &self.inner.unauthorized,
+            "trustline_metrics.unauthorized",
+        );
         unauth_map.clear();
         for &code in &checked_codes {
             unauth_map.insert(
@@ -614,11 +613,10 @@ impl TrustlineMetrics {
         }
         drop(unauth_map);
 
-        let mut hr_map = self
-            .inner
-            .headroom_stroops
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut hr_map = lock_or_recover(
+            &self.inner.headroom_stroops,
+            "trustline_metrics.headroom_stroops",
+        );
         hr_map.clear();
         for (code, stroops) in headroom {
             hr_map.insert((*code).to_string(), *stroops);
@@ -659,11 +657,7 @@ impl TrustlineMetrics {
     /// Snapshot of missing/usable state, sorted by asset code for
     /// deterministic output.
     pub fn snapshot(&self) -> Vec<(String, bool)> {
-        let map = self
-            .inner
-            .missing
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let map = lock_or_recover(&self.inner.missing, "trustline_metrics.missing");
         let mut out: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
@@ -671,11 +665,10 @@ impl TrustlineMetrics {
 
     /// Snapshot of unauthorized state, sorted by asset code.
     pub fn snapshot_unauthorized(&self) -> Vec<(String, bool)> {
-        let map = self
-            .inner
-            .unauthorized
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let map = lock_or_recover(
+            &self.inner.unauthorized,
+            "trustline_metrics.unauthorized",
+        );
         let mut out: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
@@ -683,11 +676,10 @@ impl TrustlineMetrics {
 
     /// Snapshot of headroom (limit - balance) in stroops, sorted by asset code.
     pub fn snapshot_headroom(&self) -> Vec<(String, i64)> {
-        let map = self
-            .inner
-            .headroom_stroops
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let map = lock_or_recover(
+            &self.inner.headroom_stroops,
+            "trustline_metrics.headroom_stroops",
+        );
         let mut out: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out

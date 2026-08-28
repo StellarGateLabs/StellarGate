@@ -495,7 +495,8 @@ async fn rate_limit_middleware(
         below. */
         let limiter = rate_limit.limiters.get_with(key, || {
             Arc::new(governor::RateLimiter::direct(governor::Quota::per_second(
-                NonZeroU32::new(effective_rps).unwrap(),
+                NonZeroU32::new(effective_rps)
+                    .expect("effective_rps is clamped to at least 1"),
             )))
         });
 
