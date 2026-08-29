@@ -41,6 +41,12 @@ const RATE_LIMITER_MAX_KEYS: u64 = 10_000;
 /// Keys for IPs that go quiet are automatically reclaimed.
 const RATE_LIMITER_IDLE_TTL: Duration = Duration::from_secs(60);
 
+/// Sentinel returned by `client_ip_key` when no peer address and no trusted
+/// forwarding headers are available. Every such request shares this single
+/// key so a caller cannot mint arbitrarily many limiter buckets by varying a
+/// header — the safe, fail-closed behaviour.
+pub(crate) const CLIENT_IP_UNKNOWN: &str = "unknown";
+
 #[derive(Clone)]
 struct RateLimitState {
     requests_per_sec: u32,
@@ -382,7 +388,15 @@ async fn issue_api_key(
     )
     .await?;
 
-    tracing::info!(%merchant_id, %key_id, "api key issued");
+    tracing::info!(
+        audit = true,
+        action = "api_key.issue",
+        actor = "admin",
+        outcome = "issued",
+        %merchant_id,
+        %key_id,
+        "api key issued"
+    );
 
     Ok((
         StatusCode::CREATED,
@@ -434,9 +448,17 @@ async fn list_api_keys(
 async fn revoke_api_key(
     State(state): State<Arc<AppState>>,
     Path((merchant_id, key_id)): Path<(String, String)>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    req_parts: axum::extract::Request,
 ) -> Result<impl IntoResponse, AppError> {
+    // Extract the source IP for audit logging before we consume req_parts.
+    let source_ip = client_ip_key(&req_parts, &state.config.trusted_proxy_cidrs);
+    let request_id = req_parts
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+
     if !db::merchant_exists(&state.pool, &merchant_id).await? {
         return Err(AppError::not_found(
             "merchant_not_found",
@@ -453,11 +475,6 @@ async fn revoke_api_key(
     // returned when the atomic guard fires.
     match db::revoke_api_key(&state.pool, &merchant_id, &key_id).await? {
         db::RevokeKeyOutcome::Revoked => {
-            let source_ip = client_ip_key_from_parts(
-                Some(peer),
-                &headers,
-                &state.config.trusted_proxy_cidrs,
-            );
             tracing::warn!(
                 audit = true,
                 action = "api_key.revoke",
@@ -466,7 +483,7 @@ async fn revoke_api_key(
                 %merchant_id,
                 %key_id,
                 source_ip = %source_ip,
-                request_id = %request_id(&headers),
+                request_id = %request_id,
                 "api key revoked"
             );
             Ok((
@@ -511,10 +528,18 @@ async fn rate_limit_middleware(
             )))
         });
 
-        if limiter.check().is_err() {
+        if let Err(not_until) = limiter.check() {
+            let wait = not_until.wait_time_from(governor::clock::QuantaClock::default().now());
+            let retry_after = retry_after_secs(wait);
             return (
                 StatusCode::TOO_MANY_REQUESTS,
-                [(header::RETRY_AFTER, HeaderValue::from_static("1"))],
+                [
+                    (
+                        header::RETRY_AFTER,
+                        HeaderValue::from_str(&retry_after.to_string())
+                            .unwrap_or_else(|_| HeaderValue::from_static("1")),
+                    ),
+                ],
                 Json(json!({
                     "error": "rate limit exceeded",
                     "code": "rate_limit_exceeded"
@@ -527,7 +552,54 @@ async fn rate_limit_middleware(
     next.run(req).await
 }
 
-/// Identifies which rate-limit bucket a request falls into.
+/// Convert a governor wait duration to a `Retry-After` value in whole seconds,
+/// rounded up with a floor of 1.
+///
+/// `Retry-After` is an integer number of seconds per RFC 9110. Rounding up
+/// rather than truncating means a client that obeys the header never retries
+/// into another immediate rejection. The floor of 1 means a near-zero wait
+/// (sub-millisecond replenish) still tells the client to pause rather than
+/// retry immediately.
+pub(crate) fn retry_after_secs(wait: Duration) -> u64 {
+    let secs = wait.as_secs_f64().ceil() as u64;
+    secs.max(1)
+}
+
+/// Compute seconds until a rate-limit bucket is back to full capacity.
+///
+/// `Reset` is time-to-full, not time-to-one-cell (`Retry-After`). A client
+/// that uses `Reset` to know when it can burst again needs the full replenish
+/// window, not just the next single-cell wait.
+///
+/// - `quota`     — the bucket's replenishment policy.
+/// - `remaining` — cells currently available (0 = drained).
+/// - `next_wait` — time until the next single cell is available (from governor's
+///                 `not_until.wait_time_from(...)`).
+///
+/// Formula: `(cells_missing × period_per_cell) + next_wait`, rounded up.
+/// Returns 0 when the bucket is already full (`remaining == burst`).
+pub(crate) fn reset_secs(quota: governor::Quota, remaining: u32, next_wait: Duration) -> u64 {
+    let burst = quota.burst_size().get();
+    if remaining >= burst {
+        return 0;
+    }
+    let cells_missing = burst.saturating_sub(remaining) as u64;
+    // `period()` is the time for one cell to replenish.
+    let period_secs = quota.replenish_interval().as_secs_f64();
+    let total = cells_missing as f64 * period_secs + next_wait.as_secs_f64();
+    total.ceil() as u64
+}
+
+/// Identifies which rate-limit bucket a request falls into, or `None` for
+/// probe/operational endpoints that are exempt from rate limiting.
+///
+/// `None` means the request is completely outside the rate limiter — not even
+/// the generous "default" bucket. `/health`, `/ready`, and `/metrics` are
+/// cheap, come from a trusted orchestrator rather than the public internet,
+/// and their whole purpose is to stay answerable when the system is under
+/// stress. Sharing a bucket with merchant traffic would mean a load spike that
+/// trips the limiter could also turn an orchestrator's own liveness probe into
+/// a `429`.
 ///
 /// Every request is assigned a bucket so all routes are protected by default.
 /// Write and sensitive routes use named buckets that receive the base quota
@@ -540,17 +612,34 @@ async fn rate_limit_middleware(
 /// own limiter entry — both an unbounded map and a trivially bypassed limit.
 fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
     let path = req.uri().path();
+
+    // Probe/operational endpoints are exempt from rate limiting entirely.
+    // These are cheap infrastructure requests that must remain answerable
+    // even when the service is under load.
+    if req.method() == axum::http::Method::GET {
+        match path {
+            "/health" | "/ready" | "/metrics" => return None,
+            // v1-prefixed operational paths are also exempt.
+            "/v1/health" | "/v1/ready" | "/v1/metrics" => return None,
+            _ => {}
+        }
+    }
+
     if req.method() == axum::http::Method::POST {
         return match path {
-            "/payments" => Some("payments"),
-            "/merchants" => Some("merchants"),
-            _ if path.starts_with("/payments/") && path.ends_with("/redeliver") => {
+            "/payments" | "/v1/payments" => Some("payments"),
+            "/merchants" | "/v1/merchants" => Some("merchants"),
+            _ if (path.starts_with("/payments/") || path.starts_with("/v1/payments/"))
+                && path.ends_with("/redeliver") =>
+            {
                 Some("redeliver")
             }
             // Key issuance: POST /merchants/:id/keys — credential lifecycle
             // belongs in the "merchants" write bucket, not the default read
             // bucket that gives it 5× the quota (issue #243).
-            _ if path.starts_with("/merchants/") => Some("merchants"),
+            _ if path.starts_with("/merchants/") || path.starts_with("/v1/merchants/") => {
+                Some("merchants")
+            }
             _ => Some("default"),
         };
     }
@@ -558,7 +647,7 @@ fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
     // (DELETE /merchants/:id/keys/:key_id) must be treated as a write like
     // POST /merchants, not as cheap read-only traffic (issue #243).
     if req.method() == axum::http::Method::DELETE
-        && path.starts_with("/merchants/")
+        && (path.starts_with("/merchants/") || path.starts_with("/v1/merchants/"))
         && path.contains("/keys/")
     {
         return Some("merchants");
@@ -834,10 +923,23 @@ async fn check_horizon_ready(state: &Arc<AppState>) -> Result<(), String> {
 
 /// `GET /metrics` — Prometheus-compatible plain-text metrics snapshot.
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let db_snap = crate::metrics::DbSnapshot {
+        pool_size: state.pool.size(),
+        pool_idle: state.pool.num_idle() as u32,
+        pool_max: state.config.db_pool_max_connections,
+        main_bytes: None,
+        wal_bytes: None,
+        shm_bytes: None,
+    };
     let body = crate::metrics::render(
         &state.webhook_metrics,
         &state.auth_metrics,
+        &state.task_health,
         &state.horizon_metrics,
+        &state.http_metrics,
+        &state.payment_metrics,
+        &db_snap,
+        &state.trustline_metrics,
     );
     (
         StatusCode::OK,
