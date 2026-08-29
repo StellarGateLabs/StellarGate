@@ -104,12 +104,12 @@ async fn main() -> Result<()> {
 
     let _ = shutdown_tx.send(true);
     let drain = async {
-        join_task(poller, &health, "poller").await;
-        join_task(sweeper, &health, "sweeper").await;
-        join_task(redrive, &health, "redrive").await;
-        join_task(retention, &health, "retention").await;
+        join_task(poller, "poller", &health).await;
+        join_task(sweeper, "sweeper", &health).await;
+        join_task(redrive, "redrive", &health).await;
+        join_task(retention, "retention", &health).await;
         if let Some(handle) = stream {
-            join_task(handle, &health, "stream").await;
+            join_task(handle, "stream", &health).await;
         }
     };
     if tokio::time::timeout(SHUTDOWN_GRACE, drain).await.is_err() {
@@ -178,7 +178,7 @@ where
 
 /// Await a background task. A `JoinError` means it panicked, which is recorded
 /// so the failure counter — and any alert watching it — fires.
-async fn join_task(handle: JoinHandle<()>, health: &TaskHealth, name: &'static str) {
+async fn join_task(handle: JoinHandle<()>, name: &'static str, health: &TaskHealth) {
     if let Err(e) = handle.await {
         if e.is_panic() {
             warn!("background task panicked");
@@ -189,16 +189,20 @@ async fn join_task(handle: JoinHandle<()>, health: &TaskHealth, name: &'static s
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl-C handler");
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %err, "failed to install Ctrl-C handler");
+        }
     };
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to install SIGTERM handler");
+            }
+        }
     };
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
