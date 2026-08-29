@@ -9,7 +9,21 @@
 //! `GET /metrics` returns a plain-text Prometheus-compatible snapshot so any
 //! standard scraper can ingest the data with zero configuration.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+// LABEL SAFETY: All metric labels are restricted to non-sensitive values.
+// Allowed: outcome, reason (subsystem names only), method, route (matched
+// template only — never the raw request URI), status, task, state, file,
+// asset (asset code only, never issuer key material or per-tenant data).
+// Forbidden: merchant_id, API keys, internal hostnames, file system paths,
+// stack traces, per-tenant identifiers, or any value derived from request
+// bodies or URL path parameters.
+//
+// The `route` label specifically uses the matched axum route pattern
+// (e.g. "/v1/payments/:id") and never the raw request URI, so payment IDs,
+// merchant IDs, or delivery IDs never appear in metric label values regardless
+// of how many unique identifiers flow through the service.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 fn lock_or_recover<T>(mutex: &Mutex<T>, what: &str) -> std::sync::MutexGuard<'_, T> {
@@ -214,8 +228,10 @@ impl Default for AuthMetrics {
     }
 }
 
-/// Counters for Horizon record handling that would otherwise only be visible in
-/// logs. Currently tracks records the reconciler refused to credit.
+/// Counters and gauges for Horizon record handling and poll cycle outcomes.
+///
+/// All label values (outcome, reason) are fixed subsystem names — never raw
+/// URLs, transaction hashes, payment IDs, or any per-tenant data.
 #[derive(Clone)]
 pub struct HorizonMetrics {
     inner: Arc<HorizonMetricsInner>,
@@ -228,6 +244,20 @@ struct HorizonMetricsInner {
     /// non-zero value means an unexpected payload (a proxy, a mock, a
     /// truncated response) is reaching the reconciler (issue #224).
     unhashed_records_skipped: AtomicU64,
+    /// Successful Horizon poll cycles.
+    poll_success: AtomicU64,
+    /// Poll cycles that hit a Horizon rate limit (429 / 503 with Retry-After).
+    poll_rate_limited: AtomicU64,
+    /// Poll cycles that failed for any other reason (network error, 5xx, etc).
+    poll_error: AtomicU64,
+    /// Cursor incidents: three consecutive non-rate-limit 4xx responses from
+    /// Horizon for the same cursor position, indicating the cursor is invalid.
+    repeated_cursor_4xx: AtomicU64,
+    /// Times the Horizon SSE stream listener has reconnected.
+    stream_reconnects: AtomicU64,
+    /// Age in seconds of the most recently processed Horizon payment record,
+    /// as of the last poll or stream event. A store, not an accumulator.
+    cursor_age_secs: AtomicU64,
 }
 
 impl HorizonMetrics {
@@ -246,6 +276,58 @@ impl HorizonMetrics {
 
     pub fn unhashed_records_skipped(&self) -> u64 {
         self.inner.unhashed_records_skipped.load(Ordering::Relaxed)
+    }
+
+    /// Record a successful Horizon poll cycle.
+    pub fn record_success(&self) {
+        self.inner.poll_success.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a rate-limited Horizon poll cycle.
+    pub fn record_rate_limited(&self) {
+        self.inner.poll_rate_limited.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a failed Horizon poll cycle (non-rate-limit error).
+    pub fn record_error(&self) {
+        self.inner.poll_error.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a repeated-cursor-4xx incident.
+    pub fn record_repeated_cursor_4xx(&self) {
+        self.inner.repeated_cursor_4xx.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one SSE stream reconnect.
+    pub fn record_stream_reconnect(&self) {
+        self.inner.stream_reconnects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Store (overwrite) the age of the most recently processed Horizon record,
+    /// in seconds. This is a gauge — the latest value is what matters.
+    pub fn record_cursor_age_secs(&self, age: u64) {
+        self.inner.cursor_age_secs.store(age, Ordering::Relaxed);
+    }
+
+    // ── Snapshot accessors ────────────────────────────────────────────────
+
+    pub fn success(&self) -> u64 {
+        self.inner.poll_success.load(Ordering::Relaxed)
+    }
+    pub fn rate_limited(&self) -> u64 {
+        self.inner.poll_rate_limited.load(Ordering::Relaxed)
+    }
+    pub fn error(&self) -> u64 {
+        self.inner.poll_error.load(Ordering::Relaxed)
+    }
+    pub fn repeated_cursor_4xx(&self) -> u64 {
+        self.inner.repeated_cursor_4xx.load(Ordering::Relaxed)
+    }
+    pub fn stream_reconnects(&self) -> u64 {
+        self.inner.stream_reconnects.load(Ordering::Relaxed)
+    }
+    pub fn cursor_age_secs(&self) -> u64 {
+        self.inner.cursor_age_secs.load(Ordering::Relaxed)
     }
 }
 
@@ -300,7 +382,7 @@ impl RouteLatency {
 /// labelled `<unmatched>` rather than the raw path, for the same reason.
 #[derive(Clone)]
 pub struct HttpMetrics {
-    inner: Arc<Mutex<HttpMetricsInner>>,
+    pub(crate) inner: Arc<Mutex<HttpMetricsInner>>,
 }
 
 #[derive(Default)]
@@ -319,6 +401,13 @@ impl HttpMetrics {
     }
 
     /// Record one completed HTTP request.
+    ///
+    /// `route` MUST be the matched axum route template (e.g. `/v1/payments/:id`),
+    /// never the raw request URI. This is enforced by convention: the HTTP
+    /// metrics middleware extracts the route from axum's `MatchedPath` extension,
+    /// which only contains the template. Raw URIs contain path parameters
+    /// (payment IDs, merchant IDs) that would create unbounded label cardinality
+    /// and expose per-tenant identifiers in the metrics scrape.
     pub fn record(&self, method: &str, route: &str, status: u16, elapsed_ms: u64) {
         // A poisoned metrics mutex means a previous worker panicked while the
         // lock was held. Recover the underlying state instead of crashing the
@@ -525,6 +614,9 @@ pub struct DbSnapshot {
 /// entry survives an outage rather than being overwritten by a guess.
 /// `last_success_unix` (0 until the first successful check) is how a scrape
 /// tells "we have never confirmed this" apart from "confirmed and stale".
+///
+/// Label safety: the `asset` label contains only the asset code (e.g. "USDC",
+/// "XLM") — never the issuer address, which is sensitive key-like material.
 #[derive(Clone)]
 pub struct TrustlineMetrics {
     inner: Arc<TrustlineMetricsInner>,
@@ -572,15 +664,32 @@ impl TrustlineMetrics {
     /// - `checked` — every non-native accepted asset the check evaluated.
     /// - `missing` — the subset with no usable trustline (absent or
     ///   unauthorized).
-    /// - `unauthorized` — the subset where a trustline exists but
-    ///   `is_authorized` is `false`.
-    /// - `headroom` — per-asset remaining capacity in stroops (`limit -
-    ///   balance`), for assets where both values were parseable.
+    ///
+    /// This 2-argument form clears the unauthorized and headroom maps.
+    /// Use the 4-argument form `record_check_full` when those details are
+    /// available.
     ///
     /// Replaces the prior state for exactly the assets checked, so an asset
     /// removed from `ACCEPTED_ASSETS` between checks simply stops being
     /// reported rather than lingering at its last known value.
     pub fn record_check<'a>(
+        &self,
+        checked: impl IntoIterator<Item = &'a str>,
+        missing: &[String],
+    ) {
+        self.record_check_full(checked, missing, &[], &[]);
+    }
+
+    /// Record a successful check with full detail.
+    ///
+    /// - `checked` — every non-native accepted asset the check evaluated.
+    /// - `missing` — the subset with no usable trustline (absent or
+    ///   unauthorized).
+    /// - `unauthorized` — the subset where a trustline exists but
+    ///   `is_authorized` is `false`.
+    /// - `headroom` — per-asset remaining capacity in stroops (`limit -
+    ///   balance`), for assets where both values were parseable.
+    pub fn record_check_full<'a>(
         &self,
         checked: impl IntoIterator<Item = &'a str>,
         missing: &[String],
@@ -691,10 +800,25 @@ impl Default for TrustlineMetrics {
 
 // ── Prometheus text exposition ────────────────────────────────────────────────
 
-/// Render webhook delivery and auth outcome metrics as a Prometheus-compatible
-/// plain-text snapshot. Called by `GET /metrics`.
-pub fn render(webhook: &WebhookMetrics, auth: &AuthMetrics, horizon: &HorizonMetrics) -> String {
-    let mut out = String::with_capacity(1024);
+/// Render all metrics as a Prometheus-compatible plain-text snapshot.
+/// Called by `GET /metrics`.
+///
+/// Label safety guarantee: every label value in the rendered output is a
+/// fixed subsystem name, enum value, or bounded route template. No label
+/// value is derived from request bodies, URL path parameters, merchant data,
+/// or any other per-tenant identifier. See the LABEL SAFETY comment at the
+/// top of this module for the full policy.
+pub fn render(
+    webhook: &WebhookMetrics,
+    auth: &AuthMetrics,
+    tasks: &crate::TaskHealth,
+    horizon: &HorizonMetrics,
+    http: &HttpMetrics,
+    payments: &PaymentMetrics,
+    db: &DbSnapshot,
+    trustlines: &TrustlineMetrics,
+) -> String {
+    let mut out = String::with_capacity(4096);
 
     // stellargate_webhook_deliveries_total — counter vec by outcome
     out.push_str(
@@ -768,6 +892,32 @@ pub fn render(webhook: &WebhookMetrics, auth: &AuthMetrics, horizon: &HorizonMet
         "# HELP stellargate_horizon_records_skipped_total Horizon payment records the reconciler refused to credit, by reason.\n",
     );
     out.push_str("# TYPE stellargate_horizon_records_skipped_total counter\n");
+    out.push_str(&format!(
+        "stellargate_horizon_records_skipped_total{{reason=\"no_tx_hash\"}} {}\n",
+        horizon.unhashed_records_skipped()
+    ));
+
+    // stellargate_tasks_* — background task health gauges and counters
+    out.push_str(
+        "# HELP stellargate_tasks_started_total Total background task starts (including restarts).\n",
+    );
+    out.push_str("# TYPE stellargate_tasks_started_total counter\n");
+    out.push_str(&format!(
+        "stellargate_tasks_started_total {}\n",
+        tasks.started()
+    ));
+    out.push_str(
+        "# HELP stellargate_tasks_stopped_total Total clean background task stops.\n",
+    );
+    out.push_str("# TYPE stellargate_tasks_stopped_total counter\n");
+    out.push_str(&format!(
+        "stellargate_tasks_stopped_total {}\n",
+        tasks.stopped()
+    ));
+    out.push_str(
+        "# HELP stellargate_tasks_failed_total Total background task panics.\n",
+    );
+    out.push_str("# TYPE stellargate_tasks_failed_total counter\n");
     out.push_str(&format!(
         "stellargate_tasks_failed_total {}\n",
         tasks.failed()
@@ -1099,7 +1249,7 @@ pub fn render(webhook: &WebhookMetrics, auth: &AuthMetrics, horizon: &HorizonMet
 mod tests {
     use super::*;
 
-        fn empty_db_snapshot() -> DbSnapshot {
+    fn empty_db_snapshot() -> DbSnapshot {
         DbSnapshot {
             pool_size: 3,
             pool_idle: 1,

@@ -5,6 +5,7 @@
 # 1.88 is a floor imposed by the dependency graph, not a preference: `time`
 # requires 1.88 and `url`'s icu_* chain requires 1.86.
 [toolchain]
+# Keep in sync with .github/workflows/ci.yml and Dockerfile
 channel = "1.88"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

@@ -1,5 +1,6 @@
 # cargo-deny configuration for StellarGate
 # Docs: https://embarkstudios.github.io/cargo-deny/
+# Last reviewed: 2026-08-29
 
 # ── Advisories ────────────────────────────────────────────────────────────────
 # Mirrors the RustSec advisory database. cargo-deny fetches it automatically.
@@ -7,6 +8,9 @@
 # default, so only the scope/ignore knobs need to be set explicitly.
 [advisories]
 version = 2
+# Deny any crate with an active security advisory. This is the schema v2
+# default, but stated explicitly so a reader does not have to know the default.
+vulnerability = "deny"
 # Check every crate in the tree (not just the workspace) for unmaintained
 # advisories — a supply-chain risk for a payments service.
 unmaintained = "all"
