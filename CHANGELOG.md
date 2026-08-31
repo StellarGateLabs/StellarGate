@@ -19,6 +19,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than falling back to an open default. `deploy/Caddyfile` also blocks the
   path at the edge by default (issue #250).
 
+- **API hardening review of the remaining unauthenticated/admin-gated
+  surface, prompted by the `/metrics` finding above.** Each route was
+  inspected against the concern its issue raised; none needed a behavior
+  change, and each conclusion now has a regression test so a future change
+  can't silently regress it:
+  - `GET /dashboard`, `/dashboard/app.css`, `/dashboard/app.js` (issue #460):
+    confirmed safe to serve unauthenticated. The three handlers take no
+    `State`/DB parameter — they return `include_str!`-embedded static assets
+    baked in at compile time — so the shell cannot leak per-request or
+    merchant data by construction. Every figure the dashboard displays is
+    fetched client-side from the same authenticated endpoints a merchant
+    would call directly, using an API key the operator supplies in the
+    browser; already covered by `test_dashboard_assets_served_unauthenticated`
+    and `test_dashboard_data_endpoints_reject_missing_key`.
+  - `POST /merchants` (`provision_merchant`, issue #461): confirmed it can't
+    be used to mass-create merchant records. The handler takes no request
+    body to validate, and the route already sits in the base-rate
+    `"merchants"` rate-limit bucket (1×), not the 5× read bucket — same
+    quota as any other write, on top of requiring
+    `ADMIN_PROVISIONING_SECRET`. Added
+    `test_provision_merchant_rate_limit_exceeded_returns_429`, which the
+    existing test suite was missing (every other write route had one).
+  - `POST /merchants/:id/keys` and `GET /merchants/:id/keys` (issue #462):
+    confirmed a raw key is returned exactly once, at issuance, and never
+    again — `list_api_keys` projects only `key_id`/`prefix`/`label`/
+    timestamps/`active`, never the key material — and that only a SHA-256
+    digest is ever persisted (`hash_api_key`, `db.rs`). Added
+    `api_keys_are_stored_hashed_not_plaintext`, asserting the stored
+    `api_keys.key_hash` and legacy `merchants.api_key_hash` columns differ
+    from the raw key and equal its digest; listing-side coverage already
+    existed in `test_listing_keys_never_returns_the_secret`.
+
 - **Restored a batch of previously-shipped fixes that a bad merge had
   silently reverted from `main`, discovered while landing the fix above** (a
   base-branch build failure led to auditing the rest of `main` for the same

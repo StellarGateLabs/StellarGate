@@ -166,3 +166,24 @@ async fn test_redeliver_rate_limit_exceeded_returns_429() {
     second.assert_status(StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(second.json::<Value>()["code"], "rate_limit_exceeded");
 }
+
+/// `POST /merchants` sits in the base-rate "merchants" bucket, not the 5×
+/// read bucket — an admin secret leaked or brute-forced can't be used to
+/// mass-create merchant records any faster than any other write (issue #461).
+#[tokio::test]
+async fn test_provision_merchant_rate_limit_exceeded_returns_429() {
+    let (server, _pool) = server_with_config(make_config(1)).await;
+
+    let first = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    first.assert_status(StatusCode::CREATED);
+
+    let second = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    second.assert_status(StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(second.json::<Value>()["code"], "rate_limit_exceeded");
+}
