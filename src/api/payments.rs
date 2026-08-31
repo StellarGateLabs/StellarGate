@@ -1,13 +1,14 @@
 use crate::{api::AuthenticatedMerchant, db, money, AppState};
 use axum::{
     async_trait,
-    extract::{Extension, FromRequest, Path, Query, Request, State},
-    http::{HeaderMap, StatusCode},
+    extract::{ConnectInfo, Extension, FromRequest, FromRequestParts, Path, Query, Request, State},
+    http::{request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -104,6 +105,51 @@ where
     }
 }
 
+/// A drop-in replacement for `Query<T>` that maps a query-string failure into
+/// our standard `{"code": "...", "error": "..."}` 400 instead of axum's
+/// plaintext rejection.
+///
+/// Paired with `#[serde(deny_unknown_fields)]` on the target struct, this is
+/// what makes an unrecognised *parameter* a first-class error: serde raises
+/// "unknown field `stauts`, expected one of ..." and this turns it into
+/// `400 unknown_parameter` with that message intact, so the response names the
+/// offending key and lists the accepted ones.
+pub struct QueryParams<T>(pub T);
+
+#[async_trait]
+impl<T, S> FromRequestParts<S> for QueryParams<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(value)) => Ok(QueryParams(value)),
+            Err(rejection) => {
+                let detail = rejection.body_text();
+                /* An unrecognised parameter is its own failure mode, not a
+                generic deserialization error: it almost always means a typo or
+                a client written against an older spec, and the fix is
+                different from "the value had the wrong type". This mirrors the
+                `unknown_field` split `JsonBody` already makes for bodies. */
+                if detail.contains("unknown field") {
+                    Err(AppError::bad_request(
+                        "unknown_parameter",
+                        format!("invalid query string: {detail}"),
+                    ))
+                } else {
+                    Err(AppError::bad_request(
+                        "invalid_query",
+                        format!("invalid query string: {detail}"),
+                    ))
+                }
+            }
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct CreatePaymentRequest {
     pub amount: String,
@@ -119,6 +165,7 @@ fn default_asset() -> String {
 pub async fn create(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     JsonBody(body): JsonBody<CreatePaymentRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
@@ -271,6 +318,23 @@ pub async fn create(
         },
     )
     .await?;
+
+    let source_ip =
+        super::client_ip_key_from_parts(Some(peer), &headers, &state.config.trusted_proxy_cidrs);
+    let request_id = super::request_id(&headers);
+    tracing::info!(
+        audit = true,
+        action = "payment.create",
+        actor = "merchant",
+        %merchant_id,
+        outcome = "created",
+        payment_id = %payment.id,
+        amount = %payment.amount,
+        asset = %payment.asset,
+        %source_ip,
+        %request_id,
+        "payment created"
+    );
 
     Ok((StatusCode::CREATED, Json(to_json(&payment))))
 }

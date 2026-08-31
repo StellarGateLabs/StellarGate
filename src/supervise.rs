@@ -592,7 +592,9 @@ mod tests {
         // delta explicitly.
         let health = TaskHealth::new();
         health.require("alpha");
-        health.require("beta");
+        // `supervise_returning` always spawns its task under the fixed name
+        // "probe" (see its definition below), not a caller-chosen name.
+        health.require("probe");
         let (tx, rx) = watch::channel(false);
 
         // Start alpha normally (parks until shutdown).

@@ -197,7 +197,8 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
     };
 
     let attempts = state.config.webhook_retry_attempts.max(1);
-    let delay = Duration::from_millis(state.config.webhook_retry_delay_ms);
+    let base_delay = Duration::from_millis(state.config.webhook_retry_delay_ms);
+    let max_delay = Duration::from_millis(state.config.webhook_retry_max_delay_ms);
     let start = Instant::now();
 
     for attempt in 1..=attempts {
@@ -241,7 +242,7 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
         }
 
         if attempt < attempts {
-            tokio::time::sleep(delay).await;
+            tokio::time::sleep(retry_delay(attempt, base_delay, max_delay)).await;
         }
     }
 
@@ -251,6 +252,58 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
         .webhook_metrics
         .record_latency_ms(start.elapsed().as_millis() as u64);
     let _ = db::update_webhook_delivery(&state.pool, &delivery_id, "failed", attempts as i64).await;
+}
+
+/// How long to wait before inline retry `attempt + 1`, given the configured
+/// base and cap.
+///
+/// Two properties, and the issue needs both (#318).
+///
+/// **Growth.** `base * 2^(attempt-1)`, capped at `max`. A constant delay meant
+/// a receiver returning 503 for two minutes saw, per delivery, three attempts
+/// at `t`, `t+5s`, `t+10s` — and across a settlement burst of N payments, `3N`
+/// requests arriving in three tight clusters, precisely while the receiver was
+/// least able to absorb them.
+///
+/// **Jitter**, because growth alone does not desynchronise anything. Deliveries
+/// that fail together share an attempt number, so a purely exponential schedule
+/// puts their next attempts at the same instant — the same lockstep, just
+/// further apart.
+///
+/// This is *equal* jitter — uniform in `[ceiling/2, ceiling]` — rather than the
+/// more common full jitter over `[0, ceiling]`. Full jitter can return a
+/// near-zero delay, and this service already treats that as a misconfiguration:
+/// `WEBHOOK_RETRY_DELAY_MS == 0` with retries enabled is rejected at boot
+/// because "a zero delay causes retry bursts that hammer the target endpoint".
+/// Equal jitter keeps a guaranteed floor under every retry while still spreading
+/// a co-failing batch across half the window.
+pub fn retry_delay(attempt: u32, base: Duration, max: Duration) -> Duration {
+    /* `2^(attempt-1)`, saturating rather than wrapping: a large
+    WEBHOOK_RETRY_ATTEMPTS must clamp to `max`, not overflow to a tiny delay. */
+    let factor = 2u32.saturating_pow(attempt.saturating_sub(1));
+    let ceiling = base.saturating_mul(factor).min(max);
+
+    let ceiling_ms = ceiling.as_millis() as u64;
+    if ceiling_ms == 0 {
+        return Duration::ZERO;
+    }
+    let half = ceiling_ms / 2;
+    Duration::from_millis(half + rand::random_range(0..=(ceiling_ms - half)))
+}
+
+/// The `attempts` value to record for a delivery the SSRF guard blocked.
+///
+/// `list_redrivable_deliveries` selects rows where `status IN ('pending',
+/// 'failed') AND attempts < max_attempts` — so `status = "failed"` alone does
+/// not remove a row from consideration; only `attempts` reaching the redrive
+/// cap does. A blocked delivery makes no network attempt, so there is no
+/// natural attempt count to record, but leaving it at its prior value (often
+/// `0`) left `attempts < max_attempts` permanently true: the redrive worker
+/// would pick the same blocked delivery back up on every subsequent pass —
+/// forever, and double-counting the terminal-failure metric each time it did.
+/// Recording the cap itself is what actually makes the row terminal.
+fn blocked_delivery_attempts(state: &AppState) -> i64 {
+    state.config.webhook_redrive_max_attempts as i64
 }
 
 /// Resolve and SSRF-check `url`, returning a client pinned to the validated

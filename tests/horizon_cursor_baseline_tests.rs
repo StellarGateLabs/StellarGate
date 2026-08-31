@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use stellargate::{
-    config::{AcceptedAsset, Config, ListenerMode, WebhookPayloadDetail},
+    config::{AcceptedAsset, Config, ListenerMode},
     db, horizon, AppState,
 };
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -45,7 +45,7 @@ async fn make_state(horizon_url: String) -> Arc<AppState> {
             port: 0,
             database_url: "sqlite::memory:".into(),
             network: "testnet".into(),
-            horizon_url: horizon_url.parse().unwrap(),
+            horizon_url,
             gateway_public: GATEWAY.into(),
             accepted_assets: vec![AcceptedAsset {
                 code: "XLM".into(),
@@ -56,7 +56,6 @@ async fn make_state(horizon_url: String) -> Arc<AppState> {
             webhook_retry_delay_ms: 0,
             webhook_retry_max_delay_ms: 60_000,
             allowed_webhook_schemes: vec!["https".into()],
-            webhook_payload_detail: WebhookPayloadDetail::Minimal,
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
             webhook_redrive_concurrency: 4,
@@ -64,14 +63,12 @@ async fn make_state(horizon_url: String) -> Arc<AppState> {
             webhook_redrive_grace_secs: 60,
             webhook_redrive_backoff_initial_secs: 0,
             webhook_redrive_backoff_max_secs: 0,
-            webhook_redrive_jitter_secs: 0,
             retention_interval_secs: 3600,
             webhook_delivery_retention_days: 30,
             idempotency_retention_days: 7,
             poll_interval_secs: 10,
-            cursor_staleness_multiple: 3,
+            poll_max_pages_per_cycle: 50,
             payment_ttl_secs: 3600,
-            expiry_batch_size: 500,
             rate_limit_requests_per_sec: 10000,
             db_pool_max_connections: 5,
             db_busy_timeout_ms: 5000,
@@ -79,25 +76,10 @@ async fn make_state(horizon_url: String) -> Arc<AppState> {
             listener_mode: ListenerMode::Poll,
             webhook_allow_private_targets: true,
             admin_provisioning_secret: String::new(),
+            metrics_token: String::new(),
             request_timeout_secs: 30,
             stream_idle_timeout_secs: 30,
             trusted_proxy_cidrs: vec![],
-            max_payment_amount: Default::default(),
-            min_payment_amount: Default::default(),
-            max_body_bytes: 256 * 1024,
-            rate_limiter_max_keys: 10_000,
-            rate_limiter_idle_ttl_secs: 60,
-            pagination_default_limit: 20,
-            pagination_max_limit: 100,
-            shutdown_grace_secs: 30,
-            horizon_page_limit: 200,
-            db_prune_batch_size: 500,
-            retention_max_rows_per_cycle: 50_000,
-            horizon_timeout_secs: 10,
-            sqlite_wal_autocheckpoint: 1000,
-            sqlite_journal_size_limit: 67_108_864,
-            sqlite_cache_size: -2000,
-            require_gateway_account: false,
         },
         http: reqwest::Client::new(),
         webhook_http: reqwest::Client::new(),
@@ -249,7 +231,7 @@ async fn reused_account_old_open_intent_is_not_skipped() {
     // would still have to include the payment itself.
     create_backdated_pending(&state, MEMO, "5", OLD_TOKEN.saturating_sub(1)).await;
 
-    let settled = horizon::poll_once(&state).await.unwrap();
+    let settled = horizon::poll_once(&state, &tokio::sync::watch::channel(false).1).await.unwrap();
     assert_eq!(
         settled, 1,
         "the old intent's payment must be found and settled despite 400+ \
@@ -280,7 +262,7 @@ async fn payment_just_behind_the_tip_is_not_skipped() {
     let state = make_state(server.uri()).await;
     create_backdated_pending(&state, MEMO, "5", MATCHED_TOKEN.saturating_sub(1)).await;
 
-    let settled = horizon::poll_once(&state).await.unwrap();
+    let settled = horizon::poll_once(&state, &tokio::sync::watch::channel(false).1).await.unwrap();
     assert_eq!(
         settled, 1,
         "a payment sitting just behind the tip must not be skipped by the \
@@ -300,6 +282,6 @@ async fn fresh_account_with_no_history_still_settles_the_first_payment() {
     let state = make_state(server.uri()).await;
     create_backdated_pending(&state, MEMO, "5", 1).await;
 
-    let settled = horizon::poll_once(&state).await.unwrap();
+    let settled = horizon::poll_once(&state, &tokio::sync::watch::channel(false).1).await.unwrap();
     assert_eq!(settled, 1);
 }

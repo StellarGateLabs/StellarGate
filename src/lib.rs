@@ -71,6 +71,14 @@ struct TaskHealthInner {
     /// [`TaskHealth::task_failed`] and read by [`TaskHealth::failed`].
     failed: AtomicU64,
 
+    /// Total `task_started` calls across all tasks (including restarts).
+    /// Read by [`TaskHealth::started`].
+    started: AtomicU64,
+
+    /// Total clean `task_stopped` calls across all tasks. Read by
+    /// [`TaskHealth::stopped`].
+    stopped: AtomicU64,
+
     /// Unix timestamp (seconds) of the last successful Horizon poll or stream
     /// event. `0` until the first call to [`TaskHealth::note_success`].
     last_success_unix: AtomicI64,
@@ -85,6 +93,8 @@ impl Default for TaskHealthInner {
             tasks: Mutex::new(HashMap::new()),
             required: Mutex::new(HashSet::new()),
             failed: AtomicU64::new(0),
+            started: AtomicU64::new(0),
+            stopped: AtomicU64::new(0),
             last_success_unix: AtomicI64::new(0),
             gateway_account_exists: AtomicBool::new(false),
         }
@@ -134,6 +144,7 @@ impl TaskHealth {
     /// Record that `name` started running. Called by the supervisor just
     /// before spawning the child task.
     pub fn task_started(&self, name: &'static str) {
+        self.inner.started.fetch_add(1, Ordering::Relaxed);
         let mut tasks = self
             .inner
             .tasks
@@ -149,6 +160,7 @@ impl TaskHealth {
     /// Record that `name` stopped cleanly (shutdown requested or ordinary
     /// return). Does **not** increment the failure counter.
     pub fn task_stopped(&self, name: &'static str) {
+        self.inner.stopped.fetch_add(1, Ordering::Relaxed);
         let mut tasks = self
             .inner
             .tasks
@@ -309,6 +321,16 @@ impl TaskHealth {
         self.inner.failed.load(Ordering::Relaxed)
     }
 
+    /// Total `task_started` calls across all tasks, including restarts.
+    pub fn started(&self) -> u64 {
+        self.inner.started.load(Ordering::Relaxed)
+    }
+
+    /// Total clean `task_stopped` calls across all tasks.
+    pub fn stopped(&self) -> u64 {
+        self.inner.stopped.load(Ordering::Relaxed)
+    }
+
     /// Restart count for `name`, or 0 if `name` is unknown.
     pub fn restarts(&self, name: &'static str) -> u64 {
         self.inner
@@ -421,6 +443,19 @@ pub struct AppState {
     /// usable transaction hash, so an unexpected Horizon payload is visible in
     /// `GET /metrics` and not only in the logs.
     pub horizon_metrics: metrics::HorizonMetrics,
+    /// Per-asset gateway trustline state, refreshed at boot and on a
+    /// recurring interval thereafter (trustlines can be revoked, or an asset
+    /// added to `ACCEPTED_ASSETS`, at any time after boot). Exposed via
+    /// `GET /metrics` and consulted by `POST /payments` to reject intents in
+    /// an asset currently confirmed unpayable.
+    pub trustline_metrics: metrics::TrustlineMetrics,
+    /// HTTP request counters and latency histogram, labelled by matched route
+    /// and method. Exposed via `GET /metrics` so traffic volume and latency
+    /// are queryable facts rather than invisible to an operator.
+    pub http_metrics: metrics::HttpMetrics,
+    /// Payment lifecycle counters and settlement-latency histogram. Exposed
+    /// via `GET /metrics`.
+    pub payment_metrics: metrics::PaymentMetrics,
     /// Background task health: tracks started, stopped, and failed task counts
     /// for monitoring and alerting.
     pub task_health: TaskHealth,

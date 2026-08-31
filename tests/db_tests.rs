@@ -97,7 +97,7 @@ async fn offset_pagination_returns_each_row_exactly_once_within_one_second() {
     db::migrate(&pool).await.unwrap();
 
     let (raw_key, prefix) = db::generate_api_key();
-    db::create_merchant(&pool, "m1", &raw_key, &prefix, None)
+    db::create_merchant(&pool, "m1", &raw_key, &prefix)
         .await
         .unwrap();
 
@@ -128,7 +128,7 @@ async fn offset_pagination_returns_each_row_exactly_once_within_one_second() {
     let mut seen = std::collections::HashSet::new();
     let mut offset = 0i64;
     loop {
-        let page = db::list_payments(&pool, "m1", None, page_size, offset)
+        let (page, _total) = db::list_payments(&pool, "m1", None, page_size, offset)
             .await
             .unwrap();
         if page.is_empty() {

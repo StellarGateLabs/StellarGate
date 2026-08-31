@@ -66,6 +66,7 @@ Never reuse the placeholders — startup rejects known placeholder values, and
 | `STELLAR_NETWORK` and `STELLAR_HORIZON_URL` agree | Mismatched, they silently watch the wrong chain |
 | `WEBHOOK_SECRET` ≥ 32 random chars | Signs every webhook; merchants verify against it |
 | `ADMIN_PROVISIONING_SECRET` set | Unset disables merchant provisioning entirely |
+| `METRICS_TOKEN` set, if you intend to scrape | Unset disables `/metrics` entirely (safe default); `deploy/Caddyfile` also blocks the path at the edge |
 | `CORS_ALLOWED_ORIGINS` set | **Required** on `public` — boot fails without it |
 | Trustlines added for every accepted asset | Payments in an untrusted asset bounce |
 | `WEBHOOK_ALLOW_PRIVATE_TARGETS` false | Enabling it in production reopens the SSRF hole |
@@ -271,7 +272,10 @@ systemctl status stellargate                                    # unit state
 ```
 
 **Metrics.** `GET /metrics` exposes Prometheus counters for webhook delivery
-outcomes, retries, delivery latency, and auth success/failure.
+outcomes, retries, delivery latency, and auth success/failure. Gated behind
+`Authorization: Bearer <METRICS_TOKEN>` — unset (the default here; see
+`deploy/stellargate.env.example`), the endpoint is disabled entirely, and
+`deploy/Caddyfile` also blocks the path at the edge by default (issue #250).
 
 **Alerts worth wiring first:**
 
@@ -286,6 +290,9 @@ outcomes, retries, delivery latency, and auth success/failure.
 **Exposure.** `/dashboard` leaks nothing without a valid API key, but there is
 no reason to serve the sign-in page to the whole internet. Restrict it in the
 `Caddyfile` by source IP, or put it behind basic auth, if only your team uses it.
+`/metrics` is blocked at the edge by `deploy/Caddyfile` by default, in addition
+to the app-side `METRICS_TOKEN` gate — remove that block only if you intend to
+scrape from outside the Docker network, and set `METRICS_TOKEN` first.
 
 **Log growth.** Both containers cap their JSON logs (10 MB × 5 for the app,
 10 MB × 3 for Caddy). Uncapped container logs filling the boot volume is a

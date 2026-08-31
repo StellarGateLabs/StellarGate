@@ -76,6 +76,7 @@ fn make_state(pool: db::Db, _webhook_url: Option<String>) -> Arc<AppState> {
             webhook_secret: "a-very-long-and-secure-webhook-signing-secret-32-chars".into(),
             webhook_retry_attempts: 1,
             webhook_retry_delay_ms: 0,
+            webhook_retry_max_delay_ms: 60_000,
             allowed_webhook_schemes: vec!["https".into(), "http".into()],
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
@@ -98,13 +99,19 @@ fn make_state(pool: db::Db, _webhook_url: Option<String>) -> Arc<AppState> {
             // Allow loopback targets so we can use wiremock's 127.0.0.1 server.
             webhook_allow_private_targets: true,
             admin_provisioning_secret: String::new(),
+            metrics_token: String::new(),
             request_timeout_secs: 30,
+            stream_idle_timeout_secs: 30,
+            trusted_proxy_cidrs: vec![],
         },
         http: reqwest::Client::new(),
         webhook_http: reqwest::Client::new(),
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
         horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
+        trustline_metrics: stellargate::metrics::TrustlineMetrics::new(),
+        http_metrics: stellargate::metrics::HttpMetrics::new(),
+        payment_metrics: stellargate::metrics::PaymentMetrics::new(),
         task_health: stellargate::TaskHealth::new(),
     })
 }
@@ -406,15 +413,17 @@ async fn concurrent_last_key_revocations_leave_exactly_one_active() {
     .unwrap();
 
     // Insert two raw API-key rows (pre-hashed; we just need live rows).
+    // `key_hash` is UNIQUE, so each row needs a distinct value.
     let key_id_a = uuid::Uuid::new_v4().to_string();
     let key_id_b = uuid::Uuid::new_v4().to_string();
     for key_id in [&key_id_a, &key_id_b] {
         sqlx::query(
             "INSERT INTO api_keys (id, merchant_id, key_hash, prefix, created_at)
-             VALUES (?, ?, 'hash', 'sg_', strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+             VALUES (?, ?, ?, 'sg_', strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
         )
         .bind(key_id)
         .bind(&merchant_id)
+        .bind(format!("hash-{key_id}"))
         .execute(&pool)
         .await
         .unwrap();

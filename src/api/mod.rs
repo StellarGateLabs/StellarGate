@@ -19,6 +19,7 @@ use tower_http::{
     cors::CorsLayer,
     limit::RequestBodyLimitLayer,
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    set_header::SetResponseHeaderLayer,
     timeout::TimeoutLayer,
     trace::TraceLayer,
 };
@@ -87,12 +88,22 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         state.config.trusted_proxy_cidrs.clone(),
     );
     let request_timeout = Duration::from_secs(state.config.request_timeout_secs);
+    let hsts = hsts_value(&state.config.network);
 
     axum::Router::new()
         .route("/", get(root))
         .route("/health", get(health))
         .route("/ready", get(ready))
-        .route("/metrics", get(metrics_handler))
+        /* Gated behind METRICS_TOKEN (issue #250) — unset by default, which
+        denies every request rather than exposing auth/webhook counters
+        anonymously. See `require_metrics_token`. */
+        .route(
+            "/metrics",
+            get(metrics_handler).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_metrics_token,
+            )),
+        )
         /* Operator dashboard. The assets are static and carry no data, so they
         are served unauthenticated — every figure they display is fetched by
         the browser from the same authenticated endpoints a merchant would
@@ -123,7 +134,51 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             StatusCode::REQUEST_TIMEOUT,
             request_timeout,
         ))
+        /* Baseline security headers on every response, not just the static
+        dashboard assets. Every JSON response — a payment record, a freshly
+        minted API key, a webhook URL — was previously sent with no headers
+        at all, leaving it MIME-sniffable, cacheable, and free to leak ids
+        through referrers. Applied outermost so they also cover responses the
+        inner layers generate (rate-limit 429s, timeout 408s, and the router's
+        404/405 fallbacks).
+
+        `nosniff` and `referrer-policy` override any inner value because a
+        stricter setting elsewhere is never correct (payment ids travel in
+        URLs). `cache-control` is `if_not_present` so a handler that
+        legitimately opts in to caching is not blindly clobbered, while the
+        API endpoints — which return a plaintext key once, or payment detail —
+        get `no-store` by default. Only `Strict-Transport-Security` is
+        conditional: TLS is terminated at Caddy and the app cannot assert HSTS
+        with any confidence on a testnet where that termination is absent.
+        The dashboard's Content-Security-Policy is left untouched. */
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::HeaderName::from_static("strict-transport-security"),
+            hsts,
+        ))
         .with_state(state)
+}
+
+/// The `Strict-Transport-Security` header value, or none on non-public
+/// networks. TLS is terminated by the reverse proxy in front of the app, so
+/// asserting HSTS is only meaningful where that termination is guaranteed to
+/// exist — on a `public` network deployment. On testnet (no enforced TLS) a
+/// `max-age` HSTS header would be sent to browsers over plain HTTP, where it
+/// is ignored but still misleading; returning `None` lets the caller keep the
+/// header absent entirely.
+fn hsts_value(network: &str) -> Option<HeaderValue> {
+    (network == "public").then(|| HeaderValue::from_static("max-age=63072000; includeSubDomains"))
 }
 
 /// The versioned API surface: everything that forms the public contract.
@@ -320,11 +375,70 @@ async fn require_admin_secret(
     next.run(req).await
 }
 
+/// Guards `GET /metrics` with a shared bearer token sent via the standard
+/// `Authorization: Bearer <token>` header (the form Prometheus's own
+/// `authorization` scrape config emits, so no custom scrape-config surgery is
+/// needed). An unset `METRICS_TOKEN` disables the endpoint entirely rather
+/// than leaving the auth/webhook counters it exposes open to anonymous
+/// callers (issue #250).
+async fn require_metrics_token(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> axum::response::Response {
+    let configured = &state.config.metrics_token;
+
+    // An empty configured token means scraping is disabled — reject
+    // immediately without touching any caller-supplied value, mirroring
+    // `require_admin_secret`.
+    if configured.is_empty() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "missing or invalid metrics token", "code": "unauthorized" })),
+        )
+            .into_response();
+    }
+
+    // Reject a missing or malformed Authorization header before any comparison.
+    let Some(provided) = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "missing or invalid metrics token", "code": "unauthorized" })),
+        )
+            .into_response();
+    };
+
+    // Compare SHA-256 digests in constant time — see `require_admin_secret`
+    // for the rationale (issue #244); the same oracle applies here.
+    use sha2::{Digest, Sha256};
+    let provided_digest = Sha256::digest(provided.as_bytes());
+    let configured_digest = Sha256::digest(configured.as_bytes());
+
+    if provided_digest != configured_digest {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "missing or invalid metrics token", "code": "unauthorized" })),
+        )
+            .into_response();
+    }
+
+    next.run(req).await
+}
+
 /// `POST /merchants` — provision a new merchant and return its API key once.
 /// Requires the `X-Admin-Secret` header (see `require_admin_secret`).
 async fn provision_merchant(
     State(state): State<Arc<AppState>>,
+    req_parts: Request,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let source_ip = client_ip_key(&req_parts, &state.config.trusted_proxy_cidrs);
+    let request_id = request_id(req_parts.headers());
+
     let merchant_id = uuid::Uuid::new_v4().to_string();
     let (raw_key, prefix) = db::generate_api_key();
 
@@ -339,6 +453,18 @@ async fn provision_merchant(
                 Json(json!({ "error": "internal server error", "code": "internal_error" })),
             )
         })?;
+
+    tracing::info!(
+        audit = true,
+        action = "merchant.provision",
+        actor = "admin",
+        outcome = "created",
+        %merchant_id,
+        %key_id,
+        %source_ip,
+        %request_id,
+        "merchant provisioned"
+    );
 
     Ok((
         StatusCode::CREATED,
@@ -529,6 +655,7 @@ async fn rate_limit_middleware(
         });
 
         if let Err(not_until) = limiter.check() {
+            use governor::clock::Clock as _;
             let wait = not_until.wait_time_from(governor::clock::QuantaClock::default().now());
             let retry_after = retry_after_secs(wait);
             return (
@@ -576,18 +703,15 @@ pub(crate) fn retry_after_secs(wait: Duration) -> u64 {
 /// - `next_wait` — time until the next single cell is available (from governor's
 ///                 `not_until.wait_time_from(...)`).
 ///
-/// Formula: `(cells_missing × period_per_cell) + next_wait`, rounded up.
+/// Formula: `max(cells_missing × period_per_cell, next_wait)`, rounded up.
 /// Returns 0 when the bucket is already full (`remaining == burst`).
 pub(crate) fn reset_secs(quota: governor::Quota, remaining: u32, next_wait: Duration) -> u64 {
-    let burst = quota.burst_size().get();
-    if remaining >= burst {
-        return 0;
-    }
-    let cells_missing = burst.saturating_sub(remaining) as u64;
-    // `period()` is the time for one cell to replenish.
-    let period_secs = quota.replenish_interval().as_secs_f64();
-    let total = cells_missing as f64 * period_secs + next_wait.as_secs_f64();
-    total.ceil() as u64
+    let missing = quota.burst_size().get().saturating_sub(remaining);
+    let refill = quota.replenish_interval().saturating_mul(missing);
+    // `next_wait` already covers the first missing cell on the throttled
+    // path, so it replaces one interval rather than adding to the total.
+    let total = refill.max(next_wait);
+    total.as_secs_f64().ceil() as u64
 }
 
 /// Identifies which rate-limit bucket a request falls into, or `None` for
@@ -675,12 +799,6 @@ fn bucket_rate_multiplier(bucket: &str) -> u32 {
 fn rate_limit_key(bucket: &str, req: &Request, trusted_proxies: &[IpNet]) -> String {
     format!("{bucket}:{}", client_ip_key(req, trusted_proxies))
 }
-
-/// Client key used when a request carries no peer address at all (the router
-/// is served without `into_make_service_with_connect_info`). Fail-closed:
-/// every such request shares this one key rather than trusting client-supplied
-/// forwarding headers (issue #330).
-const CLIENT_IP_UNKNOWN: &str = "unknown";
 
 /// Resolve the client IP used for rate-limit bucketing and auth-log source
 /// attribution.
@@ -825,11 +943,19 @@ fn build_cors(cfg: &crate::config::Config) -> CorsLayer {
         .allow_methods([
             axum::http::Method::GET,
             axum::http::Method::POST,
+            axum::http::Method::DELETE,
             axum::http::Method::OPTIONS,
         ])
         .allow_headers([
             HeaderName::from_static("content-type"),
             HeaderName::from_static("authorization"),
+            HeaderName::from_static("idempotency-key"),
+            HeaderName::from_static("x-admin-secret"),
+        ])
+        .expose_headers([
+            HeaderName::from_static("x-request-id"),
+            HeaderName::from_static("deprecation"),
+            HeaderName::from_static("link"),
         ])
 }
 
@@ -923,13 +1049,14 @@ async fn check_horizon_ready(state: &Arc<AppState>) -> Result<(), String> {
 
 /// `GET /metrics` — Prometheus-compatible plain-text metrics snapshot.
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let (main_bytes, wal_bytes, shm_bytes) = db::file_sizes(&state.config.database_url);
     let db_snap = crate::metrics::DbSnapshot {
         pool_size: state.pool.size(),
         pool_idle: state.pool.num_idle() as u32,
         pool_max: state.config.db_pool_max_connections,
-        main_bytes: None,
-        wal_bytes: None,
-        shm_bytes: None,
+        main_bytes,
+        wal_bytes,
+        shm_bytes,
     };
     let body = crate::metrics::render(
         &state.webhook_metrics,
@@ -1306,12 +1433,12 @@ mod tests {
     /// Build a full `Config` for a header test. Mostly mirrors `expiry`'s
     /// helper; the only field that varies here is `network`.
     fn header_test_config(network: &str) -> crate::config::Config {
-        use crate::config::{AcceptedAsset, ListenerMode, WebhookPayloadDetail};
+        use crate::config::{AcceptedAsset, ListenerMode};
         crate::config::Config {
             port: 0,
             database_url: "sqlite::memory:".into(),
             network: network.into(),
-            horizon_url: "https://horizon.invalid".parse().unwrap(),
+            horizon_url: "https://horizon.invalid".into(),
             gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
             accepted_assets: AcceptedAsset::default_list(),
             webhook_secret: "a-very-long-and-secure-webhook-signing-secret-32-chars".into(),
@@ -1319,7 +1446,6 @@ mod tests {
             webhook_retry_delay_ms: 0,
             webhook_retry_max_delay_ms: 60_000,
             allowed_webhook_schemes: vec!["https".into()],
-            webhook_payload_detail: WebhookPayloadDetail::Minimal,
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
             webhook_redrive_concurrency: 4,
@@ -1327,14 +1453,12 @@ mod tests {
             webhook_redrive_grace_secs: 60,
             webhook_redrive_backoff_initial_secs: 0,
             webhook_redrive_backoff_max_secs: 0,
-            webhook_redrive_jitter_secs: 0,
             retention_interval_secs: 3600,
             webhook_delivery_retention_days: 30,
             idempotency_retention_days: 7,
             poll_interval_secs: 10,
-            cursor_staleness_multiple: 3,
+            poll_max_pages_per_cycle: 50,
             payment_ttl_secs: 3600,
-            expiry_batch_size: 500,
             rate_limit_requests_per_sec: 1000,
             db_pool_max_connections: 5,
             db_busy_timeout_ms: 5000,
@@ -1342,32 +1466,20 @@ mod tests {
             listener_mode: ListenerMode::Poll,
             webhook_allow_private_targets: false,
             admin_provisioning_secret: String::new(),
+            metrics_token: String::new(),
             request_timeout_secs: 30,
             stream_idle_timeout_secs: 30,
             trusted_proxy_cidrs: vec![],
-            max_payment_amount: Default::default(),
-            min_payment_amount: Default::default(),
-            max_body_bytes: 256 * 1024,
-            rate_limiter_max_keys: 10_000,
-            rate_limiter_idle_ttl_secs: 60,
-            pagination_default_limit: 20,
-            pagination_max_limit: 100,
-            shutdown_grace_secs: 30,
-            horizon_page_limit: 200,
-            db_prune_batch_size: 500,
-            retention_max_rows_per_cycle: 50_000,
-            horizon_timeout_secs: 10,
-            sqlite_wal_autocheckpoint: 1000,
-            sqlite_journal_size_limit: 67_108_864,
-            sqlite_cache_size: -2000,
-            require_gateway_account: false,
         }
     }
 
     /// The exact `AppState` construction `router()` expects, backed by an
     /// in-memory SQLite pool so routing — and the header layers — run for real.
     async fn header_test_state(network: &str) -> Arc<AppState> {
-        let cfg = header_test_config(network);
+        header_test_state_with_config(header_test_config(network)).await
+    }
+
+    async fn header_test_state_with_config(cfg: crate::config::Config) -> Arc<AppState> {
         let pool = SqlitePoolOptions::new()
             .connect_with(
                 SqliteConnectOptions::from_str(&cfg.database_url)
@@ -1440,5 +1552,75 @@ mod tests {
         assert_eq!(res.header("content-security-policy"), DASHBOARD_CSP);
         // And it still gets the baseline headers like everything else.
         assert_eq!(res.header("x-content-type-options"), "nosniff");
+    }
+
+    // ── GET /metrics gating (issue #250) ─────────────────────────────────────
+
+    /// With `METRICS_TOKEN` unset (the default), `/metrics` must refuse every
+    /// request — including one that supplies a bearer token, since there is
+    /// nothing configured to check it against.
+    #[tokio::test]
+    async fn metrics_unset_token_refuses_every_request() {
+        let mut cfg = header_test_config("testnet");
+        cfg.metrics_token = String::new();
+        let state = header_test_state_with_config(cfg).await;
+        let server = TestServer::new(router(state)).unwrap();
+
+        let res = server.get("/metrics").await;
+        res.assert_status(StatusCode::UNAUTHORIZED);
+
+        let res = server
+            .get("/metrics")
+            .add_header(header::AUTHORIZATION, "Bearer anything-at-all")
+            .await;
+        res.assert_status(StatusCode::UNAUTHORIZED);
+    }
+
+    /// The acceptance criterion: with the gate enabled (`METRICS_TOKEN` set),
+    /// an unauthenticated scrape — no header at all — is refused.
+    #[tokio::test]
+    async fn metrics_enabled_refuses_an_unauthenticated_scrape() {
+        let mut cfg = header_test_config("testnet");
+        cfg.metrics_token = "a-strong-metrics-token-32-chars-long".into();
+        let state = header_test_state_with_config(cfg).await;
+        let server = TestServer::new(router(state)).unwrap();
+
+        let res = server.get("/metrics").await;
+        res.assert_status(StatusCode::UNAUTHORIZED);
+    }
+
+    /// A wrong bearer token is refused just like a missing one.
+    #[tokio::test]
+    async fn metrics_enabled_refuses_the_wrong_token() {
+        let mut cfg = header_test_config("testnet");
+        cfg.metrics_token = "a-strong-metrics-token-32-chars-long".into();
+        let state = header_test_state_with_config(cfg).await;
+        let server = TestServer::new(router(state)).unwrap();
+
+        let res = server
+            .get("/metrics")
+            .add_header(header::AUTHORIZATION, "Bearer the-wrong-token")
+            .await;
+        res.assert_status(StatusCode::UNAUTHORIZED);
+    }
+
+    /// The correct bearer token is accepted and returns the Prometheus
+    /// exposition body.
+    #[tokio::test]
+    async fn metrics_enabled_accepts_the_correct_token() {
+        let mut cfg = header_test_config("testnet");
+        cfg.metrics_token = "a-strong-metrics-token-32-chars-long".into();
+        let state = header_test_state_with_config(cfg).await;
+        let server = TestServer::new(router(state)).unwrap();
+
+        let res = server
+            .get("/metrics")
+            .add_header(
+                header::AUTHORIZATION,
+                "Bearer a-strong-metrics-token-32-chars-long",
+            )
+            .await;
+        res.assert_status_ok();
+        assert!(res.text().contains("stellargate_auth_attempts_total"));
     }
 }

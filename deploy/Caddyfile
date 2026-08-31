@@ -18,6 +18,15 @@
 		protocols tls1.2 tls1.3
 	}
 
+	# /metrics is gated app-side by METRICS_TOKEN (unset by default, which
+	# denies every request), but this VM has no other network boundary
+	# between the public internet and the app container — so the path is
+	# blocked here too, by default, rather than relying on the app-side gate
+	# alone (issue #250). To scrape from outside the Docker network instead,
+	# remove this block and set METRICS_TOKEN in deploy/stellargate.env.
+	@metrics path /metrics /v1/metrics
+	respond @metrics 404
+
 	# The gateway is not published on a host port; this is the only route in.
 	reverse_proxy app:3000 {
 		# Preserve the client IP. The rate limiter and the auth failure logs

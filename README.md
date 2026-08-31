@@ -86,7 +86,7 @@ A payment is matched on three independent attributes — **memo**, **destination
 | API key lifecycle | ✅ | CSPRNG keys, rotation with overlap, instant revocation |
 | Data retention | ✅ | Background pruning of aged delivery rows and idempotency keys |
 | API versioning | ✅ | `/v1` prefix with a documented deprecation policy |
-| Prometheus metrics | ✅ | `GET /metrics` |
+| Prometheus metrics | ✅ | `GET /metrics`, gated behind `METRICS_TOKEN` (unset — disabled by default) |
 | Dashboard UI | ✅ | Served at `/dashboard`; no build step or separate deploy |
 
 ## Architecture
@@ -509,6 +509,7 @@ until it finished; a backlog drains over several cycles instead.
 | Variable | Description | Default |
 |---|---|---|
 | `ADMIN_PROVISIONING_SECRET` | Required via `X-Admin-Secret` to call `POST /merchants`. Unset disables provisioning entirely (always `401`). | _(unset — disabled)_ |
+| `METRICS_TOKEN` | Required via `Authorization: Bearer <token>` to call `GET /metrics`. Unset disables scraping entirely (always `401`) — the endpoint exposes auth outcome counters and webhook delivery volume, so it must not be reachable anonymously by default (issue #250). | _(unset — disabled)_ |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated origins. **Required** on `public`; omitting on testnet falls back to permissive with a warning. | _(unset)_ |
 | `RATE_LIMIT_REQUESTS_PER_SEC` | Base per-IP limit. Write routes get this rate; read-only routes get 5×. Must be `> 0` — boot fails otherwise; there is no "disabled" value. | `10` |
 | `TRUSTED_PROXY_CIDRS` | Comma-separated CIDR blocks whose `X-Forwarded-For`/`X-Real-IP` headers are honored for rate-limit bucketing and auth-log attribution. Every other peer is attributed by its own address and its headers are ignored — the safe default. | _(unset — headers ignored)_ |
@@ -1301,7 +1302,7 @@ Readiness probe. Runs `SELECT 1` against the database, probes Horizon (3 s timeo
 
 ### `GET /metrics`
 
-Prometheus exposition format. See [Observability](#observability).
+Prometheus exposition format. Requires `Authorization: Bearer <METRICS_TOKEN>`; unset `METRICS_TOKEN` disables the endpoint entirely (always `401`). See [Observability](#observability).
 
 ### `GET /dashboard`
 
@@ -1502,7 +1503,7 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Observability
 
-`GET /metrics` exposes Prometheus metrics:
+`GET /metrics` exposes Prometheus metrics, gated behind `Authorization: Bearer <METRICS_TOKEN>` (issue #250). Unset (the default), the endpoint is disabled entirely — every scrape gets `401` rather than exposing auth outcome counters and webhook delivery volume to anonymous callers. Set `METRICS_TOKEN` to a strong random value (`openssl rand -hex 32`) to enable scraping, and configure Prometheus's `authorization` scrape option with the same value. `deploy/Caddyfile` also blocks the path at the edge by default (see [Deployment](DEPLOYMENT.md#operating)) — remove that block only if you intend to scrape from outside the Docker network.
 
 | Metric | Type | Description |
 |---|---|---|

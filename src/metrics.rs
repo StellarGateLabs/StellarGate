@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-fn lock_or_recover<T>(mutex: &Mutex<T>, what: &str) -> std::sync::MutexGuard<'_, T> {
+fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, what: &str) -> std::sync::MutexGuard<'a, T> {
     mutex.lock().unwrap_or_else(|poisoned| {
         tracing::warn!(mutex = what, "mutex poisoned; recovering and continuing");
         poisoned.into_inner()

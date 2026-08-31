@@ -9,6 +9,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`GET /metrics` is no longer reachable anonymously.** It was registered on
+  the public router with no authentication, exposing webhook delivery volume,
+  latency, and — most usefully to an attacker — auth outcome counters
+  (`stellargate_auth_attempts_total{outcome="failure",reason="invalid_key"}`
+  let a credential-stuffing attempt watch its own progress). The endpoint is
+  now gated behind `Authorization: Bearer <METRICS_TOKEN>`; unset (the
+  default) disables it entirely, returning `401` for every request rather
+  than falling back to an open default. `deploy/Caddyfile` also blocks the
+  path at the edge by default (issue #250).
+
+- **Restored a batch of previously-shipped fixes that a bad merge had
+  silently reverted from `main`, discovered while landing the fix above** (a
+  base-branch build failure led to auditing the rest of `main` for the same
+  pattern — several PRs' worth of work had the same fate). Each of the
+  following was already implemented, tested, and merged at some point; this
+  restores the code, not just the behavior:
+  - Baseline security headers (`X-Content-Type-Options`, `Referrer-Policy`,
+    `Cache-Control`, and `Strict-Transport-Security` on `public`) on every API
+    response, not only the dashboard's static assets (issues #251–#254).
+  - The Horizon SSE stream listener bounds every read with
+    `STREAM_IDLE_TIMEOUT_SECS`, so a half-open connection (dropped by a NAT or
+    load balancer without `RST`) is detected and reconnected instead of
+    parking the listener forever (issue #312).
+  - The Horizon poller backs off on failure — honoring `Retry-After` on a
+    `429`/`503` exactly, and falling back to an equal-jitter exponential
+    schedule otherwise — instead of retrying every cycle at the fixed poll
+    interval regardless of why the previous one failed (issue #313).
+  - First-run cursor baselining walks backward with overlap instead of
+    adopting the account's single most recent payment as the floor, which
+    silently skipped a still-open intent's payment on a reused account or a
+    startup race (issue #311).
+  - The periodic trustline checker (`run_trustline_checker`) is wired into
+    the process again — trustlines are re-verified on `RETENTION_INTERVAL_SECS`
+    for as long as a gateway is configured, not only once at boot.
+  - Inline webhook retries grow exponentially with jitter
+    (`WEBHOOK_RETRY_DELAY_MS` doubling up to `WEBHOOK_RETRY_MAX_DELAY_MS`)
+    instead of sleeping a constant delay between attempts, which retried an
+    entire failed settlement burst in lockstep against a receiver that was
+    already struggling (issue #318). Boot now also refuses a
+    `WEBHOOK_REDRIVE_GRACE_SECS` shorter than the worst-case inline delivery
+    time, closing a window where the redrive worker could double-send a
+    delivery whose inline attempt was still in flight (issue #238).
+  - `POST /merchants` and `POST /payments` emit the same structured audit
+    event (`audit=true`, `action`, `actor`, `outcome`, `source_ip`,
+    `request_id`) the key-lifecycle routes already had (issue #305).
+  - The strict CORS layer permits `DELETE` (key revocation),
+    `Idempotency-Key` and `X-Admin-Secret` request headers, and exposes
+    `X-Request-Id`/`Deprecation`/`Link` to browser clients — all four were
+    silently dropped from the allow-list despite the routes needing them
+    (issue #281).
+  - `db::migrate` now runs inside a transaction, so a failure partway through
+    (a corrupt row a backfill can't touch, a disk error) rolls back instead of
+    leaving the schema half-migrated.
+  - `GET /metrics`'s database gauges (`stellargate_db_file_size_bytes`) are
+    populated from the actual SQLite file sizes instead of always reporting
+    absent.
+  - A partial composite index on `payments(status, expires_at)` for the
+    watchable-status queries (`list_pending`, `expire_overdue`,
+    `find_pending_by_memo`) that run on every poll/sweep cycle (issue #270).
+  - Horizon paging cursors are properly percent-encoded when built into a
+    request URL; an opaque cursor containing `&` or `#` used to corrupt the
+    query string it was interpolated into.
+
 - **Unknown query parameters on the listing endpoints are now rejected
   instead of ignored.** `GET /payments`, `GET /payments/:id/webhooks`, and
   `GET /payments/webhooks` deserialized the parameters they knew and discarded
