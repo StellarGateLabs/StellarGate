@@ -102,7 +102,7 @@ jobs:
         with:
           subject-path: "dist/*.tar.gz"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.target }}
           path: dist/*
@@ -170,7 +170,7 @@ jobs:
           upload-artifact: false
           upload-release-assets: false
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sbom
           path: dist/stellargate.cdx.json
