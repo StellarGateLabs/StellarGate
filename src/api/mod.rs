@@ -1,13 +1,14 @@
 use crate::api::payments::{AppError, JsonBody};
 use crate::{db, AppState};
 use axum::{
-    extract::{ConnectInfo, Path, Request, State},
+    extract::{ConnectInfo, Extension, Path, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
     Json,
 };
+use governor::clock::Clock;
 use ipnet::IpNet;
 use moka::sync::Cache;
 use serde_json::{json, Value};
@@ -80,12 +81,92 @@ impl RateLimitState {
     }
 }
 
+/// Per-merchant limiter guarding `POST /payments/:id/webhooks/:delivery_id/redeliver`
+/// (issue #468).
+///
+/// The IP-keyed `"redeliver"` bucket in [`rate_limit_middleware`] already
+/// bounds this endpoint, but only per source address. A single authenticated
+/// merchant issuing requests from many addresses (rotating egress IPs, a
+/// pool of workers, a proxy fleet) is not bound by it at all, and could
+/// otherwise drive an unbounded redelivery storm against their own webhook
+/// endpoint — or, since the request is made with our outbound client, look
+/// like one against a downstream receiver. Keying on [`AuthenticatedMerchant`]
+/// instead closes that gap regardless of how many addresses a merchant's
+/// traffic comes from.
+///
+/// Deliberately separate from `RateLimitState`: it runs only inside
+/// `payments_authed`, after `auth_middleware` has populated the
+/// [`AuthenticatedMerchant`] extension, so it can be keyed on merchant
+/// identity rather than address.
+#[derive(Clone)]
+struct MerchantRedeliverLimitState {
+    requests_per_sec: u32,
+    limiters: Cache<String, Arc<governor::DefaultDirectRateLimiter>>,
+}
+
+impl MerchantRedeliverLimitState {
+    fn new(requests_per_sec: u32) -> Self {
+        let limiters = Cache::builder()
+            .max_capacity(RATE_LIMITER_MAX_KEYS)
+            .time_to_idle(RATE_LIMITER_IDLE_TTL)
+            .build();
+        Self {
+            requests_per_sec: requests_per_sec.max(1),
+            limiters,
+        }
+    }
+}
+
+/// Rejects a redelivery request once the calling merchant has exceeded their
+/// share of `RATE_LIMIT_REQUESTS_PER_SEC` on this endpoint, independent of
+/// which address(es) the requests arrive from. Must run after
+/// `auth_middleware` — it requires the [`AuthenticatedMerchant`] extension.
+async fn merchant_redeliver_limit_middleware(
+    State(limit): State<MerchantRedeliverLimitState>,
+    Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
+    req: Request,
+    next: Next,
+) -> axum::response::Response {
+    let limiter = limit.limiters.get_with(merchant_id, || {
+        Arc::new(governor::RateLimiter::direct(governor::Quota::per_second(
+            NonZeroU32::new(limit.requests_per_sec)
+                .expect("requests_per_sec is clamped to at least 1"),
+        )))
+    });
+
+    if let Err(not_until) = limiter.check() {
+        let wait = not_until.wait_time_from(governor::clock::QuantaClock::default().now());
+        let retry_after = retry_after_secs(wait);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(
+                header::RETRY_AFTER,
+                HeaderValue::from_str(&retry_after.to_string())
+                    .unwrap_or_else(|_| HeaderValue::from_static("1")),
+            )],
+            Json(json!({
+                "error": "rate limit exceeded",
+                "code": "rate_limit_exceeded"
+            })),
+        )
+            .into_response();
+    }
+
+    next.run(req).await
+}
+
 pub fn router(state: Arc<AppState>) -> axum::Router {
     let cors = build_cors(&state.config);
     let rate_limit = RateLimitState::new(
         state.config.rate_limit_requests_per_sec,
         state.config.trusted_proxy_cidrs.clone(),
     );
+    // Constructed once and shared across both the `/v1` and legacy mounts
+    // (`api_v1` is called for each) so a merchant's quota is a single pool
+    // regardless of which prefix they call through — matching how the IP-keyed
+    // `rate_limit` bucket above is already shared across both mounts.
+    let merchant_redeliver_limit =
+        MerchantRedeliverLimitState::new(state.config.rate_limit_requests_per_sec);
     let request_timeout = Duration::from_secs(state.config.request_timeout_secs);
 
     axum::Router::new()
@@ -107,8 +188,8 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         exists to prevent (issue #121). Legacy responses carry `Deprecation`
         and `Link` headers pointing at their `/v1` equivalent, so a client can
         discover the move from a response it already parses. */
-        .nest("/v1", api_v1(&state))
-        .merge(api_v1(&state).layer(middleware::from_fn(mark_deprecated)))
+        .nest("/v1", api_v1(&state, merchant_redeliver_limit.clone()))
+        .merge(api_v1(&state, merchant_redeliver_limit).layer(middleware::from_fn(mark_deprecated)))
         .fallback(not_found)
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(TraceLayer::new_for_http())
@@ -132,7 +213,10 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
 /// are deliberately excluded. They are infrastructure rather than contract —
 /// a probe URL that moved with every API revision would break liveness checks
 /// and scrape configs for no benefit.
-fn api_v1(state: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
+fn api_v1(
+    state: &Arc<AppState>,
+    merchant_redeliver_limit: MerchantRedeliverLimitState,
+) -> axum::Router<Arc<AppState>> {
     /* Merchant provisioning and API key lifecycle. All admin-gated behind
     ADMIN_PROVISIONING_SECRET: this service has no self-service signup, and
     minting or revoking a credential is an operator action. */
@@ -145,17 +229,34 @@ fn api_v1(state: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
             require_admin_secret,
         ));
 
-    /* Auth middleware on the write + list routes, the webhook listing, and
-    redelivery (it triggers a merchant-scoped outbound request). The
-    per-payment status endpoint handles credentials itself, because it serves
-    both authenticated and anonymous callers — see `payments::get_by_id`. */
+    /* Auth middleware on the write + list routes and the webhook listing.
+    The per-payment status endpoint handles credentials itself, because it
+    serves both authenticated and anonymous callers — see
+    `payments::get_by_id`. */
     let payments_authed = axum::Router::new()
         .route("/", post(payments::create).get(payments::list))
         .route("/:id/webhooks", get(payments::list_webhooks))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    /* Redelivery gets its own sub-router so `merchant_redeliver_limit_middleware`
+    (issue #468) applies only here, not to every authenticated payments route.
+    It triggers a merchant-scoped outbound request, so on top of the auth
+    middleware every other route here also gets, it additionally needs a
+    limiter keyed on the caller's identity rather than their address —
+    layered outside-in as auth (runs first, populates the merchant identity)
+    then the merchant limiter (runs second, reads it). */
+    let redeliver = axum::Router::new()
         .route(
             "/:id/webhooks/:delivery_id/redeliver",
             post(payments::redeliver_webhook),
         )
+        .route_layer(middleware::from_fn_with_state(
+            merchant_redeliver_limit,
+            merchant_redeliver_limit_middleware,
+        ))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -165,6 +266,7 @@ fn api_v1(state: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
         "/payments",
         axum::Router::new()
             .merge(payments_authed)
+            .merge(redeliver)
             .route("/:id", get(payments::get_by_id)),
     )
 }
