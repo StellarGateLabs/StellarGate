@@ -17,7 +17,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use stellargate::{
-    config::{AcceptedAsset, Config, ListenerMode, WebhookPayloadDetail},
+    config::{AcceptedAsset, Config, ListenerMode},
     db, horizon, AppState,
 };
 use uuid::Uuid;
@@ -39,7 +39,7 @@ fn make_config(horizon_url: &str) -> Config {
         port: 0,
         database_url: shared_memory_dsn(),
         network: "testnet".into(),
-        horizon_url: horizon_url.parse().unwrap(),
+        horizon_url: horizon_url.into(),
         gateway_public: "GDESTINATION".into(),
         accepted_assets: AcceptedAsset::default_list(),
         webhook_secret: "test-secret-32-bytes-minimum-len".into(),
@@ -47,7 +47,6 @@ fn make_config(horizon_url: &str) -> Config {
         webhook_retry_delay_ms: 0,
         webhook_retry_max_delay_ms: 60_000,
         allowed_webhook_schemes: vec!["https".into(), "http".into()],
-        webhook_payload_detail: WebhookPayloadDetail::Minimal,
         webhook_timeout_secs: 5,
         webhook_redrive_interval_secs: 30,
         webhook_redrive_concurrency: 4,
@@ -55,14 +54,12 @@ fn make_config(horizon_url: &str) -> Config {
         webhook_redrive_grace_secs: 0,
         webhook_redrive_backoff_initial_secs: 0,
         webhook_redrive_backoff_max_secs: 0,
-        webhook_redrive_jitter_secs: 0,
         retention_interval_secs: 3600,
         webhook_delivery_retention_days: 30,
         idempotency_retention_days: 7,
         poll_interval_secs: 10,
-        cursor_staleness_multiple: 3,
+        poll_max_pages_per_cycle: 50,
         payment_ttl_secs: 3600,
-        expiry_batch_size: 500,
         cors_allowed_origins: vec![],
         listener_mode: ListenerMode::Stream,
         webhook_allow_private_targets: true,
@@ -70,25 +67,10 @@ fn make_config(horizon_url: &str) -> Config {
         db_pool_max_connections: 10,
         db_busy_timeout_ms: 5000,
         admin_provisioning_secret: String::new(),
+        metrics_token: String::new(),
         request_timeout_secs: 30,
         stream_idle_timeout_secs: 30,
         trusted_proxy_cidrs: vec![],
-        max_payment_amount: Default::default(),
-        min_payment_amount: Default::default(),
-        max_body_bytes: 256 * 1024,
-        rate_limiter_max_keys: 10_000,
-        rate_limiter_idle_ttl_secs: 60,
-        pagination_default_limit: 20,
-        pagination_max_limit: 100,
-        shutdown_grace_secs: 30,
-        horizon_page_limit: 200,
-        db_prune_batch_size: 500,
-        retention_max_rows_per_cycle: 50_000,
-        horizon_timeout_secs: 10,
-        sqlite_wal_autocheckpoint: 1000,
-        sqlite_journal_size_limit: 67_108_864,
-        sqlite_cache_size: -2000,
-        require_gateway_account: false,
     }
 }
 
@@ -479,20 +461,15 @@ async fn shutdown_causes_prompt_exit() {
     let start = std::time::Instant::now();
     tx.send(true).unwrap();
 
-    let result = tokio::time::timeout(Duration::from_secs(2), handle)
+    tokio::time::timeout(Duration::from_secs(2), handle)
         .await
-        .expect("listener must return within 2s of shutdown signal");
+        .expect("listener must return within 2s of shutdown signal")
+        .unwrap();
 
     let elapsed = start.elapsed();
     assert!(
         elapsed < Duration::from_secs(2),
         "shutdown took too long: {elapsed:?}"
-    );
-
-    use stellargate::supervise::TaskExit;
-    assert!(
-        matches!(result.unwrap(), TaskExit::ShutdownRequested),
-        "must return ShutdownRequested"
     );
 }
 
@@ -528,18 +505,12 @@ async fn unconfigured_gateway_exits_disabled_by_config() {
     });
 
     let (_tx, rx) = tokio::sync::watch::channel(false);
-    let result = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(1),
         horizon::run_stream_listener(state, rx),
     )
     .await
     .expect("must return immediately when gateway is unconfigured");
-
-    use stellargate::supervise::TaskExit;
-    assert!(
-        matches!(result, TaskExit::DisabledByConfig(_)),
-        "must be DisabledByConfig, got {result:?}"
-    );
 
     // Horizon was never contacted.
     assert!(

@@ -22,6 +22,7 @@ fn make_config() -> Config {
         webhook_secret: String::new(),
         webhook_retry_attempts: 1,
         webhook_retry_delay_ms: 0,
+        webhook_retry_max_delay_ms: 60_000,
         /* Both schemes are allowed here so the scheme allow-list isn't what
         rejects http:// — these tests cover the network-based rule (http is fine
         on testnet, HTTPS-only on public), which runs after this gate. */
@@ -48,12 +49,18 @@ fn make_config() -> Config {
         listener_mode: ListenerMode::Poll,
         webhook_allow_private_targets: false,
         admin_provisioning_secret: TEST_ADMIN_SECRET.into(),
+        metrics_token: TEST_METRICS_TOKEN.into(),
         request_timeout_secs: 30,
+        stream_idle_timeout_secs: 30,
+        trusted_proxy_cidrs: vec![],
     }
 }
 
 /// Shared admin secret used by tests to provision merchants.
 const TEST_ADMIN_SECRET: &str = "test-admin-secret";
+
+/// Shared metrics bearer token used by tests that scrape `/metrics`.
+const TEST_METRICS_TOKEN: &str = "test-metrics-token-32-chars-long";
 
 async fn test_server_with_pool() -> (TestServer, db::Db) {
     server_with_config(make_config()).await
@@ -78,6 +85,44 @@ async fn server_with_config(cfg: Config) -> (TestServer, db::Db) {
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
         horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
+        trustline_metrics: stellargate::metrics::TrustlineMetrics::new(),
+        http_metrics: stellargate::metrics::HttpMetrics::new(),
+        payment_metrics: stellargate::metrics::PaymentMetrics::new(),
+        task_health: stellargate::TaskHealth::new(),
+    }))
+    .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let server = TestServer::new(router).unwrap();
+    (server, pool)
+}
+
+/// Like [`server_with_config`], but wires a caller-supplied
+/// [`stellargate::metrics::TrustlineMetrics`] instead of a fresh one, so a
+/// test can pre-seed the trustline-check state `POST /payments` reads from.
+async fn server_with_config_and_trustlines(
+    cfg: Config,
+    trustlines: stellargate::metrics::TrustlineMetrics,
+) -> (TestServer, db::Db) {
+    let pool = SqlitePoolOptions::new()
+        .connect_with(
+            SqliteConnectOptions::from_str(&cfg.database_url)
+                .unwrap()
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+    db::migrate(&pool).await.unwrap();
+    let http = reqwest::Client::new();
+    let router = api::router(Arc::new(AppState {
+        pool: pool.clone(),
+        config: cfg,
+        http,
+        webhook_http: reqwest::Client::new(),
+        webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
+        auth_metrics: stellargate::metrics::AuthMetrics::new(),
+        horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
+        trustline_metrics: trustlines,
+        http_metrics: stellargate::metrics::HttpMetrics::new(),
+        payment_metrics: stellargate::metrics::PaymentMetrics::new(),
         task_health: stellargate::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
@@ -189,7 +234,10 @@ async fn test_auth_outcomes_are_counted_in_metrics() {
         .add_header("Authorization", format!("Bearer {key}"))
         .await; // valid key
 
-    let res = server.get("/metrics").await;
+    let res = server
+        .get("/metrics")
+        .add_header("Authorization", format!("Bearer {TEST_METRICS_TOKEN}"))
+        .await;
     res.assert_status_ok();
     let body = res.text();
     assert!(
@@ -436,7 +484,7 @@ async fn test_create_invalid_asset() {
 #[tokio::test]
 async fn test_create_rejects_asset_with_confirmed_missing_trustline() {
     let trustlines = stellargate::metrics::TrustlineMetrics::new();
-    trustlines.record_check(["USDC"], &["USDC".to_string()], &[], &[]);
+    trustlines.record_check_full(["USDC"], &["USDC".to_string()], &[], &[]);
     let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
     let key = provision_merchant(&server).await;
     let res = server
@@ -450,10 +498,10 @@ async fn test_create_rejects_asset_with_confirmed_missing_trustline() {
 #[tokio::test]
 async fn test_create_accepts_asset_with_confirmed_present_trustline() {
     let trustlines = stellargate::metrics::TrustlineMetrics::new();
-    trustlines.record_check(["USDC"], &[], &[], &[]);
+    trustlines.record_check_full(["USDC"], &[], &[], &[]);
     let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
     let key = provision_merchant(&server).await;
-    let id = server
+    let res = server
         .post("/payments")
         .add_header("Authorization", format!("Bearer {key}"))
         .json(&json!({ "amount": "10", "asset": "USDC" }))
@@ -466,9 +514,19 @@ async fn test_create_accepts_asset_with_confirmed_present_trustline() {
 #[tokio::test]
 async fn test_create_never_rejects_native_xlm_for_a_missing_trustline() {
     let trustlines = stellargate::metrics::TrustlineMetrics::new();
-    trustlines.record_check(["USDC"], &["USDC".to_string()], &[], &[]);
+    trustlines.record_check_full(["USDC"], &["USDC".to_string()], &[], &[]);
     let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
     let key = provision_merchant(&server).await;
+    let create_res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "10", "asset": "XLM" }))
+        .await;
+    create_res.assert_status(StatusCode::CREATED);
+    let id = create_res.json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // Full detail now requires the owning merchant's key (issues #67, #85).
     let res = server
@@ -492,11 +550,15 @@ async fn test_create_never_rejects_native_xlm_for_a_missing_trustline() {
 #[tokio::test]
 async fn test_metrics_expose_trustline_state() {
     let trustlines = stellargate::metrics::TrustlineMetrics::new();
-    trustlines.record_check(["USDC", "EURC"], &["USDC".to_string()], &[], &[]);
+    trustlines.record_check_full(["USDC", "EURC"], &["USDC".to_string()], &[], &[]);
     trustlines.record_check_failure();
     let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
 
-    let body = server.get("/metrics").await.text();
+    let body = server
+        .get("/metrics")
+        .add_header("Authorization", format!("Bearer {TEST_METRICS_TOKEN}"))
+        .await
+        .text();
     assert!(
         body.contains("stellargate_missing_trustlines{asset=\"USDC\"} 1"),
         "got: {body}"
@@ -2134,9 +2196,14 @@ async fn test_v1_responses_are_not_marked_deprecated() {
 async fn test_operational_endpoints_are_not_versioned() {
     let server = test_server().await;
 
-    for path in ["/health", "/ready", "/metrics", "/dashboard"] {
+    for path in ["/health", "/ready", "/dashboard"] {
         server.get(path).await.assert_status_ok();
     }
+    server
+        .get("/metrics")
+        .add_header("Authorization", format!("Bearer {TEST_METRICS_TOKEN}"))
+        .await
+        .assert_status_ok();
     for path in ["/v1/health", "/v1/ready", "/v1/metrics", "/v1/dashboard"] {
         server.get(path).await.assert_status(StatusCode::NOT_FOUND);
     }

@@ -13,7 +13,10 @@ use stellargate::{
     api,
     config::{Config, ListenerMode},
     db, expiry, horizon,
-    metrics::{AuthMetrics, HorizonMetrics, WebhookMetrics},
+    metrics::{
+        AuthMetrics, HorizonMetrics, HttpMetrics, PaymentMetrics, TrustlineMetrics,
+        WebhookMetrics,
+    },
     retention, webhook, AppState, TaskHealth,
 };
 use tokio::sync::watch;
@@ -52,6 +55,9 @@ async fn main() -> Result<()> {
         webhook_metrics: WebhookMetrics::new(),
         auth_metrics: AuthMetrics::new(),
         horizon_metrics: HorizonMetrics::new(),
+        trustline_metrics: TrustlineMetrics::new(),
+        http_metrics: HttpMetrics::new(),
+        payment_metrics: PaymentMetrics::new(),
         task_health: TaskHealth::new(),
         config: cfg,
     });
@@ -85,6 +91,13 @@ async fn main() -> Result<()> {
         "retention",
         retention::run_retention_worker(state.clone(), shutdown_rx.clone()),
     );
+    let trustline_checker = spawn_task(&health, "trustline_checker", {
+        let state = state.clone();
+        let shutdown_rx = shutdown_rx.clone();
+        async move {
+            horizon::run_trustline_checker(state, shutdown_rx).await;
+        }
+    });
     let redrive = spawn_task(
         &health,
         "redrive",
@@ -108,6 +121,7 @@ async fn main() -> Result<()> {
         join_task(sweeper, "sweeper", &health).await;
         join_task(redrive, "redrive", &health).await;
         join_task(retention, "retention", &health).await;
+        join_task(trustline_checker, "trustline_checker", &health).await;
         if let Some(handle) = stream {
             join_task(handle, "stream", &health).await;
         }

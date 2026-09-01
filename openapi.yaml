@@ -130,9 +130,12 @@ paths:
       summary: Prometheus-compatible metrics snapshot
       description: >-
         Text-exposition-format counters and gauges covering webhook delivery,
-        authentication, and background task health. Currently unauthenticated
-        — see issue #250 for the access-control decision tracked against that.
-      security: []
+        authentication, and background task health. Gated behind
+        Authorization: Bearer <METRICS_TOKEN>; an unset METRICS_TOKEN disables
+        this route entirely (every request gets 401) rather than leaving it
+        open (issue #250).
+      security:
+        - metricsToken: []
       responses:
         "200":
           description: Metrics snapshot
@@ -447,7 +450,7 @@ paths:
                     error: merchant not found
                     code: merchant_not_found
 
-  /payments:
+  /v1/payments:
     post:
       operationId: createPayment
       summary: Create a payment intent
@@ -1365,6 +1368,13 @@ components:
         provisioning and the API-key lifecycle routes only; it is never
         accepted on a payment route. An unset ADMIN_PROVISIONING_SECRET
         disables those routes entirely rather than leaving them open.
+    metricsToken:
+      type: http
+      scheme: bearer
+      description: >-
+        Operator secret from METRICS_TOKEN. Guards GET /metrics only; it is
+        never accepted on a payment or admin route. An unset METRICS_TOKEN
+        disables the route entirely rather than leaving it open (issue #250).
 
   responses:
     Unauthorized:
@@ -1724,8 +1734,7 @@ components:
           type: string
           enum: [XLM, USDC]
         asset_issuer:
-          type: string
-          nullable: true
+          type: [string, "null"]
           description: >-
             Issuer account of `asset`, recorded when the intent was created.
             `null` for the native asset (XLM), which has no issuer. Persisted

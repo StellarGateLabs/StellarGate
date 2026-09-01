@@ -29,6 +29,7 @@ fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
         webhook_secret: webhook_secret.into(),
         webhook_retry_attempts: retry_attempts,
         webhook_retry_delay_ms: 0,
+        webhook_retry_max_delay_ms: 60_000,
         allowed_webhook_schemes: vec!["https".into(), "http".into()],
         webhook_timeout_secs: 10,
         webhook_redrive_interval_secs: 30,
@@ -52,7 +53,10 @@ fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
         db_pool_max_connections: 10,
         db_busy_timeout_ms: 5000,
         admin_provisioning_secret: String::new(),
+        metrics_token: String::new(),
         request_timeout_secs: 30,
+        stream_idle_timeout_secs: 30,
+        trusted_proxy_cidrs: vec![],
     }
 }
 
@@ -74,6 +78,9 @@ async fn setup_state(cfg: Config) -> AppState {
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
         horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
+        trustline_metrics: stellargate::metrics::TrustlineMetrics::new(),
+        http_metrics: stellargate::metrics::HttpMetrics::new(),
+        payment_metrics: stellargate::metrics::PaymentMetrics::new(),
         task_health: stellargate::TaskHealth::new(),
     }
 }

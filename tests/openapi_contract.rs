@@ -42,7 +42,7 @@ fn make_config() -> Config {
         port: 0,
         database_url: "sqlite::memory:".into(),
         network: "testnet".into(),
-        horizon_url: "https://horizon.invalid".parse().unwrap(),
+        horizon_url: "https://horizon.invalid".into(),
         gateway_public: "UNCONFIGURED".into(),
         accepted_assets: stellargate::config::AcceptedAsset::default_list(),
         webhook_secret: String::new(),
@@ -50,7 +50,6 @@ fn make_config() -> Config {
         webhook_retry_delay_ms: 0,
         webhook_retry_max_delay_ms: 60_000,
         allowed_webhook_schemes: vec!["https".into(), "http".into()],
-        webhook_payload_detail: stellargate::config::WebhookPayloadDetail::Minimal,
         webhook_timeout_secs: 10,
         webhook_redrive_interval_secs: 30,
         webhook_redrive_concurrency: 4,
@@ -58,14 +57,12 @@ fn make_config() -> Config {
         webhook_redrive_grace_secs: 60,
         webhook_redrive_backoff_initial_secs: 0,
         webhook_redrive_backoff_max_secs: 0,
-        webhook_redrive_jitter_secs: 0,
         retention_interval_secs: 3600,
         webhook_delivery_retention_days: 30,
         idempotency_retention_days: 7,
         poll_interval_secs: 10,
-        cursor_staleness_multiple: 3,
+        poll_max_pages_per_cycle: 50,
         payment_ttl_secs: 3600,
-        expiry_batch_size: 500,
         rate_limit_requests_per_sec: 1000,
         db_pool_max_connections: 10,
         db_busy_timeout_ms: 5000,
@@ -73,25 +70,10 @@ fn make_config() -> Config {
         listener_mode: ListenerMode::Poll,
         webhook_allow_private_targets: false,
         admin_provisioning_secret: TEST_ADMIN_SECRET.into(),
+        metrics_token: String::new(),
         request_timeout_secs: 30,
         stream_idle_timeout_secs: 30,
         trusted_proxy_cidrs: vec![],
-        max_payment_amount: Default::default(),
-        min_payment_amount: Default::default(),
-        max_body_bytes: 256 * 1024,
-        rate_limiter_max_keys: 10_000,
-        rate_limiter_idle_ttl_secs: 60,
-        pagination_default_limit: 20,
-        pagination_max_limit: 100,
-        shutdown_grace_secs: 30,
-        horizon_page_limit: 200,
-        db_prune_batch_size: 500,
-        retention_max_rows_per_cycle: 50_000,
-        horizon_timeout_secs: 10,
-        sqlite_wal_autocheckpoint: 1000,
-        sqlite_journal_size_limit: 67_108_864,
-        sqlite_cache_size: -2000,
-        require_gateway_account: false,
     }
 }
 
@@ -304,7 +286,13 @@ async fn openapi_documents_exactly_the_intended_paths() {
     let documented = documented_paths(&read_spec());
 
     let expected: BTreeSet<String> = [
+        // Operational endpoints. Infrastructure rather than contract (they
+        // don't move between API versions), but still documented so a reader
+        // of the spec sees the whole surface the service answers on.
+        "/",
         "/health",
+        "/ready",
+        "/metrics",
         // Operator / merchant management.
         "/merchants",
         "/merchants/{id}/keys",

@@ -26,6 +26,7 @@ fn make_config(rate_limit_requests_per_sec: u32) -> Config {
         webhook_secret: String::new(),
         webhook_retry_attempts: 1,
         webhook_retry_delay_ms: 0,
+        webhook_retry_max_delay_ms: 60_000,
         allowed_webhook_schemes: vec!["https".into(), "http".into()],
         webhook_timeout_secs: 10,
         webhook_redrive_interval_secs: 30,
@@ -47,7 +48,10 @@ fn make_config(rate_limit_requests_per_sec: u32) -> Config {
         listener_mode: ListenerMode::Poll,
         webhook_allow_private_targets: false,
         admin_provisioning_secret: TEST_ADMIN_SECRET.into(),
+        metrics_token: String::new(),
         request_timeout_secs: 30,
+        stream_idle_timeout_secs: 30,
+        trusted_proxy_cidrs: vec![],
     }
 }
 
@@ -72,6 +76,9 @@ async fn server_with_config(cfg: Config) -> (TestServer, db::Db) {
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
         horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
+        trustline_metrics: stellargate::metrics::TrustlineMetrics::new(),
+        http_metrics: stellargate::metrics::HttpMetrics::new(),
+        payment_metrics: stellargate::metrics::PaymentMetrics::new(),
         task_health: stellargate::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
@@ -155,6 +162,27 @@ async fn test_redeliver_rate_limit_exceeded_returns_429() {
     let second = server
         .post(&format!("/payments/{id}/webhooks/delivery-1/redeliver"))
         .add_header("Authorization", auth)
+        .await;
+    second.assert_status(StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(second.json::<Value>()["code"], "rate_limit_exceeded");
+}
+
+/// `POST /merchants` sits in the base-rate "merchants" bucket, not the 5×
+/// read bucket — an admin secret leaked or brute-forced can't be used to
+/// mass-create merchant records any faster than any other write (issue #461).
+#[tokio::test]
+async fn test_provision_merchant_rate_limit_exceeded_returns_429() {
+    let (server, _pool) = server_with_config(make_config(1)).await;
+
+    let first = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    first.assert_status(StatusCode::CREATED);
+
+    let second = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
         .await;
     second.assert_status(StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(second.json::<Value>()["code"], "rate_limit_exceeded");

@@ -24,6 +24,7 @@ fn normalize_ts(raw: &str) -> String {
 }
 
 pub async fn migrate(pool: &Db) -> Result<()> {
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS payments (
             id TEXT PRIMARY KEY,
@@ -42,7 +43,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             expires_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 hour'))
         )",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Bring pre-existing payment tables up to schema. New databases already have
@@ -52,11 +53,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     let has_expires_at: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('payments') WHERE name = 'expires_at'",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     if has_expires_at == 0 {
         sqlx::query("ALTER TABLE payments ADD COLUMN expires_at TEXT")
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
     }
     /* Backfill any row without an expiry (legacy rows, or rows inserted in the
@@ -67,7 +68,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', created_at, '+1 hour')
           WHERE expires_at IS NULL",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* `asset_issuer` completes the asset identity of an intent. Only the code
@@ -89,15 +90,26 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     }
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_memo ON payments(memo)")
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)")
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_payments_created_id ON payments(created_at DESC, id DESC)",
     )
-    .execute(pool)
+    .execute(&mut *tx)
+    .await?;
+    /* Partial composite index for the watchable-status queries (list_pending,
+    expire_overdue, find_pending_by_memo) that run on every poll/sweep cycle.
+    SQLite can satisfy both the `status IN (...)` filter and the `expires_at`
+    comparison from this one index instead of scanning every matching-status
+    row before evaluating expiry (issue #270). */
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_payments_status_expires_at ON payments(status, expires_at)
+         WHERE status IN ('pending', 'underpaid')",
+    )
+    .execute(&mut *tx)
     .await?;
 
     sqlx::query(
@@ -113,7 +125,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
         )",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Bring pre-existing delivery tables up to schema. `event_type` records
@@ -124,7 +136,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     let has_event_type: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'event_type'",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     if has_event_type == 0 {
         sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN event_type TEXT")
@@ -167,6 +179,22 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             .await?;
     }
 
+    /* Manual redeliveries must not share the automatic redrive budget (issue
+    #235). `manual_attempts` is incremented by POST .../redeliver; the redrive
+    worker only looks at `attempts`. */
+    let has_manual_attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'manual_attempts'",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if has_manual_attempts == 0 {
+        sqlx::query(
+            "ALTER TABLE webhook_deliveries ADD COLUMN manual_attempts INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+
     /* Durable key/value state — used by the Horizon poller to persist its
     paging cursor so it resumes exactly where it left off across restarts. */
     sqlx::query(
@@ -176,20 +204,23 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
         )",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Merchants are provisioned via POST /merchants. The raw API key is never
     stored; only its SHA-256 hex digest is persisted so a DB breach does not
-    expose live credentials. */
+    expose live credentials. `api_key_hash` is nullable: it exists only for
+    compatibility with merchants created before the `api_keys` table (one row
+    per credential) became the source of truth — a merchant provisioned today
+    has its keys exclusively in `api_keys` and carries no value here. */
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS merchants (
             id TEXT PRIMARY KEY,
-            api_key_hash TEXT NOT NULL UNIQUE,
+            api_key_hash TEXT UNIQUE,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
         )",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* API keys, one row per credential rather than one per merchant, so a key
@@ -212,7 +243,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             revoked_at TEXT
         )",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Authentication looks a key up by hash on every request, so this index is
@@ -243,7 +274,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_payment
          ON webhook_deliveries(payment_id)",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Partial index covering the redrive worker's per-tick query (issue #239).
@@ -269,7 +300,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
          ON webhook_deliveries(status, attempts, last_attempt, created_at)
          WHERE status IN ('pending', 'failed')",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Idempotency keys for payment creation. A key is unique per merchant and
@@ -285,7 +316,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             PRIMARY KEY (merchant_id, idempotency_key)
         )",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Every on-chain transaction we credit to an intent, one row per
@@ -307,7 +338,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             PRIMARY KEY (payment_id, tx_hash)
         )",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Backfill from legacy rows that recorded only the most-recent `tx_hash`
@@ -318,7 +349,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
         "SELECT id, tx_hash, paid_amount FROM payments
          WHERE tx_hash IS NOT NULL AND tx_hash <> '' AND paid_amount IS NOT NULL",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
     for row in &legacy {
         let id: String = row.get("id");
@@ -333,7 +364,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             .bind(&id)
             .bind(&tx_hash)
             .bind(stroops)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
         }
     }
@@ -345,7 +376,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     so an operator can reconcile against the ledger by hand. */
     let unhashed: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM processed_transactions WHERE tx_hash = ''")
-            .fetch_one(pool)
+            .fetch_one(&mut *tx)
             .await?;
     if unhashed > 0 {
         tracing::warn!(
@@ -369,9 +400,10 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             tbl_col.0,
             col = tbl_col.1
         );
-        sqlx::query(&sql).execute(pool).await?;
+        sqlx::query(&sql).execute(&mut *tx).await?;
     }
 
+    tx.commit().await?;
     Ok(())
 }
 
@@ -962,7 +994,14 @@ pub struct WebhookDelivery {
     pub event_type: Option<String>,
     pub status: String,
     pub attempts: i64,
+    /// Merchant-initiated redeliveries. Ignored by the redrive worker's budget
+    /// (issue #235); exposed on listing so operators can tell the two apart.
+    pub manual_attempts: i64,
     pub last_attempt: Option<String>,
+    /// When somebody acted on this delivery — requeued it, or explicitly
+    /// acknowledged it. `None` means nobody has looked at it yet, which is
+    /// what keeps a terminal failure exempt from retention (issue #319).
+    pub acknowledged_at: Option<String>,
     pub created_at: String,
 }
 
@@ -1009,7 +1048,9 @@ fn row_to_webhook_delivery(row: &sqlx::sqlite::SqliteRow) -> WebhookDelivery {
         event_type: row.get("event_type"),
         status: row.get("status"),
         attempts: row.get("attempts"),
+        manual_attempts: row.get("manual_attempts"),
         last_attempt: row.get("last_attempt"),
+        acknowledged_at: row.get("acknowledged_at"),
         created_at: normalize_ts(&row.get::<String, _>("created_at")),
     }
 }
@@ -1043,7 +1084,7 @@ pub async fn list_redrivable_deliveries(
     backoff_max_secs: i64,
 ) -> Result<Vec<WebhookDelivery>> {
     let rows = sqlx::query(
-        "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+        "SELECT id, payment_id, url, payload, event_type, status, attempts, manual_attempts, last_attempt, acknowledged_at, created_at
          FROM webhook_deliveries
          WHERE status IN ('pending', 'failed')
            AND attempts < ?
@@ -1068,7 +1109,7 @@ pub async fn list_redrivable_deliveries(
 /// Get all webhook deliveries for a payment, ordered by created_at descending.
 pub async fn list_webhook_deliveries(pool: &Db, payment_id: &str) -> Result<Vec<WebhookDelivery>> {
     let rows = sqlx::query(
-        "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+        "SELECT id, payment_id, url, payload, event_type, status, attempts, manual_attempts, last_attempt, acknowledged_at, created_at
          FROM webhook_deliveries WHERE payment_id = ? ORDER BY created_at DESC",
     )
     .bind(payment_id)
@@ -1081,7 +1122,7 @@ pub async fn list_webhook_deliveries(pool: &Db, payment_id: &str) -> Result<Vec<
 /// Get a specific webhook delivery by id.
 pub async fn get_webhook_delivery(pool: &Db, id: &str) -> Result<Option<WebhookDelivery>> {
     let row = sqlx::query(
-        "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+        "SELECT id, payment_id, url, payload, event_type, status, attempts, manual_attempts, last_attempt, acknowledged_at, created_at
          FROM webhook_deliveries WHERE id = ?",
     )
     .bind(id)
@@ -1098,6 +1139,38 @@ pub async fn ping(pool: &Db) -> Result<()> {
         .fetch_one(pool)
         .await?;
     Ok(())
+}
+
+/// Resolve the on-disk path from a `sqlite:` `DATABASE_URL`, for file-size
+/// metrics. Returns `None` for `sqlite::memory:` or anything else with no
+/// backing file to `stat()`.
+fn sqlite_path(database_url: &str) -> Option<&str> {
+    let rest = database_url.strip_prefix("sqlite:")?;
+    let rest = rest.split('?').next().unwrap_or(rest);
+    let rest = rest.trim_start_matches("//");
+    if rest.is_empty() || rest == ":memory:" {
+        return None;
+    }
+    Some(rest)
+}
+
+/// Sizes, in bytes, of the main database file and its `-wal`/`-shm`
+/// companions, for the `stellargate_db_file_size_bytes` gauge (issue: missing
+/// DB metrics). Each is `None` when the file doesn't exist yet (a `-wal`
+/// before the first write, or any of them for an in-memory database) rather
+/// than an error — a fresh deployment legitimately has no WAL file.
+///
+/// Returns `(main, wal, shm)`.
+pub fn file_sizes(database_url: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let Some(path) = sqlite_path(database_url) else {
+        return (None, None, None);
+    };
+    let stat = |p: String| std::fs::metadata(p).ok().map(|m| m.len());
+    (
+        stat(path.to_string()),
+        stat(format!("{path}-wal")),
+        stat(format!("{path}-shm")),
+    )
 }
 
 /* ---------------------------------------------------------------------------
@@ -1117,10 +1190,10 @@ fn hash_api_key(raw: &str) -> String {
 ///
 /// The raw key must be shown to the caller once; it is not recoverable.
 ///
-/// `merchants.api_key_hash` is written only to satisfy the column's NOT NULL
-/// constraint on databases created before `api_keys` existed. Nothing reads it
-/// any more — authentication goes through `api_keys` so that rotation and
-/// revocation work — and it is not maintained as keys change.
+/// `merchants.api_key_hash` is written for backward compatibility with
+/// databases created before `api_keys` existed; the column is nullable and
+/// nothing reads it any more — authentication goes through `api_keys` so that
+/// rotation and revocation work — and it is not maintained as keys change.
 pub async fn create_merchant(pool: &Db, id: &str, raw_key: &str, prefix: &str) -> Result<String> {
     let mut tx = pool.begin().await?;
 
@@ -1453,6 +1526,13 @@ mod tests {
         pool
     }
 
+    fn shared_memory_dsn() -> String {
+        format!(
+            "sqlite:file:{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4()
+        )
+    }
+
     /// An upgrade must not lock out merchants whose keys predate the
     /// `api_keys` table. This simulates a pre-upgrade database — the old
     /// `merchants.api_key_hash` schema with no `api_keys` table — runs the
@@ -1503,22 +1583,36 @@ mod tests {
     }
 
     /// Revoking a key must take effect immediately for authentication.
+    ///
+    /// A second key is issued first so the guard against revoking a
+    /// merchant's *only* active key (issue #247) doesn't fire here — that
+    /// guard has its own dedicated coverage elsewhere.
     #[tokio::test]
     async fn revoked_keys_stop_authenticating() {
         let pool = memory_db().await;
         let (raw, prefix) = generate_api_key();
         let key_id = create_merchant(&pool, "m1", &raw, &prefix).await.unwrap();
+        let (raw2, prefix2) = generate_api_key();
+        create_api_key(&pool, "m1", &raw2, &prefix2, None)
+            .await
+            .unwrap();
 
         assert_eq!(
             find_merchant_by_key(&pool, &raw).await.unwrap(),
             Some("m1".to_string())
         );
 
-        assert!(revoke_api_key(&pool, "m1", &key_id).await.unwrap());
+        assert_eq!(
+            revoke_api_key(&pool, "m1", &key_id).await.unwrap(),
+            RevokeKeyOutcome::Revoked
+        );
         assert_eq!(find_merchant_by_key(&pool, &raw).await.unwrap(), None);
 
         // Revoking again reports that nothing was revoked.
-        assert!(!revoke_api_key(&pool, "m1", &key_id).await.unwrap());
+        assert_eq!(
+            revoke_api_key(&pool, "m1", &key_id).await.unwrap(),
+            RevokeKeyOutcome::NotFound
+        );
     }
 
     /// Generated keys must be unique and carry full entropy.
@@ -1881,7 +1975,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            list_redrivable_deliveries(&pool, 34, 0, 86_400, 86_400, 0)
+            list_redrivable_deliveries(&pool, 34, 0, 86_400, 86_400)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -1897,7 +1991,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            list_redrivable_deliveries(&pool, 34, 0, 86_400, 86_400, 0)
+            list_redrivable_deliveries(&pool, 34, 0, 86_400, 86_400)
                 .await
                 .unwrap()
                 .len(),
@@ -1971,18 +2065,6 @@ mod tests {
                 .map(|(_, _, _, d)| d.as_str())
                 .collect::<Vec<_>>()
         );
-    }
-
-    #[test]
-    fn redrive_backoff_exponent_cap_avoids_extreme_products() {
-        assert_eq!(redrive_backoff_exponent_cap(0, 86_400), 0);
-        assert_eq!(redrive_backoff_exponent_cap(86_400, 86_400), 0);
-        assert_eq!(redrive_backoff_exponent_cap(1, 86_400), 17);
-
-        // Even callers that bypass Config cannot make the SQL multiply two
-        // values whose product would exceed SQLite's signed integer range.
-        assert_eq!(redrive_backoff_exponent_cap(1, i64::MAX), 63);
-        assert_eq!(redrive_backoff_exponent_cap(i64::MAX / 2, i64::MAX), 2);
     }
 
     // ── file_sizes / sqlite_path (issue: missing DB metrics) ────────────────

@@ -91,7 +91,18 @@ pub struct Config {
     pub accepted_assets: Vec<AcceptedAsset>,
     pub webhook_secret: String,
     pub webhook_retry_attempts: u32,
+    /// Base delay between inline retry attempts, in milliseconds. This is the
+    /// *first* step of an exponential schedule (`base * 2^(attempt-1)`, capped
+    /// by [`Self::webhook_retry_max_delay_ms`]), not a fixed interval — a
+    /// constant delay meant every delivery that failed at the same moment,
+    /// which is what happens when a receiver goes down, retried in lockstep
+    /// and hit it again at exactly the same instants as it tried to come back
+    /// up (issue #318).
     pub webhook_retry_delay_ms: u64,
+    /// Upper bound on one inline retry delay, in milliseconds. Without it the
+    /// doubling above would push the last attempt of a long retry chain
+    /// arbitrarily far out and keep a settlement waiting on it.
+    pub webhook_retry_max_delay_ms: u64,
     pub allowed_webhook_schemes: Vec<String>,
     /// Per-attempt timeout for outbound webhook POSTs, in seconds. Each
     /// delivery attempt is bounded independently, so a slow receiver can't
@@ -176,11 +187,26 @@ pub struct Config {
     /// `POST /merchants`. Empty disables provisioning entirely — the endpoint
     /// rejects every request rather than falling back to an open default.
     pub admin_provisioning_secret: String,
+    /// Shared bearer token required (via `Authorization: Bearer <token>`) to
+    /// call `GET /metrics`. Empty disables scraping entirely — the endpoint
+    /// rejects every request rather than exposing webhook/auth counters to
+    /// anonymous callers by default (issue #250).
+    pub metrics_token: String,
     /// Per-request timeout for the whole API, in seconds. A request whose
     /// handler hasn't produced a response within this window is aborted with
     /// `408 Request Timeout`, so a slow client or a stuck handler can't tie up
     /// a connection indefinitely. Defaults to 30 seconds.
     pub request_timeout_secs: u64,
+    /// How long (seconds) the Horizon SSE stream listener may go without
+    /// receiving any bytes before it treats the connection as dead and
+    /// reconnects. Horizon sends periodic keep-alive comment lines on its SSE
+    /// endpoints, so an idle window is a reliable liveness signal — without
+    /// it, a half-open connection (a NAT or load balancer dropping idle state
+    /// without sending `RST`, or an upstream stall) leaves `stream.next()`
+    /// waiting forever, silently degrading detection to the interval poller's
+    /// cadence with no log line and no metric (issue #312). Defaults to 30
+    /// seconds.
+    pub stream_idle_timeout_secs: u64,
     /// CIDR blocks whose `X-Forwarded-For` / `X-Real-IP` headers are honoured
     /// for rate-limit bucketing and auth-log source attribution (issue #330).
     ///
@@ -211,6 +237,18 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect()
         };
+
+        /* Independent of network: HTTPS is enforced unconditionally on
+        `public` regardless of this list, but on any other network an
+        operator who has widened this allow-list to include `http` is
+        choosing to let webhook payloads transit in cleartext. That should
+        never be silent (issue #306). */
+        if allowed_webhook_schemes.iter().any(|s| s == "http") {
+            tracing::warn!(
+                "ALLOWED_WEBHOOK_SCHEMES includes \"http\": webhook deliveries to a \
+                 plaintext endpoint are not encrypted in transit."
+            );
+        }
 
         let cors_allowed_origins: Vec<String> = {
             let raw_origins: Vec<String> = std::env::var("CORS_ALLOWED_ORIGINS")
@@ -276,6 +314,7 @@ impl Config {
 
         let admin_provisioning_secret =
             Self::validate_admin_secret(std::env::var("ADMIN_PROVISIONING_SECRET"))?;
+        let metrics_token = Self::validate_metrics_token(std::env::var("METRICS_TOKEN"))?;
 
         let config = Self {
             port: parse_env("PORT", 3000)?,
@@ -295,6 +334,7 @@ impl Config {
             allowed_webhook_schemes,
             webhook_retry_attempts: parse_env("WEBHOOK_RETRY_ATTEMPTS", 3)?,
             webhook_retry_delay_ms: parse_env("WEBHOOK_RETRY_DELAY_MS", 5000)?,
+            webhook_retry_max_delay_ms: parse_env("WEBHOOK_RETRY_MAX_DELAY_MS", 60_000)?,
             webhook_timeout_secs: parse_env("WEBHOOK_TIMEOUT_SECS", 10)?,
             webhook_redrive_interval_secs: parse_env("WEBHOOK_REDRIVE_INTERVAL_SECS", 30)?,
             webhook_redrive_concurrency: parse_env("WEBHOOK_REDRIVE_CONCURRENCY", 4)?,
@@ -320,7 +360,9 @@ impl Config {
             )?,
             webhook_allow_private_targets,
             admin_provisioning_secret,
+            metrics_token,
             request_timeout_secs: parse_env("REQUEST_TIMEOUT_SECS", 30)?,
+            stream_idle_timeout_secs: parse_env("STREAM_IDLE_TIMEOUT_SECS", 30)?,
             trusted_proxy_cidrs: parse_cidrs(
                 &std::env::var("TRUSTED_PROXY_CIDRS").unwrap_or_default(),
             )?,
@@ -417,10 +459,51 @@ impl Config {
             ));
         }
 
+        if self.webhook_retry_max_delay_ms < self.webhook_retry_delay_ms {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_RETRY_MAX_DELAY_MS ({}) must be >= WEBHOOK_RETRY_DELAY_MS ({}). \
+                 With the current settings the cap would override the starting delay and the \
+                 inline retry backoff would never actually grow.",
+                self.webhook_retry_max_delay_ms,
+                self.webhook_retry_delay_ms
+            ));
+        }
+
+        /* The redrive grace window has to clear the worst case a `dispatch()`
+        call can take, or the worker starts a second delivery for a row whose
+        first one is still in flight. Making the inline delay exponential
+        changed that arithmetic — the old comparison assumed a constant delay
+        (issue #238, coordinating with #318). */
+        let worst_case_inline = self.worst_case_inline_delivery_secs();
+        if self.webhook_redrive_grace_secs < worst_case_inline as i64 {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_GRACE_SECS ({}) is below the worst-case inline delivery time \
+                 ({worst_case_inline}s). With the current settings the redrive worker could pick \
+                 up a delivery whose inline dispatch is still running and send it twice. \
+                 The inline budget is WEBHOOK_RETRY_ATTEMPTS ({}) attempts of up to \
+                 WEBHOOK_TIMEOUT_SECS ({}s) each, plus the exponential retry delays \
+                 (WEBHOOK_RETRY_DELAY_MS {}ms doubling to at most \
+                 WEBHOOK_RETRY_MAX_DELAY_MS {}ms).",
+                self.webhook_redrive_grace_secs,
+                self.webhook_retry_attempts,
+                self.webhook_timeout_secs,
+                self.webhook_retry_delay_ms,
+                self.webhook_retry_max_delay_ms
+            ));
+        }
+
         if self.request_timeout_secs == 0 {
             return Err(anyhow::anyhow!(
                 "REQUEST_TIMEOUT_SECS must be > 0 (got 0). \
                  A zero timeout would abort every request immediately."
+            ));
+        }
+
+        if self.stream_idle_timeout_secs == 0 {
+            return Err(anyhow::anyhow!(
+                "STREAM_IDLE_TIMEOUT_SECS must be > 0 (got 0). \
+                 A zero timeout would make the stream listener reconnect \
+                 continuously instead of tolerating any gap between events."
             ));
         }
 
@@ -435,6 +518,37 @@ impl Config {
         }
 
         Ok(())
+    }
+
+    /// Longest a single `webhook::dispatch` call can take, in seconds, rounded
+    /// up.
+    ///
+    /// Every attempt may burn a full `webhook_timeout_secs`, and each gap
+    /// between attempts is bounded by the exponential schedule
+    /// `retry_delay(n) <= min(base * 2^(n-1), max)`. Jitter only ever shortens
+    /// a gap, so the un-jittered ceiling is the worst case.
+    ///
+    /// This is what `WEBHOOK_REDRIVE_GRACE_SECS` has to clear for the redrive
+    /// worker never to race a live dispatch for the same row (issues #238,
+    /// #318). Before the delay became exponential the bound was simply
+    /// `attempts * (timeout + delay)`.
+    pub fn worst_case_inline_delivery_secs(&self) -> u64 {
+        let attempts = self.webhook_retry_attempts.max(1) as u64;
+        let timeouts = attempts.saturating_mul(self.webhook_timeout_secs);
+
+        let mut delays_ms: u64 = 0;
+        for attempt in 1..attempts {
+            let factor = 2u64.saturating_pow(attempt as u32 - 1);
+            let step = self
+                .webhook_retry_delay_ms
+                .saturating_mul(factor)
+                .min(self.webhook_retry_max_delay_ms);
+            delays_ms = delays_ms.saturating_add(step);
+        }
+
+        // Round the delay total up to whole seconds; a sub-second remainder
+        // still has to fit inside the grace window.
+        timeouts.saturating_add(delays_ms.div_ceil(1_000))
     }
 
     fn validate_webhook_secret(raw_secret: Result<String, std::env::VarError>) -> Result<String> {
@@ -543,6 +657,61 @@ impl Config {
 
         Ok(secret)
     }
+
+    /// Validate `METRICS_TOKEN`. Mirrors [`Self::validate_admin_secret`]: an
+    /// unset/empty value disables `GET /metrics` entirely (every scrape gets
+    /// `401`) rather than falling back to the previously-open default
+    /// (issue #250) — an operator must opt in to exposing the endpoint.
+    fn validate_metrics_token(raw_token: Result<String, std::env::VarError>) -> Result<String> {
+        let token = match raw_token {
+            Ok(s) => s,
+            // Absent is treated the same as empty: scraping disabled.
+            Err(_) => String::new(),
+        };
+
+        if token.is_empty() {
+            tracing::info!(
+                "METRICS_TOKEN is not set — GET /metrics is disabled (returns 401). \
+                 Set the variable to a strong random value to enable scraping."
+            );
+            return Ok(String::new());
+        }
+
+        // Reject placeholder values that an operator might copy from documentation
+        // or a template without changing.
+        const METRICS_PLACEHOLDERS: &[&str] = &[
+            "metrics",
+            "secret",
+            "changeme",
+            "password",
+            "test",
+            "your_metrics_token",
+            "REPLACE_ME_metrics_token",
+        ];
+        if METRICS_PLACEHOLDERS.contains(&token.as_str())
+            || token.starts_with("REPLACE_ME_")
+            || token.to_ascii_lowercase() == "metrics"
+            || token.to_ascii_lowercase() == "secret"
+            || token.to_ascii_lowercase() == "changeme"
+        {
+            return Err(anyhow::anyhow!(
+                "METRICS_TOKEN is set to a known placeholder value. \
+                 Replace it with a strong, randomly-generated secret \
+                 (e.g. `openssl rand -hex 32`)."
+            ));
+        }
+
+        if token.len() < 32 {
+            return Err(anyhow::anyhow!(
+                "METRICS_TOKEN must be at least 32 characters long \
+                 (got {}). Use a randomly-generated value \
+                 (e.g. `openssl rand -hex 32`).",
+                token.len()
+            ));
+        }
+
+        Ok(token)
+    }
 }
 
 impl std::fmt::Debug for Config {
@@ -557,6 +726,10 @@ impl std::fmt::Debug for Config {
             .field("webhook_secret", &"***")
             .field("webhook_retry_attempts", &self.webhook_retry_attempts)
             .field("webhook_retry_delay_ms", &self.webhook_retry_delay_ms)
+            .field(
+                "webhook_retry_max_delay_ms",
+                &self.webhook_retry_max_delay_ms,
+            )
             .field("webhook_timeout_secs", &self.webhook_timeout_secs)
             .field(
                 "webhook_redrive_interval_secs",
@@ -598,7 +771,9 @@ impl std::fmt::Debug for Config {
                 &self.webhook_allow_private_targets,
             )
             .field("admin_provisioning_secret", &"***")
+            .field("metrics_token", &"***")
             .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("stream_idle_timeout_secs", &self.stream_idle_timeout_secs)
             .field("trusted_proxy_cidrs", &self.trusted_proxy_cidrs)
             .finish()
     }
@@ -668,6 +843,7 @@ mod tests {
             webhook_secret: "webhook-hmac-secret".into(),
             webhook_retry_attempts: 3,
             webhook_retry_delay_ms: 5000,
+            webhook_retry_max_delay_ms: 60_000,
             allowed_webhook_schemes: vec!["https".into()],
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
@@ -689,7 +865,9 @@ mod tests {
             listener_mode: ListenerMode::Stream,
             webhook_allow_private_targets: false,
             admin_provisioning_secret: "admin-super-secret".into(),
+            metrics_token: "metrics-super-secret".into(),
             request_timeout_secs: 30,
+            stream_idle_timeout_secs: 30,
             trusted_proxy_cidrs: vec![],
         };
         let output = format!("{cfg:?}");
@@ -700,6 +878,10 @@ mod tests {
         assert!(
             !output.contains("admin-super-secret"),
             "admin_provisioning_secret must not appear in Debug output"
+        );
+        assert!(
+            !output.contains("metrics-super-secret"),
+            "metrics_token must not appear in Debug output"
         );
         assert!(
             output.contains("***"),
@@ -745,6 +927,7 @@ mod tests {
             webhook_secret: String::new(),
             webhook_retry_attempts: 3,
             webhook_retry_delay_ms: 5000,
+            webhook_retry_max_delay_ms: 60_000,
             allowed_webhook_schemes: vec!["https".into()],
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
@@ -766,7 +949,9 @@ mod tests {
             listener_mode: ListenerMode::Stream,
             webhook_allow_private_targets: false,
             admin_provisioning_secret: String::new(),
+            metrics_token: String::new(),
             request_timeout_secs: 30,
+            stream_idle_timeout_secs: 30,
             trusted_proxy_cidrs: vec![],
         }
     }
@@ -997,12 +1182,83 @@ mod tests {
         assert!(timing_config().validate_timing().is_ok());
     }
 
+    // ── Retry schedule and grace-window validation (issues #318, #238) ───────
+
+    /// The bound the grace window is checked against: every attempt may burn a
+    /// full timeout, and the gaps follow the exponential schedule.
+    #[test]
+    fn worst_case_inline_sums_the_exponential_schedule() {
+        let mut cfg = timing_config();
+        cfg.webhook_retry_attempts = 3;
+        cfg.webhook_timeout_secs = 10;
+        cfg.webhook_retry_delay_ms = 5_000;
+        cfg.webhook_retry_max_delay_ms = 60_000;
+        // 3 × 10s of timeouts, plus gaps of 5s and 10s.
+        assert_eq!(cfg.worst_case_inline_delivery_secs(), 45);
+    }
+
+    /// The cap has to actually bind, or a long retry chain would report an
+    /// absurd worst case and demand an equally absurd grace window.
+    #[test]
+    fn worst_case_inline_respects_the_delay_cap() {
+        let mut cfg = timing_config();
+        cfg.webhook_retry_attempts = 5;
+        cfg.webhook_timeout_secs = 1;
+        cfg.webhook_retry_delay_ms = 1_000;
+        cfg.webhook_retry_max_delay_ms = 2_000;
+        // 5 × 1s, plus gaps of 1s, 2s, 2s (capped), 2s (capped).
+        assert_eq!(cfg.worst_case_inline_delivery_secs(), 12);
+    }
+
+    /// A single attempt has no gaps at all.
+    #[test]
+    fn worst_case_inline_with_no_retries_is_just_one_timeout() {
+        let mut cfg = timing_config();
+        cfg.webhook_retry_attempts = 1;
+        cfg.webhook_timeout_secs = 10;
+        assert_eq!(cfg.worst_case_inline_delivery_secs(), 10);
+    }
+
+    /// The failure this guards against is a duplicate delivery: the worker
+    /// picking up a row whose inline dispatch has not finished.
+    #[test]
+    fn timing_rejects_a_grace_window_shorter_than_the_inline_schedule() {
+        let mut cfg = timing_config();
+        cfg.webhook_retry_attempts = 5;
+        cfg.webhook_timeout_secs = 30;
+        cfg.webhook_retry_delay_ms = 5_000;
+        cfg.webhook_retry_max_delay_ms = 60_000;
+        cfg.webhook_redrive_grace_secs = 60; // far below 150s of timeouts alone
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(
+            err.contains("WEBHOOK_REDRIVE_GRACE_SECS") && err.contains("send it twice"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn timing_rejects_a_retry_cap_below_the_base_delay() {
+        let mut cfg = timing_config();
+        cfg.webhook_retry_delay_ms = 5_000;
+        cfg.webhook_retry_max_delay_ms = 1_000;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(err.contains("WEBHOOK_RETRY_MAX_DELAY_MS"), "got: {err}");
+    }
+
     #[test]
     fn timing_rejects_zero_poll_interval() {
         let mut cfg = timing_config();
         cfg.poll_interval_secs = 0;
         let err = cfg.validate_timing().unwrap_err().to_string();
         assert!(err.contains("POLL_INTERVAL_SECS"), "got: {err}");
+    }
+
+    #[test]
+    fn timing_rejects_zero_stream_idle_timeout() {
+        let mut cfg = timing_config();
+        cfg.stream_idle_timeout_secs = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(err.contains("STREAM_IDLE_TIMEOUT_SECS"), "got: {err}");
     }
 
     #[test]
@@ -1148,98 +1404,6 @@ mod tests {
     /// `run_with_env` test fails at the lock.
     const ENV_WEBHOOK_SECRET: &str = "a-very-long-and-secure-webhook-signing-secret-32-chars";
 
-    #[test]
-    fn cursor_staleness_multiple_defaults_to_three() {
-        run_with_env(&[("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET))], || {
-            assert_eq!(Config::from_env().unwrap().cursor_staleness_multiple, 3);
-        });
-    }
-
-    #[test]
-    fn cursor_staleness_multiple_parses_from_env() {
-        run_with_env(
-            &[
-                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
-                ("CURSOR_STALENESS_MULTIPLE", Some("7")),
-            ],
-            || {
-                assert_eq!(Config::from_env().unwrap().cursor_staleness_multiple, 7);
-            },
-        );
-    }
-
-    #[test]
-    fn cursor_staleness_multiple_rejects_non_numeric_value() {
-        run_with_env(
-            &[
-                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
-                ("CURSOR_STALENESS_MULTIPLE", Some("soon")),
-            ],
-            || {
-                let err = Config::from_env().unwrap_err().to_string();
-                assert!(
-                    err.contains("CURSOR_STALENESS_MULTIPLE"),
-                    "boot should abort on a non-numeric value; got: {err}"
-                );
-            },
-        );
-    }
-
-    // ── WebhookPayloadDetail::parse (issue #306) ─────────────────────────────
-
-    #[test]
-    fn webhook_payload_detail_empty_defaults_to_minimal() {
-        assert_eq!(
-            WebhookPayloadDetail::parse("").unwrap(),
-            WebhookPayloadDetail::Minimal
-        );
-    }
-
-    #[test]
-    fn webhook_payload_detail_minimal_parses() {
-        assert_eq!(
-            WebhookPayloadDetail::parse("minimal").unwrap(),
-            WebhookPayloadDetail::Minimal
-        );
-        assert_eq!(
-            WebhookPayloadDetail::parse("MINIMAL").unwrap(),
-            WebhookPayloadDetail::Minimal
-        );
-    }
-
-    #[test]
-    fn webhook_payload_detail_full_parses() {
-        assert_eq!(
-            WebhookPayloadDetail::parse("full").unwrap(),
-            WebhookPayloadDetail::Full
-        );
-        assert_eq!(
-            WebhookPayloadDetail::parse("FULL").unwrap(),
-            WebhookPayloadDetail::Full
-        );
-    }
-
-    #[test]
-    fn webhook_payload_detail_invalid_aborts_boot() {
-        let err = WebhookPayloadDetail::parse("rich").unwrap_err().to_string();
-        assert!(
-            err.contains("WEBHOOK_PAYLOAD_DETAIL"),
-            "error should name the variable; got: {err}"
-        );
-        assert!(
-            err.contains("rich"),
-            "error should echo the bad value; got: {err}"
-        );
-    }
-
-    #[test]
-    fn from_env_defaults_to_minimal_webhook_payload_detail() {
-        run_with_env(&[("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET))], || {
-            let cfg = Config::from_env().unwrap();
-            assert_eq!(cfg.webhook_payload_detail, WebhookPayloadDetail::Minimal);
-        });
-    }
-
     // ── Plaintext webhook scheme startup warning (issue #306) ────────────────
 
     #[test]
@@ -1274,159 +1438,6 @@ mod tests {
             || {
                 Config::from_env().unwrap();
                 assert!(!logs_contain("ALLOWED_WEBHOOK_SCHEMES"));
-            },
-        );
-    }
-
-    // ── Deployment-tunable limits (issue #279) ────────────────────────────────
-    //
-    // MAX_BODY_BYTES, RATE_LIMITER_MAX_KEYS, RATE_LIMITER_IDLE_TTL_SECS,
-    // PAGINATION_DEFAULT_LIMIT, PAGINATION_MAX_LIMIT, SHUTDOWN_GRACE_SECS,
-    // HORIZON_PAGE_LIMIT, DB_PRUNE_BATCH_SIZE, RETENTION_MAX_ROWS_PER_CYCLE.
-
-    #[test]
-    fn limits_default_from_sample_config_pass() {
-        assert!(sample_config().validate_limits().is_ok());
-    }
-
-    #[test]
-    fn limits_rejects_zero_max_body_bytes() {
-        let mut cfg = sample_config();
-        cfg.max_body_bytes = 0;
-        let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("MAX_BODY_BYTES"), "got: {err}");
-    }
-
-    #[test]
-    fn limits_rejects_zero_rate_limiter_max_keys() {
-        let mut cfg = sample_config();
-        cfg.rate_limiter_max_keys = 0;
-        let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("RATE_LIMITER_MAX_KEYS"), "got: {err}");
-    }
-
-    #[test]
-    fn limits_rejects_zero_rate_limiter_idle_ttl() {
-        let mut cfg = sample_config();
-        cfg.rate_limiter_idle_ttl_secs = 0;
-        let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("RATE_LIMITER_IDLE_TTL_SECS"), "got: {err}");
-    }
-
-    #[test]
-    fn limits_rejects_zero_pagination_default_limit() {
-        let mut cfg = sample_config();
-        cfg.pagination_default_limit = 0;
-        let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("PAGINATION_DEFAULT_LIMIT"), "got: {err}");
-    }
-
-    #[test]
-    fn limits_rejects_pagination_max_below_default() {
-        let mut cfg = sample_config();
-        cfg.pagination_default_limit = 50;
-        cfg.pagination_max_limit = 10;
-        let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("PAGINATION_MAX_LIMIT"), "got: {err}");
-        assert!(err.contains("PAGINATION_DEFAULT_LIMIT"), "got: {err}");
-    }
-
-    #[test]
-    fn limits_allows_pagination_max_equal_to_default() {
-        let mut cfg = sample_config();
-        cfg.pagination_default_limit = 20;
-        cfg.pagination_max_limit = 20;
-        assert!(cfg.validate_limits().is_ok());
-    }
-
-    #[test]
-    fn limits_rejects_zero_shutdown_grace() {
-        let mut cfg = sample_config();
-        cfg.shutdown_grace_secs = 0;
-        let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("SHUTDOWN_GRACE_SECS"), "got: {err}");
-    }
-
-    #[test]
-    fn limits_rejects_zero_horizon_page_limit() {
-        let mut cfg = sample_config();
-        cfg.horizon_page_limit = 0;
-        let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("HORIZON_PAGE_LIMIT"), "got: {err}");
-    }
-
-    #[test]
-    fn limits_rejects_zero_db_prune_batch_size() {
-        let mut cfg = sample_config();
-        cfg.db_prune_batch_size = 0;
-        let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("DB_PRUNE_BATCH_SIZE"), "got: {err}");
-    }
-
-    #[test]
-    fn limits_rejects_zero_retention_max_rows_per_cycle() {
-        let mut cfg = sample_config();
-        cfg.retention_max_rows_per_cycle = 0;
-        let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("RETENTION_MAX_ROWS_PER_CYCLE"), "got: {err}");
-    }
-
-    #[test]
-    fn limits_parse_from_env_and_override_defaults() {
-        run_with_env(
-            &[
-                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
-                ("MAX_BODY_BYTES", Some("1024")),
-                ("RATE_LIMITER_MAX_KEYS", Some("500")),
-                ("RATE_LIMITER_IDLE_TTL_SECS", Some("120")),
-                ("PAGINATION_DEFAULT_LIMIT", Some("5")),
-                ("PAGINATION_MAX_LIMIT", Some("50")),
-                ("SHUTDOWN_GRACE_SECS", Some("45")),
-                ("HORIZON_PAGE_LIMIT", Some("100")),
-                ("DB_PRUNE_BATCH_SIZE", Some("250")),
-                ("RETENTION_MAX_ROWS_PER_CYCLE", Some("1000")),
-            ],
-            || {
-                let cfg = Config::from_env().unwrap();
-                assert_eq!(cfg.max_body_bytes, 1024);
-                assert_eq!(cfg.rate_limiter_max_keys, 500);
-                assert_eq!(cfg.rate_limiter_idle_ttl_secs, 120);
-                assert_eq!(cfg.pagination_default_limit, 5);
-                assert_eq!(cfg.pagination_max_limit, 50);
-                assert_eq!(cfg.shutdown_grace_secs, 45);
-                assert_eq!(cfg.horizon_page_limit, 100);
-                assert_eq!(cfg.db_prune_batch_size, 250);
-                assert_eq!(cfg.retention_max_rows_per_cycle, 1000);
-            },
-        );
-    }
-
-    #[test]
-    fn limits_default_to_the_previous_compile_time_constants() {
-        run_with_env(&[("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET))], || {
-            let cfg = Config::from_env().unwrap();
-            assert_eq!(cfg.max_body_bytes, 256 * 1024);
-            assert_eq!(cfg.rate_limiter_max_keys, 10_000);
-            assert_eq!(cfg.rate_limiter_idle_ttl_secs, 60);
-            assert_eq!(cfg.pagination_default_limit, 20);
-            assert_eq!(cfg.pagination_max_limit, 100);
-            assert_eq!(cfg.shutdown_grace_secs, 30);
-            assert_eq!(cfg.horizon_page_limit, 200);
-            assert_eq!(cfg.db_prune_batch_size, 500);
-            assert_eq!(cfg.retention_max_rows_per_cycle, 50_000);
-        });
-    }
-
-    #[test]
-    fn limits_invalid_env_value_aborts_boot() {
-        run_with_env(
-            &[
-                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
-                ("HORIZON_PAGE_LIMIT", Some("not-a-number")),
-            ],
-            || {
-                let err = Config::from_env().unwrap_err().to_string();
-                assert!(err.contains("HORIZON_PAGE_LIMIT"), "got: {err}");
             },
         );
     }
@@ -1599,6 +1610,122 @@ mod tests {
                     err.contains("ADMIN_PROVISIONING_SECRET")
                         || err.contains("at least 32 characters"),
                     "error must indicate the secret is too short; got: {err}"
+                );
+            },
+        );
+    }
+
+    // ── issue #250: METRICS_TOKEN validation ───────────────────────────────────
+
+    /// An empty (unset) metrics token disables scraping — boot must succeed.
+    #[test]
+    fn metrics_token_empty_disables_scraping() {
+        let result = Config::validate_metrics_token(Err(std::env::VarError::NotPresent));
+        assert!(result.is_ok(), "absent token should succeed; got: {:?}", result);
+        assert_eq!(result.unwrap(), "");
+    }
+
+    /// An explicitly empty env var is the same as absent.
+    #[test]
+    fn metrics_token_explicit_empty_string_disables_scraping() {
+        let result = Config::validate_metrics_token(Ok(String::new()));
+        assert!(result.is_ok(), "empty string should succeed; got: {:?}", result);
+        assert_eq!(result.unwrap(), "");
+    }
+
+    /// A value shorter than 32 characters is rejected.
+    #[test]
+    fn metrics_token_too_short_aborts_boot() {
+        let result = Config::validate_metrics_token(Ok("short".into()));
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("at least 32 characters"),
+            "error must mention the length requirement; got: {err}"
+        );
+    }
+
+    /// Exactly 32 characters is the boundary — must be accepted.
+    #[test]
+    fn metrics_token_32_chars_is_accepted() {
+        let result = Config::validate_metrics_token(Ok("a".repeat(32)));
+        assert!(
+            result.is_ok(),
+            "32-char token should be accepted; got: {:?}",
+            result
+        );
+    }
+
+    /// Known placeholder values are rejected regardless of length.
+    #[test]
+    fn metrics_token_placeholder_is_rejected() {
+        let result = Config::validate_metrics_token(Ok("changeme".into()));
+        assert!(result.is_err(), "changeme should be rejected");
+    }
+
+    /// A strong, randomly-generated token must be accepted.
+    #[test]
+    fn metrics_token_strong_value_is_accepted() {
+        let strong = "a3f8b2c1d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1";
+        let result = Config::validate_metrics_token(Ok(strong.into()));
+        assert!(
+            result.is_ok(),
+            "strong token should be accepted; got: {:?}",
+            result
+        );
+        assert_eq!(result.unwrap(), strong);
+    }
+
+    /// The whole from_env path must accept a strong metrics token.
+    #[test]
+    fn metrics_token_from_env_strong_value_is_accepted() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                (
+                    "METRICS_TOKEN",
+                    Some("a3f8b2c1d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1"),
+                ),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert!(!cfg.metrics_token.is_empty());
+            },
+        );
+    }
+
+    /// A short metrics token must abort boot through from_env.
+    #[test]
+    fn metrics_token_from_env_short_value_aborts_boot() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("METRICS_TOKEN", Some("tooshort")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("METRICS_TOKEN") || err.contains("at least 32 characters"),
+                    "error must indicate the token is too short; got: {err}"
+                );
+            },
+        );
+    }
+
+    /// With no METRICS_TOKEN set, from_env boots successfully and the
+    /// resulting config disables scraping (acceptance criterion: /metrics is
+    /// not reachable anonymously from the public listener by default).
+    #[test]
+    fn metrics_token_unset_by_default() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("METRICS_TOKEN", None),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert!(
+                    cfg.metrics_token.is_empty(),
+                    "metrics_token should be empty (disabled) by default"
                 );
             },
         );

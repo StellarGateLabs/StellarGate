@@ -97,7 +97,7 @@ async fn offset_pagination_returns_each_row_exactly_once_within_one_second() {
     db::migrate(&pool).await.unwrap();
 
     let (raw_key, prefix) = db::generate_api_key();
-    db::create_merchant(&pool, "m1", &raw_key, &prefix, None)
+    db::create_merchant(&pool, "m1", &raw_key, &prefix)
         .await
         .unwrap();
 
@@ -128,7 +128,7 @@ async fn offset_pagination_returns_each_row_exactly_once_within_one_second() {
     let mut seen = std::collections::HashSet::new();
     let mut offset = 0i64;
     loop {
-        let page = db::list_payments(&pool, "m1", None, page_size, offset)
+        let (page, _total) = db::list_payments(&pool, "m1", None, page_size, offset)
             .await
             .unwrap();
         if page.is_empty() {
@@ -150,4 +150,48 @@ async fn offset_pagination_returns_each_row_exactly_once_within_one_second() {
         25,
         "offset walk must return all 25 payments exactly once"
     );
+}
+
+/// API keys must never be persisted in a recoverable form (issue #462): the
+/// only representation stored in either `merchants.api_key_hash` (legacy) or
+/// `api_keys.key_hash` (current) is a SHA-256 digest of the raw key.
+#[tokio::test]
+async fn api_keys_are_stored_hashed_not_plaintext() {
+    let pool = SqlitePoolOptions::new()
+        .min_connections(1)
+        .connect_with(
+            SqliteConnectOptions::from_str("sqlite::memory:")
+                .unwrap()
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+
+    db::migrate(&pool).await.unwrap();
+
+    let (raw_key, prefix) = db::generate_api_key();
+    db::create_merchant(&pool, "m1", &raw_key, &prefix)
+        .await
+        .unwrap();
+
+    let expected_digest = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(raw_key.as_bytes()))
+    };
+
+    let merchant_hash: String =
+        sqlx::query_scalar("SELECT api_key_hash FROM merchants WHERE id = 'm1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_ne!(merchant_hash, raw_key, "merchants.api_key_hash must not store the raw key");
+    assert_eq!(merchant_hash, expected_digest);
+
+    let key_hash: String =
+        sqlx::query_scalar("SELECT key_hash FROM api_keys WHERE merchant_id = 'm1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_ne!(key_hash, raw_key, "api_keys.key_hash must not store the raw key");
+    assert_eq!(key_hash, expected_digest);
 }

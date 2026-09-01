@@ -76,6 +76,7 @@ mod tests {
             webhook_secret: "a-very-long-and-secure-webhook-signing-secret-32-chars".into(),
             webhook_retry_attempts: 1,
             webhook_retry_delay_ms: 0,
+            webhook_retry_max_delay_ms: 60_000,
             allowed_webhook_schemes: vec!["https".into()],
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
@@ -98,7 +99,10 @@ mod tests {
             // Allow loopback targets so tests can dispatch to a wiremock server.
             webhook_allow_private_targets: webhook_url_allowed,
             admin_provisioning_secret: String::new(),
+            metrics_token: String::new(),
             request_timeout_secs: 30,
+            stream_idle_timeout_secs: 30,
+            trusted_proxy_cidrs: vec![],
         }
     }
 
@@ -120,6 +124,9 @@ mod tests {
             webhook_metrics: crate::metrics::WebhookMetrics::new(),
             auth_metrics: crate::metrics::AuthMetrics::new(),
             horizon_metrics: crate::metrics::HorizonMetrics::new(),
+            trustline_metrics: crate::metrics::TrustlineMetrics::new(),
+            http_metrics: crate::metrics::HttpMetrics::new(),
+            payment_metrics: crate::metrics::PaymentMetrics::new(),
             task_health: crate::TaskHealth::new(),
         }
     }
