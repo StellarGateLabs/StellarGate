@@ -739,6 +739,17 @@ pub async fn list_payments_keyset(
     Ok(rows.iter().map(row_to_payment).collect())
 }
 
+pub async fn payments_summary(pool: &Db, merchant_id: &str) -> Result<Vec<(String, i64)>> {
+    let rows = sqlx::query_as::<_, (String, i64)>(
+        "SELECT status, COUNT(*) FROM payments WHERE merchant_id = ? GROUP BY status ORDER BY status",
+    )
+    .bind(merchant_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
 /// All payments still awaiting confirmation or top-up, oldest first. Rows whose
 /// TTL has elapsed are excluded even if the sweeper hasn't transitioned them
 /// yet, so an overdue intent is never polled.

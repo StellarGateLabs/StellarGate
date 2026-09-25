@@ -335,6 +335,7 @@ fn api_v1(
         axum::Router::new()
             .merge(payments_authed)
             .merge(redeliver)
+            .route("/summary", get(payments::summary))
             .route("/{id}", get(payments::get_by_id)),
     )
 }

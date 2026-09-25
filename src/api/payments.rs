@@ -521,6 +521,14 @@ pub async fn list(
     }
 }
 
+pub async fn summary(
+    State(state): State<Arc<AppState>>,
+    Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
+) -> Result<Json<Value>, AppError> {
+    let summary = db::payments_summary(&state.pool, &merchant_id).await?;
+    Ok(Json(json!({ "summary": summary })))
+}
+
 fn encode_cursor(ts: &str, id: &str) -> String {
     hex::encode(format!("{ts}\t{id}"))
 }
@@ -623,15 +631,7 @@ pub async fn list_webhooks(
 
     Ok(Json(json!({
         "payment_id": payment.id,
-        "deliveries": deliveries.iter().map(|d| json!({
-            "id": d.id,
-            "url": d.url,
-            "event": d.event(),
-            "status": d.status,
-            "attempts": d.attempts,
-            "last_attempt": d.last_attempt,
-            "created_at": d.created_at,
-        })).collect::<Vec<_>>(),
+        "deliveries": deliveries.iter().map(delivery_to_json).collect::<Vec<_>>(),
     })))
 }
 

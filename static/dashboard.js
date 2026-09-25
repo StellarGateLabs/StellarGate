@@ -17,6 +17,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
 
   var API_BASE = "/v1";
   var KEY_NAME = "stellargate.apiKey";
+  var KEY_SAVED_AT = "stellargate.apiKeySavedAt";
 
   var state = {
     key: null,
@@ -133,6 +134,10 @@ import { fmtTime, shortId } from "/dashboard/format.js";
         KEY_NAME,
         key
       );
+      (persist ? window.localStorage : window.sessionStorage).setItem(
+        KEY_SAVED_AT,
+        String(Date.now())
+      );
     } catch (e) {
       /* non-fatal: the key still works for this page load */
     }
@@ -169,14 +174,17 @@ import { fmtTime, shortId } from "/dashboard/format.js";
 
   function signIn(key, persist) {
     state.key = key;
+    readHashState();
     // Validate by making the cheapest authenticated call available.
     return api("/payments?limit=1").then(function () {
       if (persist !== null) storeKey(key, persist);
       show($("gate"), false);
       show($("app"), true);
       setError($("gate-error"), null);
+      updateSessionExpiry();
       loadVersion();
       pollHealth();
+      loadSummary();
       reload();
     });
   }
@@ -222,6 +230,23 @@ import { fmtTime, shortId } from "/dashboard/format.js";
       });
   }
 
+  function loadSummary() {
+    api("/payments/summary")
+      .then(function (body) {
+        var summary = $("summary");
+        clear(summary);
+        (body.summary || []).forEach(function (row) {
+          var card = el("div", "summary-card");
+          card.appendChild(el("span", "muted small", row[0]));
+          card.appendChild(el("strong", null, row[1]));
+          summary.appendChild(card);
+        });
+      })
+      .catch(function () {
+        clear($("summary"));
+      });
+  }
+
   function appendRow(p) {
     var tr = document.createElement("tr");
     tr.tabIndex = 0;
@@ -231,16 +256,10 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     statusCell.appendChild(el("span", pillClass(p.status), p.status));
     tr.appendChild(statusCell);
 
-    [
-      ["Amount", p.amount + " " + p.asset, null],
-      ["Memo", p.memo, "mono"],
-      ["Created", fmtTime(p.created_at), null],
-      ["Payment ID", shortId(p.id), "mono"],
-    ].forEach(function (pair) {
-      var td = el("td", pair[2], pair[1]);
-      td.setAttribute("data-label", pair[0]);
-      tr.appendChild(td);
-    });
+    tr.appendChild(el("td", null, formatAmount(p.amount, p.asset)));
+    tr.appendChild(el("td", "mono", p.memo));
+    tr.appendChild(el("td", null, fmtTime(p.created_at)));
+    tr.appendChild(el("td", "mono", shortId(p.id)));
 
     tr.addEventListener("click", function () {
       openDetail(p.id);
@@ -271,8 +290,8 @@ import { fmtTime, shortId } from "/dashboard/format.js";
       .then(function (p) {
         [
           ["Status", p.status],
-          ["Amount", p.amount + " " + p.asset],
-          ["Received", p.paid_amount ? p.paid_amount + " " + p.asset : "—"],
+          ["Amount", formatAmount(p.amount, p.asset)],
+          ["Received", p.paid_amount ? formatAmount(p.paid_amount, p.asset) : "—"],
           ["Memo", p.memo],
           ["Destination", p.destination_address],
           ["Transaction", p.tx_hash || "—"],
@@ -282,13 +301,21 @@ import { fmtTime, shortId } from "/dashboard/format.js";
           ["Merchant", p.merchant_id],
           ["Created", fmtTime(p.created_at)],
           ["Updated", fmtTime(p.updated_at)],
-          ["Expires", fmtTime(p.expires_at)],
+          ["Expires", fmtTime(p.expires_at) + (p.status === "pending" ? " (" + countdown(p.expires_at) + " left)" : "")],
         ].forEach(function (pair) {
           fields.appendChild(el("dt", null, pair[0]));
           if (pair[0] === "Status") {
             var dd = document.createElement("dd");
             dd.appendChild(el("span", pillClass(p.status), p.status));
             fields.appendChild(dd);
+          } else if (pair[0] === "Transaction" && p.tx_hash) {
+            var tx = document.createElement("dd");
+            var link = el("a", "mono", shortId(p.tx_hash));
+            link.href = explorerTx(p.tx_hash);
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+            tx.appendChild(link);
+            fields.appendChild(tx);
           } else {
             fields.appendChild(el("dd", "mono", pair[1]));
           }
@@ -334,12 +361,23 @@ import { fmtTime, shortId } from "/dashboard/format.js";
       el(
         "div",
         "delivery-meta",
-        "attempt " + d.attempts + " · last " + fmtTime(d.last_attempt)
+        "attempt " + d.attempts + " · manual " + (d.manual_attempts || 0)
       )
     );
+    li.appendChild(el("div", "delivery-meta", "last: " + relativeTime(d.last_attempt)));
+    li.lastChild.title = fmtTime(d.last_attempt);
+    li.appendChild(el("div", "delivery-meta", "created: " + relativeTime(d.created_at)));
+    li.lastChild.title = fmtTime(d.created_at);
+    if (d.status === "failed") {
+      li.appendChild(el("div", "error", "Last delivery failed; check receiver logs or redeliver."));
+    }
+    if (d.status !== "delivered") {
+      li.appendChild(el("div", "delivery-meta", "retry state: queued for redrive if attempts remain"));
+    }
 
     var button = el("button", "ghost", "Redeliver");
     button.addEventListener("click", function () {
+      if (!window.confirm("Redeliver this webhook now?")) return;
       button.disabled = true;
       button.textContent = "Sending…";
       api(
@@ -357,7 +395,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
           button.disabled = false;
           button.textContent = "Redeliver";
           if (err.message !== "unauthorized") {
-            setError($("deliveries-error"), err.message);
+            setError($("deliveries-error"), err.message.indexOf("429") >= 0 ? "Rate limited. Try again shortly." : err.message);
           }
         });
     });
@@ -406,6 +444,18 @@ import { fmtTime, shortId } from "/dashboard/format.js";
 
   // ── Health ────────────────────────────────────────────────────────────
 
+  function updateSessionExpiry() {
+    var saved = window.localStorage.getItem(KEY_SAVED_AT) || window.sessionStorage.getItem(KEY_SAVED_AT);
+    if (!saved) {
+      $("session-expiry").textContent = "";
+      return;
+    }
+    var savedAt = Number(saved);
+    var expiresAt = savedAt + 30 * 24 * 60 * 60 * 1000;
+    $("session-expiry").textContent = "session " + countdown(new Date(expiresAt).toISOString());
+    $("session-expiry").title = "Saved " + fmtTime(new Date(savedAt).toISOString());
+  }
+
   function pollHealth() {
     fetch("/ready", { headers: { Accept: "application/json" } })
       .then(function (res) {
@@ -417,15 +467,24 @@ import { fmtTime, shortId } from "/dashboard/format.js";
         var pill = $("health");
         pill.className = r.ok ? "pill pill-ok" : "pill pill-err";
         pill.textContent = r.ok ? "healthy" : r.body.reason || "unavailable";
+        pill.title = JSON.stringify(r.body);
       })
       .catch(function () {
         var pill = $("health");
         pill.className = "pill pill-err";
         pill.textContent = "unreachable";
+        pill.title = "Readiness request failed";
       });
   }
 
   // ── Wiring ────────────────────────────────────────────────────────────
+
+  function syncFilterUi() {
+    Array.prototype.forEach.call(document.querySelectorAll(".chip"), function (chip) {
+      chip.className = (chip.getAttribute("data-status") || "") === state.status ? "chip chip-on" : "chip";
+    });
+    $("auto-refresh").checked = state.autoRefresh;
+  }
 
   function init() {
     $("gate-form").addEventListener("submit", function (ev) {
@@ -459,6 +518,10 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     $("load-more").addEventListener("click", loadPayments);
     $("detail-close").addEventListener("click", closeDetail);
     $("scrim").addEventListener("click", closeDetail);
+    $("auto-refresh").addEventListener("change", function () {
+      state.autoRefresh = $("auto-refresh").checked;
+      writeHashState();
+    });
 
     document.addEventListener("keydown", function (ev) {
       if (ev.key === "Escape") closeDetail();
@@ -476,6 +539,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
           );
           chip.className = "chip chip-on";
           state.status = chip.getAttribute("data-status") || "";
+          writeHashState();
           reload();
         });
       }
@@ -484,6 +548,11 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     window.setInterval(function () {
       if (state.key) pollHealth();
     }, 30000);
+    window.setInterval(function () {
+      if (state.key && state.autoRefresh && (!state.status || state.status === "pending")) {
+        reload();
+      }
+    }, 15000);
 
     // Resume an existing session when a key is already stored.
     /* Resume an existing session when a key is already stored. The gate is
