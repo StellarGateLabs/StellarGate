@@ -422,10 +422,30 @@ main {
 }
 
 @media (max-width: 720px) {
-  .payments th:nth-child(3),
-  .payments td:nth-child(3),
-  .payments th:nth-child(5),
-  .payments td:nth-child(5) {
+  .payments thead {
     display: none;
+  }
+  .payments,
+  .payments tbody,
+  .payments tr,
+  .payments td {
+    display: block;
+    width: 100%;
+  }
+  .payments tr {
+    border-bottom: 1px solid var(--border);
+    padding: 0.65rem 0;
+  }
+  .payments td {
+    border-bottom: none;
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+  .payments td::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-size: 0.78rem;
+    text-transform: uppercase;
   }
 }

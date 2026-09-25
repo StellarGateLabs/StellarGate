@@ -16,17 +16,18 @@ import { fmtTime, shortId } from "/dashboard/format.js";
   "use strict";
 
   var API_BASE = "/v1";
-  var PAGE_SIZE = 25;
   var KEY_NAME = "stellargate.apiKey";
   var KEY_SAVED_AT = "stellargate.apiKeySavedAt";
 
   var state = {
     key: null,
     status: "",
+    pageSize: 25,
     createdAfter: "",
     createdBefore: "",
     cursor: null,
     loading: false,
+    loadedPayments: [],
   };
 
   // ── Tiny DOM helpers ──────────────────────────────────────────────────
@@ -192,6 +193,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
 
   function reload() {
     state.cursor = null;
+    state.loadedPayments = [];
     clear($("rows"));
     loadPayments();
   }
@@ -201,7 +203,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     state.loading = true;
     setError($("list-error"), null);
 
-    var query = "/payments?limit=" + PAGE_SIZE;
+    var query = "/payments?limit=" + state.pageSize;
     if (state.status) query += "&status=" + encodeURIComponent(state.status);
     if (state.createdAfter) query += "&created_after=" + encodeURIComponent(state.createdAfter + "T00:00:00Z");
     if (state.createdBefore) query += "&created_before=" + encodeURIComponent(state.createdBefore + "T23:59:59Z");
@@ -210,11 +212,12 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     api(query)
       .then(function (body) {
         var payments = body.payments || [];
+        state.loadedPayments = state.loadedPayments.concat(payments);
         payments.forEach(appendRow);
 
         // The offset-mode response returns a cursor even on the final page, so
         // a short page is what actually signals the end.
-        var more = payments.length === PAGE_SIZE && !!body.next_cursor;
+        var more = payments.length === state.pageSize && !!body.next_cursor;
         state.cursor = more ? body.next_cursor : null;
         show($("load-more"), more);
         show($("empty"), $("rows").childElementCount === 0);
@@ -249,6 +252,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     tr.tabIndex = 0;
 
     var statusCell = document.createElement("td");
+    statusCell.setAttribute("data-label", "Status");
     statusCell.appendChild(el("span", pillClass(p.status), p.status));
     tr.appendChild(statusCell);
 
@@ -291,6 +295,8 @@ import { fmtTime, shortId } from "/dashboard/format.js";
           ["Memo", p.memo],
           ["Destination", p.destination_address],
           ["Transaction", p.tx_hash || "—"],
+          ["Network", "Stellar"],
+          ["Asset issuer", p.asset_issuer || "native"],
           ["Payment ID", p.id],
           ["Merchant", p.merchant_id],
           ["Created", fmtTime(p.created_at)],
@@ -398,6 +404,22 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     return li;
   }
 
+  function exportCsv() {
+    var header = ["id", "status", "amount", "asset", "asset_issuer", "memo", "destination_address", "created_at", "expires_at"];
+    var lines = [header.join(",")].concat(state.loadedPayments.map(function (p) {
+      return header.map(function (key) {
+        return '"' + String(p[key] || "").replace(/"/g, '""') + '"';
+      }).join(",");
+    }));
+    var blob = new Blob([lines.join("\n")], { type: "text/csv" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = "stellargate-payments.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   function closeDetail() {
     show($("detail"), false);
     show($("scrim"), false);
@@ -480,6 +502,11 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     });
 
     $("refresh").addEventListener("click", reload);
+    $("export-csv").addEventListener("click", exportCsv);
+    $("page-size").addEventListener("change", function () {
+      state.pageSize = Number($("page-size").value) || 25;
+      reload();
+    });
     $("created-after").addEventListener("change", function () {
       state.createdAfter = $("created-after").value;
       reload();
