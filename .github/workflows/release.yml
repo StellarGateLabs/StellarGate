@@ -98,7 +98,7 @@ jobs:
           ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: "dist/*.tar.gz"
 
@@ -149,7 +149,7 @@ jobs:
       # — no cosign key material to generate, store, or rotate. Verifiable
       # with: gh attestation verify --owner <org> oci://<image>@<digest>
       - name: Attest image provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ steps.vars.outputs.image }}
           subject-digest: ${{ steps.push.outputs.digest }}
