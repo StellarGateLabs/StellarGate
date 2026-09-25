@@ -18,6 +18,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
   var API_BASE = "/v1";
   var PAGE_SIZE = 25;
   var KEY_NAME = "stellargate.apiKey";
+  var KEY_SAVED_AT = "stellargate.apiKeySavedAt";
 
   var state = {
     key: null,
@@ -132,6 +133,10 @@ import { fmtTime, shortId } from "/dashboard/format.js";
         KEY_NAME,
         key
       );
+      (persist ? window.localStorage : window.sessionStorage).setItem(
+        KEY_SAVED_AT,
+        String(Date.now())
+      );
     } catch (e) {
       /* non-fatal: the key still works for this page load */
     }
@@ -175,6 +180,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
       show($("gate"), false);
       show($("app"), true);
       setError($("gate-error"), null);
+      updateSessionExpiry();
       loadVersion();
       pollHealth();
       loadSummary();
@@ -289,7 +295,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
           ["Merchant", p.merchant_id],
           ["Created", fmtTime(p.created_at)],
           ["Updated", fmtTime(p.updated_at)],
-          ["Expires", fmtTime(p.expires_at)],
+          ["Expires", fmtTime(p.expires_at) + (p.status === "pending" ? " (" + countdown(p.expires_at) + " left)" : "")],
         ].forEach(function (pair) {
           fields.appendChild(el("dt", null, pair[0]));
           if (pair[0] === "Status") {
@@ -365,6 +371,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
 
     var button = el("button", "ghost", "Redeliver");
     button.addEventListener("click", function () {
+      if (!window.confirm("Redeliver this webhook now?")) return;
       button.disabled = true;
       button.textContent = "Sending…";
       api(
@@ -382,7 +389,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
           button.disabled = false;
           button.textContent = "Redeliver";
           if (err.message !== "unauthorized") {
-            setError($("deliveries-error"), err.message);
+            setError($("deliveries-error"), err.message.indexOf("429") >= 0 ? "Rate limited. Try again shortly." : err.message);
           }
         });
     });
@@ -415,6 +422,18 @@ import { fmtTime, shortId } from "/dashboard/format.js";
 
   // ── Health ────────────────────────────────────────────────────────────
 
+  function updateSessionExpiry() {
+    var saved = window.localStorage.getItem(KEY_SAVED_AT) || window.sessionStorage.getItem(KEY_SAVED_AT);
+    if (!saved) {
+      $("session-expiry").textContent = "";
+      return;
+    }
+    var savedAt = Number(saved);
+    var expiresAt = savedAt + 30 * 24 * 60 * 60 * 1000;
+    $("session-expiry").textContent = "session " + countdown(new Date(expiresAt).toISOString());
+    $("session-expiry").title = "Saved " + fmtTime(new Date(savedAt).toISOString());
+  }
+
   function pollHealth() {
     fetch("/ready", { headers: { Accept: "application/json" } })
       .then(function (res) {
@@ -426,11 +445,13 @@ import { fmtTime, shortId } from "/dashboard/format.js";
         var pill = $("health");
         pill.className = r.ok ? "pill pill-ok" : "pill pill-err";
         pill.textContent = r.ok ? "healthy" : r.body.reason || "unavailable";
+        pill.title = JSON.stringify(r.body);
       })
       .catch(function () {
         var pill = $("health");
         pill.className = "pill pill-err";
         pill.textContent = "unreachable";
+        pill.title = "Readiness request failed";
       });
   }
 
