@@ -320,26 +320,93 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .await?;
 
     /* Every on-chain transaction we credit to an intent, one row per
-    (payment_id, tx_hash). The cumulative received amount for an intent is the
-    SUM of `amount_stroops` over its rows, so re-seeing a transaction (on a
-    later poll cycle, over the stream, or from a concurrent reconciler) is an
-    idempotent no-op instead of a double-credit. `amount_stroops` is the
-    integer stroop value so SUM is exact. */
+    (payment_id, tx_hash, operation_index). The cumulative received amount for
+    an intent is the SUM of `amount_stroops` over its rows, so re-seeing a
+    transaction (on a later poll cycle, over the stream, or from a concurrent
+    reconciler) is an idempotent no-op instead of a double-credit.
+    `operation_index` tracks which operation within the transaction was
+    credited — a Stellar transaction can contain multiple payment operations
+    that all share the same `transaction_hash`; without this index the
+    second operation would be silently dropped as "already seen", causing the
+    intent to be under-credited (issues #614, #615).
+    `amount_stroops` is the integer stroop value so SUM is exact. */
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS processed_transactions (
             payment_id TEXT NOT NULL,
-            /* The transaction hash is half the dedup key, so an empty value
-            would make every unhashed record collide on one row and silently
-            discard all but the first (issue #224). Reject it in the schema as
-            well as at the write path. */
+            /* The transaction hash is part of the dedup key, so an empty value
+            would make every unhashed record collide and silently discard all
+            but the first (issue #224). Reject it in the schema as well as at
+            the write path. */
             tx_hash TEXT NOT NULL CHECK (tx_hash <> ''),
+            /* Zero-based index of this operation within its transaction.
+            Combined with tx_hash to form a unique key per operation so that
+            multiple operations in one transaction are each credited
+            independently (issues #614, #615). Defaults to 0 for
+            single-operation transactions and for rows backfilled from legacy
+            data that predate this column. */
+            operation_index INTEGER NOT NULL DEFAULT 0,
             amount_stroops INTEGER NOT NULL,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-            PRIMARY KEY (payment_id, tx_hash)
+            PRIMARY KEY (payment_id, tx_hash, operation_index)
         )",
     )
     .execute(&mut *tx)
     .await?;
+
+    /* Bring pre-existing processed_transactions tables up to schema.
+    `operation_index` is new as of issues #614/#615/#616: a Stellar transaction
+    can include multiple payment operations that all share the same
+    `transaction_hash`; the old PK of (payment_id, tx_hash) collapsed them
+    onto one row so every operation after the first was silently discarded.
+    The new PK is (payment_id, tx_hash, operation_index).
+    Existing rows (which predate this column) default to 0, which is correct:
+    they were written for single-operation transactions, and operation 0 is the
+    right identity for any single-op record. */
+    let has_operation_index: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('processed_transactions') WHERE name = 'operation_index'",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if has_operation_index == 0 {
+        /* SQLite does not allow adding a column that is part of a PRIMARY KEY
+        via ALTER TABLE, so we recreate the table with the new schema and
+        migrate existing rows across, defaulting operation_index to 0. This is
+        safe because (payment_id, tx_hash, 0) is the correct identity for any
+        single-operation record that existed before this column was introduced,
+        and because re-processing an already-migrated record is idempotent via
+        ON CONFLICT DO NOTHING. */
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS processed_transactions_new (
+                payment_id TEXT NOT NULL,
+                tx_hash TEXT NOT NULL CHECK (tx_hash <> ''),
+                operation_index INTEGER NOT NULL DEFAULT 0,
+                amount_stroops INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                PRIMARY KEY (payment_id, tx_hash, operation_index)
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT OR IGNORE INTO processed_transactions_new
+                 (payment_id, tx_hash, operation_index, amount_stroops, created_at)
+             SELECT payment_id, tx_hash, 0, amount_stroops, created_at
+               FROM processed_transactions",
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("DROP TABLE processed_transactions")
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query(
+            "ALTER TABLE processed_transactions_new RENAME TO processed_transactions",
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
 
     /* Backfill from legacy rows that recorded only the most-recent `tx_hash`
     and a cumulative `paid_amount`, so upgrading preserves the received-amount
@@ -357,9 +424,9 @@ pub async fn migrate(pool: &Db) -> Result<()> {
         let paid_amount: String = row.get("paid_amount");
         if let Some(stroops) = crate::money::parse_stroops(&paid_amount) {
             sqlx::query(
-                "INSERT INTO processed_transactions (payment_id, tx_hash, amount_stroops)
-                 VALUES (?, ?, ?)
-                 ON CONFLICT(payment_id, tx_hash) DO NOTHING",
+                "INSERT INTO processed_transactions (payment_id, tx_hash, operation_index, amount_stroops)
+                 VALUES (?, ?, 0, ?)
+                 ON CONFLICT(payment_id, tx_hash, operation_index) DO NOTHING",
             )
             .bind(&id)
             .bind(&tx_hash)
@@ -808,19 +875,26 @@ pub async fn update_payment_status(
     Ok(result.rows_affected() == 1)
 }
 
-/// Record that transaction `tx_hash`, worth `amount_stroops`, has been credited
-/// to intent `payment_id`. Returns `true` when this is the first time the
-/// transaction was recorded for the intent, and `false` when it was already
-/// present (a re-seen record on a later poll cycle, over the stream, or from a
-/// concurrent reconciler).
+/// Record that transaction `tx_hash` operation `operation_index`, worth
+/// `amount_stroops`, has been credited to intent `payment_id`. Returns `true`
+/// when this is the first time the operation was recorded for the intent, and
+/// `false` when it was already present (a re-seen record on a later poll
+/// cycle, over the stream, or from a concurrent reconciler).
 ///
-/// The `(payment_id, tx_hash)` primary key plus `ON CONFLICT DO NOTHING` makes
-/// this the atomic dedup point: SQLite serialises writers, so exactly one of
-/// two racing inserts for the same transaction observes `rows_affected() == 1`.
+/// The `(payment_id, tx_hash, operation_index)` primary key plus
+/// `ON CONFLICT DO NOTHING` makes this the atomic dedup point: SQLite
+/// serialises writers, so exactly one of two racing inserts for the same
+/// operation observes `rows_affected() == 1`.
+///
+/// Multiple operations within the same transaction each carry a distinct
+/// `operation_index` (0, 1, 2, …), so they are each tracked independently —
+/// a transaction with two payment operations for the same intent now credits
+/// both instead of silently discarding the second (issues #614, #615).
 pub async fn record_processed_tx(
     pool: &Db,
     payment_id: &str,
     tx_hash: &str,
+    operation_index: i64,
     amount_stroops: i64,
 ) -> Result<bool> {
     /* An empty hash is not a hash: it would make every unhashed record share
@@ -833,12 +907,13 @@ pub async fn record_processed_tx(
     }
 
     let result = sqlx::query(
-        "INSERT INTO processed_transactions (payment_id, tx_hash, amount_stroops)
-         VALUES (?, ?, ?)
-         ON CONFLICT(payment_id, tx_hash) DO NOTHING",
+        "INSERT INTO processed_transactions (payment_id, tx_hash, operation_index, amount_stroops)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(payment_id, tx_hash, operation_index) DO NOTHING",
     )
     .bind(payment_id)
     .bind(tx_hash)
+    .bind(operation_index)
     .bind(amount_stroops)
     .execute(pool)
     .await?;
@@ -1801,29 +1876,43 @@ mod tests {
             .unwrap();
 
         // First time a transaction is seen it is recorded and counted.
-        assert!(record_processed_tx(&pool, "p", "TX_A", 40_000_000)
+        assert!(record_processed_tx(&pool, "p", "TX_A", 0, 40_000_000)
             .await
             .unwrap());
         assert_eq!(sum_processed_stroops(&pool, "p").await.unwrap(), 40_000_000);
 
-        // Re-seeing the same transaction is a no-op — no double credit.
-        assert!(!record_processed_tx(&pool, "p", "TX_A", 40_000_000)
+        // Re-seeing the same transaction (same tx_hash, same operation_index)
+        // is a no-op — no double credit.
+        assert!(!record_processed_tx(&pool, "p", "TX_A", 0, 40_000_000)
             .await
             .unwrap());
         assert_eq!(sum_processed_stroops(&pool, "p").await.unwrap(), 40_000_000);
 
-        // A distinct transaction adds to the running total.
-        assert!(record_processed_tx(&pool, "p", "TX_B", 30_000_000)
+        // A distinct transaction (different tx_hash) adds to the running total.
+        assert!(record_processed_tx(&pool, "p", "TX_B", 0, 30_000_000)
             .await
             .unwrap());
         assert_eq!(sum_processed_stroops(&pool, "p").await.unwrap(), 70_000_000);
 
         // Re-seeing an *earlier* transaction after a later one is still a no-op,
         // regardless of order (issue #119).
-        assert!(!record_processed_tx(&pool, "p", "TX_A", 40_000_000)
+        assert!(!record_processed_tx(&pool, "p", "TX_A", 0, 40_000_000)
             .await
             .unwrap());
         assert_eq!(sum_processed_stroops(&pool, "p").await.unwrap(), 70_000_000);
+
+        // Two operations within the same transaction (same tx_hash, different
+        // operation_index) are each credited independently (issues #614, #615).
+        assert!(record_processed_tx(&pool, "p", "TX_A", 1, 10_000_000)
+            .await
+            .unwrap());
+        assert_eq!(sum_processed_stroops(&pool, "p").await.unwrap(), 80_000_000);
+
+        // Re-seeing that second operation is still a no-op.
+        assert!(!record_processed_tx(&pool, "p", "TX_A", 1, 10_000_000)
+            .await
+            .unwrap());
+        assert_eq!(sum_processed_stroops(&pool, "p").await.unwrap(), 80_000_000);
 
         // Rows are scoped per intent.
         assert_eq!(sum_processed_stroops(&pool, "other").await.unwrap(), 0);

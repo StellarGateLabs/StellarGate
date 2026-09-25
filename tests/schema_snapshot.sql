@@ -75,14 +75,21 @@ CREATE TABLE payments (
 ;
 CREATE TABLE processed_transactions (
             payment_id TEXT NOT NULL,
-            /* The transaction hash is half the dedup key, so an empty value
-            would make every unhashed record collide on one row and silently
-            discard all but the first (issue #224). Reject it in the schema as
-            well as at the write path. */
+            /* The transaction hash is part of the dedup key, so an empty value
+            would make every unhashed record collide and silently discard all
+            but the first (issue #224). Reject it in the schema as well as at
+            the write path. */
             tx_hash TEXT NOT NULL CHECK (tx_hash <> ''),
+            /* Zero-based index of this operation within its transaction.
+            Combined with tx_hash to form a unique key per operation so that
+            multiple operations in one transaction are each credited
+            independently (issues #614, #615). Defaults to 0 for
+            single-operation transactions and for rows backfilled from legacy
+            data that predate this column. */
+            operation_index INTEGER NOT NULL DEFAULT 0,
             amount_stroops INTEGER NOT NULL,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-            PRIMARY KEY (payment_id, tx_hash)
+            PRIMARY KEY (payment_id, tx_hash, operation_index)
         )
 ;
 CREATE TABLE webhook_deliveries (

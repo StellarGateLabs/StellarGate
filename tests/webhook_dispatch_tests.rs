@@ -309,6 +309,7 @@ fn make_horizon_payment(tx_hash: &str) -> HorizonPayment {
         }),
         paging_token: Some("1".into()),
         created_at: None,
+        operation_index: 0,
     }
 }
 
