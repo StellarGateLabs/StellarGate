@@ -65,24 +65,15 @@
 
       <main>
         <section class="toolbar">
-          <div class="filters" role="group" aria-label="Filter by status">
-            <button class="chip chip-on" data-status="">All</button>
-            <button class="chip" data-status="pending">Pending</button>
-            <button class="chip" data-status="completed">Completed</button>
-            <button class="chip" data-status="underpaid">Underpaid</button>
-            <button class="chip" data-status="expired">Expired</button>
-          </div>
-          <div class="filters" role="group" aria-label="Filter by creation date">
-            <label class="small" for="created-after">From</label>
-            <input id="created-after" type="date" />
-            <label class="small" for="created-before">To</label>
-            <input id="created-before" type="date" />
-          </div>
+          <!-- aria-label overrides the visible <span> as the accessible name,
+               so "Search" identifies one control rather than a label and an
+               input with the same text. -->
           <div class="search">
             <label class="small muted" for="search">Search</label>
             <input
               id="search"
               type="search"
+              aria-label="Search payments"
               placeholder="Memo or payment ID"
               autocomplete="off"
               spellcheck="false"
@@ -96,6 +87,19 @@
             >
               &times;
             </button>
+          </div>
+          <div class="filters" role="group" aria-label="Filter by status">
+            <button class="chip chip-on" data-status="">All</button>
+            <button class="chip" data-status="pending">Pending</button>
+            <button class="chip" data-status="completed">Completed</button>
+            <button class="chip" data-status="underpaid">Underpaid</button>
+            <button class="chip" data-status="expired">Expired</button>
+          </div>
+          <div class="filters" role="group" aria-label="Filter by creation date">
+            <label class="small" for="created-after">From</label>
+            <input id="created-after" type="date" />
+            <label class="small" for="created-before">To</label>
+            <input id="created-before" type="date" />
           </div>
           <label class="small checkbox" for="auto-refresh">
             <input id="auto-refresh" type="checkbox" />
@@ -184,7 +188,6 @@
         </p>
       </div>
     </div>
-    <div id="help-scrim" class="scrim" hidden></div>
 
     <script type="module" src="/dashboard/app.js"></script>
   </body>

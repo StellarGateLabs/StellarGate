@@ -190,13 +190,26 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
 
   function reload() {
     store.resetPaging();
+    store.update({ loadedPayments: [] });
     clear($("rows"));
     loadPayments();
   }
 
+  /* Set while a request is in flight, so a refresh arriving mid-flight is
+     deferred rather than dropped. Dropping it would leave the table the reload
+     just cleared permanently empty; letting it run concurrently would let two
+     responses both append, doubling the list. */
+  var reloadPending = false;
+
   function loadPayments() {
     var state = store.get();
-    if (state.loading) return;
+    if (state.loading) {
+      /* Remember the request and issue it once the current one finishes. The
+         list is already cleared by reload(), so this is a replace, not an
+         append — hence resetPaging() here too. */
+      reloadPending = true;
+      return;
+    }
     store.update({ loading: true });
     setError($("list-error"), null);
 
@@ -212,10 +225,7 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
         var more = payments.length === store.get().pageSize && !!body.next_cursor;
         store.update({ cursor: more ? body.next_cursor : null });
         show($("load-more"), more);
-        show(
-          $("empty"),
-          store.visiblePayments().length === 0
-        );
+        show($("empty"), store.visiblePayments().length === 0);
       })
       .catch(function (err) {
         if (err.message !== "unauthorized") {
@@ -224,6 +234,14 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
       })
       .then(function () {
         store.update({ loading: false });
+        if (reloadPending) {
+          reloadPending = false;
+          /* The response just applied is now stale, and its cursor points into
+             a result set the operator has already moved past, so the deferred
+             refresh starts from a clean paging state. */
+          store.resetPaging();
+          loadPayments();
+        }
       });
   }
 
@@ -600,6 +618,10 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
   function closeHelp() {
     show($("help"), false);
     store.update({ helpOpen: false });
+    /* Hand focus back to whatever opened the overlay, so a keyboard user is
+       not dropped at the top of the document. */
+    var opener = $("help-open");
+    if (opener && typeof opener.focus === "function") opener.focus();
   }
 
   function toggleHelp() {
@@ -790,6 +812,13 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
       });
     }
 
+    /* A new page of rows invalidates both the highlighted row and the CSV
+       export, which is built from the loaded set. */
+    $("load-more").addEventListener("click", function () {
+      store.update({ activeRow: -1 });
+      loadPayments();
+    });
+
     var searchClear = $("search-clear");
     if (searchClear) {
       searchClear.addEventListener("click", function () {
@@ -802,11 +831,16 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
       });
     }
 
-    $("load-more").addEventListener("click", loadPayments);
     $("detail-close").addEventListener("click", closeDetail);
     $("scrim").addEventListener("click", closeDetail);
     $("help-close").addEventListener("click", closeHelp);
-    $("help-scrim").addEventListener("click", closeHelp);
+    /* The overlay element is its own full-viewport backdrop, so a click that
+       lands on the overlay rather than the panel is a click outside it. There is
+       no separate scrim: a second, lower-z layer would sit permanently behind
+       the overlay and never receive the click. */
+    $("help").addEventListener("click", function (ev) {
+      if (ev.target === $("help")) closeHelp();
+    });
     $("help-open").addEventListener("click", openHelp);
 
     /* Enter on the highlighted row opens it, so `j`/`k` then Enter is a

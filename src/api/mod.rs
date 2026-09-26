@@ -350,12 +350,24 @@ fn api_v1(
             auth_middleware,
         ));
 
+    /* The summary aggregates one merchant's payments, so it needs the same
+    credential check as the list it summarises. It is layered per method for
+    the same reason as `payments_authed` (#635): a `route_layer` here would run
+    auth before axum rejected a wrong verb, answering 401 where 405 is correct. */
+    let summary = get(payments::summary).route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        auth_middleware,
+    ));
+
     axum::Router::new().nest("/merchants", merchants).nest(
         "/payments",
         axum::Router::new()
             .merge(payments_authed)
             .merge(redeliver)
-            .route("/summary", get(payments::summary))
+            .route("/summary", summary)
+            /* `get_by_id` handles its own credential check, because it serves
+            both authenticated and anonymous callers — a payer confirming their
+              own payment has no API key. See `payments::get_by_id`. */
             .route("/{id}", get(payments::get_by_id)),
     )
 }

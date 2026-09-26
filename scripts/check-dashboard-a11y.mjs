@@ -56,7 +56,6 @@ for (const id of [
   "help",
   "help-list",
   "help-close",
-  "help-scrim",
   "help-open",
 ]) {
   if (!html.includes(`id="${id}"`)) failures.push(`missing #${id}`);
