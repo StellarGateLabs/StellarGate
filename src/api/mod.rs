@@ -204,6 +204,14 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/dashboard/app.css", get(dashboard_css))
         .route("/dashboard/app.js", get(dashboard_js))
         .route("/dashboard/format.js", get(dashboard_format_js))
+        /* The dashboard is split into DOM-free modules so their logic can be
+        unit tested with `node --test` (issue #723). Each is still an
+        individually allow-listed route: an unknown file under
+        /dashboard/ falls through to the JSON 404 and is never read from
+        disk, so nothing under static/ is exposed by accident. */
+        .route("/dashboard/session.js", get(dashboard_session_js))
+        .route("/dashboard/state.js", get(dashboard_state_js))
+        .route("/dashboard/keys.js", get(dashboard_keys_js))
         /* The versioned API surface, mounted twice.
         `/v1` is canonical. The same routes stay mounted unprefixed so every
         existing integrator keeps working — shipping versioning by breaking all
@@ -298,14 +306,26 @@ fn api_v1(
     /* Auth middleware on the write + list routes and the webhook listing.
     The per-payment status endpoint handles credentials itself, because it
     serves both authenticated and anonymous callers — see
-    `payments::get_by_id`. */
-    let payments_authed = axum::Router::new()
-        .route("/", post(payments::create).get(payments::list))
-        .route("/{id}/webhooks", get(payments::list_webhooks))
-        .route_layer(middleware::from_fn_with_state(
+    `payments::get_by_id`.
+
+    The auth layer is attached to each `MethodRouter` rather than to the
+    enclosing `Router` with `route_layer`. That distinction is what decides
+    whether a wrong method on a known path answers 405 or 401 (#635): a
+    `route_layer` wraps the `MethodRouter` itself, so it runs *before* axum has
+    worked out that the method is not allowed and an anonymous `PUT /payments`
+    gets a 401 — which tells an integrator their credentials are bad when
+    really their verb is. Layering the methods instead lets axum reject the verb
+    first, and the request never reaches the credential check. */
+    let authed = |m: axum::routing::MethodRouter<Arc<AppState>>| {
+        m.route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
-        ));
+        ))
+    };
+
+    let payments_authed = axum::Router::new()
+        .route("/", authed(post(payments::create).get(payments::list)))
+        .route("/{id}/webhooks", authed(get(payments::list_webhooks)));
 
     /* Redelivery gets its own sub-router so `merchant_redeliver_limit_middleware`
     (issue #468) applies only here, not to every authenticated payments route.
@@ -330,12 +350,24 @@ fn api_v1(
             auth_middleware,
         ));
 
+    /* The summary aggregates one merchant's payments, so it needs the same
+    credential check as the list it summarises. It is layered per method for
+    the same reason as `payments_authed` (#635): a `route_layer` here would run
+    auth before axum rejected a wrong verb, answering 401 where 405 is correct. */
+    let summary = get(payments::summary).route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        auth_middleware,
+    ));
+
     axum::Router::new().nest("/merchants", merchants).nest(
         "/payments",
         axum::Router::new()
             .merge(payments_authed)
             .merge(redeliver)
-            .route("/summary", get(payments::summary))
+            .route("/summary", summary)
+            /* `get_by_id` handles its own credential check, because it serves
+            both authenticated and anonymous callers — a payer confirming their
+              own payment has no API key. See `payments::get_by_id`. */
             .route("/{id}", get(payments::get_by_id)),
     )
 }
@@ -1223,11 +1255,21 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
 
 /* The dashboard is compiled into the binary rather than read from disk, so a
 deployment stays a single artifact with no asset path to configure and no way
-for the two to drift apart. */
+for the two to drift apart.
+
+Each JS module is named after the route it is served on (`static/format.js` →
+`/dashboard/format.js`). That is not cosmetic: the modules import each other
+with relative specifiers, which resolve both in the browser and under
+`node --test` (issue #723). An absolute `/dashboard/...` specifier works in the
+page and then fails to resolve in the unit-test runner, which is precisely the
+browser coupling the split was meant to remove. */
 const DASHBOARD_HTML: &str = include_str!("../../static/dashboard.html");
 const DASHBOARD_CSS: &str = include_str!("../../static/dashboard.css");
 const DASHBOARD_JS: &str = include_str!("../../static/dashboard.js");
-const DASHBOARD_FORMAT_JS: &str = include_str!("../../static/dashboard-format.js");
+const DASHBOARD_FORMAT_JS: &str = include_str!("../../static/format.js");
+const DASHBOARD_SESSION_JS: &str = include_str!("../../static/session.js");
+const DASHBOARD_STATE_JS: &str = include_str!("../../static/state.js");
+const DASHBOARD_KEYS_JS: &str = include_str!("../../static/keys.js");
 
 /// Locks the dashboard to its own origin: no third-party script, style, frame
 /// or connection. The page ships no inline script or style, so this needs no
@@ -1273,6 +1315,18 @@ async fn dashboard_js() -> impl IntoResponse {
 
 async fn dashboard_format_js() -> impl IntoResponse {
     dashboard_asset(DASHBOARD_FORMAT_JS, "text/javascript; charset=utf-8")
+}
+
+async fn dashboard_session_js() -> impl IntoResponse {
+    dashboard_asset(DASHBOARD_SESSION_JS, "text/javascript; charset=utf-8")
+}
+
+async fn dashboard_state_js() -> impl IntoResponse {
+    dashboard_asset(DASHBOARD_STATE_JS, "text/javascript; charset=utf-8")
+}
+
+async fn dashboard_keys_js() -> impl IntoResponse {
+    dashboard_asset(DASHBOARD_KEYS_JS, "text/javascript; charset=utf-8")
 }
 
 async fn not_found() -> impl IntoResponse {

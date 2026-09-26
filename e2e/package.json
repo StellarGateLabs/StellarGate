@@ -1,0 +1,16 @@
+{
+  "name": "stellargate-dashboard-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end smoke tests for the StellarGate operator dashboard (issues #724, #726). Dev-only; nothing here ships in the gateway binary.",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "test:debug": "playwright test --debug",
+    "seed": "node fixtures/seed.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0"
+  }
+}

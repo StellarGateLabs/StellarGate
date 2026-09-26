@@ -168,7 +168,7 @@ const EXPECTED_CSP: &str = "default-src 'none'; \
 async fn dashboard_assets_keep_content_type_and_csp() {
     let server = test_server().await;
 
-    for (path, content_type, body) in [
+    let mut assets: Vec<(&str, &str, &str)> = vec![
         ("/dashboard", "text/html; charset=utf-8", DASHBOARD_HTML),
         (
             "/dashboard/app.css",
@@ -180,7 +180,14 @@ async fn dashboard_assets_keep_content_type_and_csp() {
             "text/javascript; charset=utf-8",
             DASHBOARD_JS,
         ),
-    ] {
+    ];
+    assets.extend(
+        MODULES
+            .iter()
+            .map(|(path, body)| (*path, "text/javascript; charset=utf-8", *body)),
+    );
+
+    for (path, content_type, body) in assets {
         let res = server.get(path).await;
         res.assert_status_ok();
         assert_eq!(

@@ -108,13 +108,17 @@ fn header(res: &axum_test::TestResponse, name: &str) -> u64 {
 #[tokio::test]
 async fn rate_limit_headers_track_quota_before_and_after_exhaustion() {
     let (server, _pool) = server_with_config(make_config(2)).await;
-    let _key = provision_merchant(&server).await;
-    let auth = "******";
+    /* The key is minted per-test by `provision_merchant`, so nothing secret is
+    ever written down here — but the *real* value must still be sent, or every
+    request 401s before the limiter is ever consulted and the test asserts
+    nothing about rate limiting at all. */
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
     let body = json!({ "amount": "1", "asset": "XLM" });
 
     let first = server
         .post("/v1/payments")
-        .add_header("Authorization", auth)
+        .add_header("Authorization", auth.clone())
         .json(&body)
         .await;
     first.assert_status(StatusCode::CREATED);
@@ -123,7 +127,7 @@ async fn rate_limit_headers_track_quota_before_and_after_exhaustion() {
 
     let second = server
         .post("/v1/payments")
-        .add_header("Authorization", auth)
+        .add_header("Authorization", auth.clone())
         .json(&body)
         .await;
     second.assert_status(StatusCode::CREATED);
@@ -132,7 +136,7 @@ async fn rate_limit_headers_track_quota_before_and_after_exhaustion() {
 
     let throttled = server
         .post("/v1/payments")
-        .add_header("Authorization", auth)
+        .add_header("Authorization", auth.clone())
         .json(&body)
         .await;
     throttled.assert_status(StatusCode::TOO_MANY_REQUESTS);
