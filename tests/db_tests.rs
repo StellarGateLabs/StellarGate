@@ -129,6 +129,8 @@ async fn offset_pagination_returns_each_row_exactly_once_within_one_second() {
     let mut seen = std::collections::HashSet::new();
     let mut offset = 0i64;
     loop {
+        // `None` for the status and the two date bounds: this walk is about
+        // pagination, not filtering.
         let (page, _total) = db::list_payments(&pool, "m1", None, None, None, page_size, offset)
             .await
             .unwrap();

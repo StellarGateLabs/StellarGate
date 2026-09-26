@@ -79,6 +79,33 @@
             <label class="small" for="created-before">To</label>
             <input id="created-before" type="date" />
           </div>
+          <div class="search">
+            <!-- aria-label on the input overrides the visible <label> as its
+                 accessible name, so "Search" identifies exactly one control
+                 rather than a label and an input sharing the same text. -->
+            <label class="small muted" for="search">Search</label>
+            <input
+              id="search"
+              type="search"
+              aria-label="Search payments"
+              placeholder="Memo or payment ID"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button
+              id="search-clear"
+              class="ghost"
+              type="button"
+              aria-label="Clear search"
+              hidden
+            >
+              &times;
+            </button>
+          </div>
+          <label class="small checkbox" for="auto-refresh">
+            <input id="auto-refresh" type="checkbox" />
+            <span>Auto-refresh</span>
+          </label>
           <label class="small" for="page-size">Page size</label>
           <select id="page-size">
             <option>10</option>
@@ -86,18 +113,17 @@
             <option>50</option>
             <option>100</option>
           </select>
-          <label class="checkbox small">
-            <input id="auto-refresh" type="checkbox" />
-            <span>Auto-refresh</span>
-          </label>
           <button id="export-csv" class="ghost">Export CSV</button>
           <button id="refresh" class="ghost">Refresh</button>
+          <button id="help-open" class="ghost" aria-haspopup="dialog">
+            Shortcuts&nbsp;<kbd>?</kbd>
+          </button>
         </section>
 
         <section id="summary" class="summary" aria-label="Payment summary"></section>
 
         <section class="card">
-          <table class="payments">
+          <table class="payments" aria-label="Payments">
             <thead>
               <tr>
                 <th>Status</th>
@@ -111,6 +137,9 @@
           </table>
           <p id="empty" class="empty" hidden>No payments match this filter.</p>
           <p id="list-error" class="error" hidden></p>
+          <!-- Announces the j/k highlight. Without it the row selection is a
+               purely visual change that a screen-reader user cannot perceive. -->
+          <p id="rows-status" class="muted small" role="status" aria-live="polite"></p>
           <div class="table-foot">
             <button id="load-more" class="ghost" hidden>Load more</button>
           </div>
@@ -135,6 +164,31 @@
       <div id="scrim" class="scrim" hidden></div>
     </div>
 
+    <!-- Keyboard shortcut help (#721).
+         The list is rendered from the SHORTCUTS table in keys.js, so a shortcut
+         cannot exist without appearing here and cannot be documented with the
+         wrong key. Rendered as a dialog so it is announced as one, and kept out
+         of #app so it is reachable from anywhere the app is. -->
+    <div
+      id="help"
+      class="help"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="help-title"
+      hidden
+    >
+      <div class="help-panel card">
+        <div class="detail-head">
+          <h2 id="help-title">Keyboard shortcuts</h2>
+          <button id="help-close" class="ghost" aria-label="Close">&times;</button>
+        </div>
+        <ul id="help-list" class="help-list"></ul>
+        <p class="muted small">
+          Shortcuts are ignored while you are typing in a field. Press
+          <kbd>Esc</kbd> to close this panel.
+        </p>
+      </div>
+    </div>
     <script type="module" src="/dashboard/app.js"></script>
   </body>
 </html>

@@ -112,18 +112,23 @@ pub struct HorizonPayment {
     /// subsequent one is silently discarded as "already seen", causing the
     /// intent to be under-credited (issues #614, #615).
     ///
-    /// Horizon includes this field as `"source_account_sequence"` is not
-    /// what we want; Horizon's payments endpoint returns each operation with
-    /// its own numeric `id` (the operation ID) and a `transaction_successful`
-    /// flag. The operation index within the transaction is encoded in the
-    /// paging token but is also available directly as the `operation_index`
-    /// field. We read it here and thread it through to
-    /// `record_processed_tx` so the PK becomes
-    /// `(payment_id, tx_hash, operation_index)`.
+    /// Horizon returns each operation with its own numeric `id` and a
+    /// `transaction_successful` flag. The operation's position within its
+    /// transaction is the `operation_index` field, which we thread through to
+    /// `record_processed_tx` so the dedup key becomes
+    /// `(payment_id, tx_hash, operation_index)` (issues #614, #615).
     ///
-    /// Absent from older Horizon builds (pre-protocol-10 responses, mocked
-    /// data) — defaults to `0`, which preserves the old behaviour for any
-    /// single-op transaction.
+    /// This field — not the paging token — is the authoritative index. The
+    /// earlier implementation derived it by parsing `paging_token` as an
+    /// integer, which only works for tokens that happen to be numeric: a real
+    /// Horizon paging token is a large opaque string, so the parse silently
+    /// failed and every operation in a transaction collapsed onto index `0`.
+    /// The second operation was then discarded as "already seen" and the
+    /// intent stayed underpaid — the original bug this field fixes.
+    ///
+    /// `#[serde(default)]` keeps synthetic records and older Horizon builds
+    /// working; for a single-operation transaction the correct value is `0`,
+    /// which is also what a missing field yields.
     #[serde(default)]
     pub operation_index: i64,
 }
@@ -260,22 +265,16 @@ impl HorizonPayment {
     /// The index of this operation within its transaction, derived from the
     /// Horizon paging token.
     ///
-    /// Horizon encodes the paging token as a large integer that embeds the
-    /// ledger sequence, transaction index, and operation index. Each payment
-    /// operation in a multi-op transaction gets its own unique paging token,
-    /// so the token itself is a stable, unique-per-operation identifier.  We
-    /// store it as-is as the `operation_index` column so that two operations
-    /// sharing the same `tx_hash` always get distinct ledger rows (issue #613).
+    /// The operation's index within its transaction, used as the operation
+    /// component of the `processed_transactions` dedup key (issue #613).
     ///
-    /// If the paging token is absent (e.g. a synthetic record constructed in
-    /// tests without one) we default to `0`, which is the correct value for
-    /// any single-operation transaction and for records written before this
-    /// field existed (issue #616).
+    /// Read from the `operation_index` field rather than parsed out of the
+    /// paging token. The token *encodes* the index, but it is an opaque string
+    /// — not a plain integer — so parsing it yields `None` for real Horizon
+    /// responses and silently collapsed every operation of a transaction onto
+    /// `0`. `operation_index` is the field Horizon actually documents for this.
     pub fn operation_index(&self) -> i64 {
-        self.paging_token
-            .as_deref()
-            .and_then(|t| t.parse::<i64>().ok())
-            .unwrap_or(0)
+        self.operation_index
     }
 }
 

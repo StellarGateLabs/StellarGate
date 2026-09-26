@@ -150,11 +150,13 @@ async fn seed_pending_payment(pool: &db::Db, webhook_url: Option<&str>) -> Strin
 
 /// Build a 5 XLM Horizon payment operation for the seeded intent.
 ///
-/// `paging_token` must be unique per operation — Horizon encodes the ledger,
-/// transaction position, and operation index into this value.  Passing
-/// different tokens for op 0 and op 1 of the same transaction simulates what
-/// Horizon actually returns for a multi-operation transaction.
-fn make_half_payment(paging_token: &str) -> HorizonPayment {
+/// `operation_index` must be distinct per operation, and is what the dedup key
+/// is built from (issue #613). `paging_token` is set to a realistic *opaque*
+/// Horizon string, deliberately non-numeric: the gateway must read the index
+/// from the `operation_index` field, and this fixture fails if it is ever
+/// derived by parsing the token instead.
+fn make_half_payment(operation_index: i64) -> HorizonPayment {
+    let paging_token = format!("12884901985-{operation_index}-abc123def456");
     HorizonPayment {
         kind: "payment".into(),
         amount: Some("5.0000000".into()),
@@ -168,8 +170,11 @@ fn make_half_payment(paging_token: &str) -> HorizonPayment {
             memo_type: Some("text".into()),
             successful: Some(true),
         }),
-        paging_token: Some(paging_token.into()),
+        paging_token: Some(paging_token),
         created_at: None,
+        // Mirrors what Horizon returns, and the value the dedup key is built
+        // from (issue #613).
+        operation_index,
     }
 }
 
@@ -202,16 +207,25 @@ async fn multi_op_same_tx_credits_full_amount() {
     let payment_id = seed_pending_payment(&pool, Some(&webhook_url)).await;
     let state = make_state(pool.clone(), Some(webhook_url));
 
-    // Op 0: first 5 XLM operation — different paging token → operation_index 100
-    let op0 = make_half_payment("100");
-    // Op 1: second 5 XLM operation in the same tx — paging token → operation_index 101
-    let op1 = make_half_payment("101");
+    // Op 0: first 5 XLM operation of the shared transaction.
+    let op0 = make_half_payment(0);
+    // Op 1: second 5 XLM operation in the same tx — a distinct operation index
+    // is the only thing that lets both be credited.
+    let op1 = make_half_payment(1);
 
     // Process op 0 — intent goes underpaid (5 of 10 XLM received).
     let settled0 = reconcile_payment(&state, &op0)
         .await
         .expect("op0 reconcile must not error");
-    assert!(!settled0, "first half-payment must not complete the intent");
+    /* The returned bool means "a settlement webhook was dispatched", not "the
+    intent completed". An underpayment is itself a settlement event — it moves
+    the intent to `underpaid` and fires `payment.underpaid` so the merchant can
+    chase the remainder — so `true` here is the correct answer. Completion is
+    the status assertion below, which is the invariant this test exists for. */
+    assert!(
+        settled0,
+        "the first half-payment must still notify the merchant (payment.underpaid)"
+    );
 
     let payment = db::get_payment(&pool, &payment_id)
         .await
@@ -219,7 +233,7 @@ async fn multi_op_same_tx_credits_full_amount() {
         .expect("payment must exist");
     assert_eq!(
         payment.status, "underpaid",
-        "after first op intent should be underpaid"
+        "after first op intent should be underpaid, not completed"
     );
 
     // Process op 1 — cumulative total reaches 10 XLM → completed.
@@ -240,14 +254,30 @@ async fn multi_op_same_tx_credits_full_amount() {
         "intent must be completed after both ops are credited"
     );
 
-    // Exactly one completed webhook should have been dispatched.
+    // Exactly one webhook per settlement: `payment.underpaid` for the first op
+    // and `payment.completed` for the second. Two operations, two state
+    // transitions, two notifications — and no third from a re-credit.
     tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
     let received = mock_server.received_requests().await.unwrap();
     assert_eq!(
         received.len(),
-        1,
-        "exactly one webhook must be dispatched (payment.completed); got {}",
+        2,
+        "expected one payment.underpaid and one payment.completed webhook; got {}",
         received.len()
+    );
+    let events: Vec<String> = received
+        .iter()
+        .map(|r| {
+            serde_json::from_slice::<serde_json::Value>(&r.body)
+                .ok()
+                .and_then(|v| v.get("event").and_then(|e| e.as_str()).map(str::to_string))
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(
+        events,
+        ["payment.underpaid", "payment.completed"],
+        "the intent must report the underpayment and then the completion, in order"
     );
 
     // Both operations must be in the processed_transactions ledger.
@@ -275,8 +305,8 @@ async fn multi_op_idempotent_on_rescan() {
     let payment_id = seed_pending_payment(&pool, Some(&webhook_url)).await;
     let state = make_state(pool.clone(), Some(webhook_url));
 
-    let op0 = make_half_payment("200");
-    let op1 = make_half_payment("201");
+    let op0 = make_half_payment(0);
+    let op1 = make_half_payment(1);
 
     // First pass: settle the intent.
     reconcile_payment(&state, &op0).await.unwrap();
@@ -287,10 +317,11 @@ async fn multi_op_idempotent_on_rescan() {
     let payment = db::get_payment(&pool, &payment_id).await.unwrap().unwrap();
     assert_eq!(payment.status, "completed");
 
+    // One webhook per state transition: underpaid, then completed.
     let after_first_pass = mock_server.received_requests().await.unwrap().len();
     assert_eq!(
-        after_first_pass, 1,
-        "should have exactly one webhook after first pass"
+        after_first_pass, 2,
+        "expected one payment.underpaid and one payment.completed webhook; got {after_first_pass}"
     );
 
     // Second pass: rescan with the same operations.
@@ -370,6 +401,9 @@ async fn single_op_tx_still_works() {
         }),
         paging_token: Some("300".into()),
         created_at: None,
+        // A single-operation transaction is operation 0 within its own
+        // transaction (issue #613).
+        operation_index: 0,
     };
 
     let settled = reconcile_payment(&state, &hp)

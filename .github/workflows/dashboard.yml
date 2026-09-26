@@ -7,9 +7,16 @@ on:
       - "static/**"
       - "scripts/check-dashboard-a11y.mjs"
       - ".github/workflows/dashboard.yml"
+  push:
+    branches: [main]
+    paths:
+      - "static/**"
+      - "scripts/check-dashboard-a11y.mjs"
+      - ".github/workflows/dashboard.yml"
 
 jobs:
   dashboard-static-checks:
+    name: dashboard static checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,8 +26,93 @@ jobs:
         with:
           node-version: "22"
 
+      # Every module plus the entry point: `node --check` only parses, so this
+      # catches a syntax error before the tests try to import the file.
       - name: JavaScript syntax check
-        run: node --check static/dashboard.js
+        run: |
+          node --check static/dashboard.js
+          for f in static/format.js static/session.js static/state.js static/keys.js; do
+            node --check "$f"
+          done
 
       - name: Accessibility smoke check
         run: node scripts/check-dashboard-a11y.mjs
+
+  # The dashboard's logic lives in DOM-free ES modules precisely so it can be
+  # tested with Node's built-in runner — no npm dependencies, no package.json,
+  # no lockfile to rot (issue #723). `node --test` is the whole harness.
+  dashboard-unit-tests:
+    name: dashboard unit tests (node --test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run unit tests for the pure JS modules
+        run: node --test static/tests/*.test.js
+
+  # End-to-end smoke test against a real server and a seeded database
+  # (issue #724), plus the credential-leak regression assertion (#726).
+  #
+  # Pinned to a major so the runner resolves a current browser, and kept out of
+  # the `test` job: Playwright installs a browser and a Node package tree, which
+  # is far slower than `cargo test` and belongs in its own check.
+  dashboard-e2e:
+    name: dashboard end-to-end (playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-e2e-
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('e2e/package-lock.json') }}
+
+      # The seed provisions a merchant and its payments against a real
+      # SQLite file, then prints the API key the specs sign in with. It never
+      # reaches a log: the key is written to a git-ignored file the server and
+      # the specs both read, and `scripts/` output is not echoed (issue #726).
+      - name: Install Playwright
+        working-directory: e2e
+        run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+
+      - name: Install Playwright browsers
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium firefox webkit
+
+      - name: Build the gateway
+        run: cargo build --locked
+
+      - name: Run the end-to-end suite
+        working-directory: e2e
+        env:
+          # A dedicated, throwaway database. The seed provisions the merchant;
+          # no credential is ever supplied through the environment.
+          DATABASE_URL: sqlite:e2e/playwright.db
+        run: npx playwright test
