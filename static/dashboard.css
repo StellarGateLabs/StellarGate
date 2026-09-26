@@ -306,6 +306,9 @@ main {
 .payments tbody tr:last-child td {
   border-bottom: none;
 }
+.payments .select-col {
+  width: 1%;
+}
 
 /* ── Empty state ──────────────────────────────────────────────────────── */
 
@@ -426,6 +429,7 @@ main {
 .skeleton-row .sk-memo    { width: 7rem; }
 .skeleton-row .sk-date    { width: 9rem; }
 .skeleton-row .sk-id      { width: 8rem; }
+.skeleton-row .sk-select  { width: 1rem; }
 
 /* Detail panel skeleton blocks */
 .skeleton-field {

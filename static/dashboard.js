@@ -28,6 +28,9 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     cursor: null,
     loading: false,
     loadedPayments: [],
+    // Selected payments keyed by id, holding the row's payment record so the
+    // selection can be exported without re-fetching.
+    selected: {},
     autoRefresh: false,
   };
 
@@ -258,6 +261,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
 
   function signIn(key, persist) {
     state.key = key;
+    state.selected = {};
     readHashState();
     // Validate by making the cheapest authenticated call available.
     return api("/payments?limit=1").then(function () {
@@ -288,6 +292,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
       tr.setAttribute("aria-hidden", "true");
 
       var cols = [
+        { label: "Select",     cls: "sk-select" },
         { label: "Status",     cls: "sk-status" },
         { label: "Amount",     cls: "sk-amount" },
         { label: "Memo",       cls: "sk-memo" },
@@ -454,6 +459,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
         var payments = body.payments || [];
         state.loadedPayments = state.loadedPayments.concat(payments);
         payments.forEach(appendRow);
+        syncSelectionUi();
 
         // Remove any previous inline state nodes before rendering new ones.
         var prev = $("list-state");
@@ -526,6 +532,32 @@ import { fmtTime, shortId } from "/dashboard/format.js";
   function appendRow(p) {
     var tr = document.createElement("tr");
     tr.tabIndex = 0;
+
+    // Keep the stored record fresh when a selected row is reloaded.
+    if (state.selected[p.id]) state.selected[p.id] = p;
+
+    var selectCell = document.createElement("td");
+    selectCell.setAttribute("data-label", "Select");
+    var box = document.createElement("input");
+    box.type = "checkbox";
+    box.className = "row-select";
+    box.setAttribute("data-id", p.id);
+    box.setAttribute("aria-label", "Select payment " + p.id);
+    box.checked = !!state.selected[p.id];
+    // Stop the row's click and Enter/Space handlers from opening the detail
+    // panel when the checkbox is toggled.
+    box.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+    });
+    box.addEventListener("keydown", function (ev) {
+      ev.stopPropagation();
+    });
+    box.addEventListener("change", function () {
+      setSelected(p, box.checked);
+      syncSelectionUi();
+    });
+    selectCell.appendChild(box);
+    tr.appendChild(selectCell);
 
     var statusCell = document.createElement("td");
     statusCell.setAttribute("data-label", "Status");
@@ -707,9 +739,46 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     return li;
   }
 
-  function exportCsv() {
+  // ── Selection (#775) ──────────────────────────────────────────────────
+
+  function setSelected(p, on) {
+    if (on) state.selected[p.id] = p;
+    else delete state.selected[p.id];
+  }
+
+  function selectedPayments() {
+    return Object.keys(state.selected).map(function (id) {
+      return state.selected[id];
+    });
+  }
+
+  /** Sync the row checkboxes, the select-all box, the count and the action. */
+  function syncSelectionUi() {
+    var count = Object.keys(state.selected).length;
+    Array.prototype.forEach.call(document.querySelectorAll(".row-select"), function (box) {
+      box.checked = !!state.selected[box.getAttribute("data-id")];
+    });
+
+    var loadedSelected = state.loadedPayments.filter(function (p) {
+      return !!state.selected[p.id];
+    }).length;
+    var all = $("select-all");
+    all.checked = state.loadedPayments.length > 0 && loadedSelected === state.loadedPayments.length;
+    all.indeterminate = loadedSelected > 0 && !all.checked;
+
+    $("selection-count").textContent = count + " selected";
+    show($("selection-count"), count > 0);
+    show($("export-selected"), count > 0);
+  }
+
+  function clearSelection() {
+    state.selected = {};
+    syncSelectionUi();
+  }
+
+  function exportCsv(payments, filename) {
     var header = ["id", "status", "amount", "asset", "asset_issuer", "memo", "destination_address", "created_at", "expires_at"];
-    var lines = [header.join(",")].concat(state.loadedPayments.map(function (p) {
+    var lines = [header.join(",")].concat(payments.map(function (p) {
       return header.map(function (key) {
         return '"' + String(p[key] || "").replace(/"/g, '""') + '"';
       }).join(",");
@@ -718,7 +787,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     var url = URL.createObjectURL(blob);
     var a = document.createElement("a");
     a.href = url;
-    a.download = "stellargate-payments.csv";
+    a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -807,17 +876,31 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     });
 
     $("refresh").addEventListener("click", reload);
-    $("export-csv").addEventListener("click", exportCsv);
+    $("export-csv").addEventListener("click", function () {
+      exportCsv(state.loadedPayments, "stellargate-payments.csv");
+    });
+    $("export-selected").addEventListener("click", function () {
+      exportCsv(selectedPayments(), "stellargate-payments-selected.csv");
+    });
+    $("select-all").addEventListener("change", function () {
+      var on = $("select-all").checked;
+      state.loadedPayments.forEach(function (p) {
+        setSelected(p, on);
+      });
+      syncSelectionUi();
+    });
     $("page-size").addEventListener("change", function () {
       state.pageSize = Number($("page-size").value) || 25;
       reload();
     });
     $("created-after").addEventListener("change", function () {
       state.createdAfter = $("created-after").value;
+      clearSelection();
       reload();
     });
     $("created-before").addEventListener("change", function () {
       state.createdBefore = $("created-before").value;
+      clearSelection();
       reload();
     });
     $("load-more").addEventListener("click", loadPayments);
@@ -845,6 +928,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
           chip.className = "chip chip-on";
           state.status = chip.getAttribute("data-status") || "";
           writeHashState();
+          clearSelection();
           reload();
         });
       }

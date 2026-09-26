@@ -91,6 +91,8 @@
             <span>Auto-refresh</span>
           </label>
           <button id="export-csv" class="ghost">Export CSV</button>
+          <span id="selection-count" class="muted small" hidden></span>
+          <button id="export-selected" class="ghost" hidden>Export selected</button>
           <button id="refresh" class="ghost">Refresh</button>
         </section>
 
@@ -100,6 +102,9 @@
           <table class="payments">
             <thead>
               <tr>
+                <th class="select-col">
+                  <input id="select-all" type="checkbox" aria-label="Select all loaded payments" />
+                </th>
                 <th>Status</th>
                 <th>Amount</th>
                 <th>Memo</th>
