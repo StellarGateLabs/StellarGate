@@ -8,29 +8,52 @@
  * via el()//setText below), never innerHTML. `webhook_url`, `memo` and the
  * event name are merchant-controlled, so interpolating them as markup would
  * be a stored-XSS vector.
+ *
+ * This file is only the controller: DOM wiring and rendering. The logic worth
+ * testing is in the sibling modules it imports, all of which are DOM-free and
+ * run under `node --test` (issue #723):
+ *
+ *   format.js   pure formatting, query building, row filtering
+ *   session.js  API-key storage rules
+ *   state.js    the single view-state store and URL-hash serialisation
+ *   keys.js     which keystroke means which action (issue #721)
  */
 
-import { fmtTime, shortId } from "/dashboard/format.js";
+import {
+  buildListQuery,
+  countdown,
+  CSV_COLUMNS,
+  explorerTx,
+  fmtTime,
+  formatAmount,
+  pillClass,
+  relativeTime,
+  shortId,
+  toCsv,
+} from "./format.js";
+import { createSessionStore } from "./session.js";
+import { createStore, parseHash, serializeHash } from "./state.js";
+import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
 
 (function () {
   "use strict";
 
+  /* The version prefix is defined exactly once, here, so a request can never
+     end up with the prefix doubled. Pinned by `tests/dashboard_asset_tests.rs`,
+     which counts the occurrences of the prefix across this file. */
   var API_BASE = "/v1";
-  var KEY_NAME = "stellargate.apiKey";
-  var KEY_SAVED_AT = "stellargate.apiKeySavedAt";
 
-  var state = {
-    key: null,
-    status: "",
-    pageSize: 25,
-    createdAfter: "",
-    createdBefore: "",
-    cursor: null,
-    loading: false,
-    loadedPayments: [],
-  };
+  var store = createStore();
+  var session = createSessionStore({
+    session: safeArea(function () {
+      return window.sessionStorage;
+    }),
+    local: safeArea(function () {
+      return window.localStorage;
+    }),
+  });
 
-  // ── Tiny DOM helpers ──────────────────────────────────────────────────
+  /* ── Tiny DOM helpers ────────────────────────────────────────────────── */
 
   function $(id) {
     return document.getElementById(id);
@@ -45,14 +68,16 @@ import { fmtTime, shortId } from "/dashboard/format.js";
   }
 
   function show(node, visible) {
-    node.hidden = !visible;
+    if (node) node.hidden = !visible;
   }
 
   function clear(node) {
+    if (!node) return;
     while (node.firstChild) node.removeChild(node.firstChild);
   }
 
   function setError(node, message) {
+    if (!node) return;
     if (message) {
       node.textContent = message;
       show(node, true);
@@ -62,37 +87,40 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     }
   }
 
-  // ── Formatting ────────────────────────────────────────────────────────
-
-  /** Map a payment or delivery status onto a pill style. */
-  function pillClass(status) {
-    switch (status) {
-      case "completed":
-      case "delivered":
-        return "pill pill-ok";
-      case "pending":
-      case "underpaid":
-        return "pill pill-warn";
-      case "expired":
-      case "failed":
-        return "pill pill-err";
-      default:
-        return "pill pill-idle";
+  /**
+   * A Web Storage area, or null when the browser refuses to hand one over.
+   *
+   * Merely *reading* `window.localStorage` throws in Safari private mode and
+   * wherever storage is blocked by policy, so it is touched lazily and the
+   * session store is told to fall back to memory (issue #678). Losing
+   * persistence must degrade to "re-enter the key on reload", never to a blank
+   * page.
+   */
+  function safeArea(get) {
+    try {
+      return get();
+    } catch (e) {
+      return null;
     }
   }
 
-  // ── API ───────────────────────────────────────────────────────────────
+  /* ── API ─────────────────────────────────────────────────────────────── */
 
   /**
    * Call the gateway. Resolves with the parsed body, or rejects with an Error
    * carrying the API's `error` message when one is present. A 401 drops the
    * stored key and returns to the sign-in gate, since it means the key was
    * revoked or is wrong.
+   *
+   * The key is attached as an `Authorization` header and nowhere else — never a
+   * query parameter, never the fragment. #726 asserts this over every request
+   * the browser actually makes.
    */
   function api(path, options) {
     var opts = options || {};
     var headers = { Accept: "application/json" };
-    if (state.key) headers.Authorization = "Bearer " + state.key;
+    var key = store.get().key;
+    if (key) headers.Authorization = "Bearer " + key;
 
     return fetch(API_BASE + path, { method: opts.method || "GET", headers: headers }).then(
       function (res) {
@@ -107,7 +135,9 @@ import { fmtTime, shortId } from "/dashboard/format.js";
           })
           .then(function (body) {
             if (!res.ok) {
-              throw new Error(body.error || "Request failed (" + res.status + ")");
+              throw new Error(
+                body.error || "Request failed (" + res.status + ")"
+              );
             }
             return body;
           });
@@ -115,69 +145,36 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     );
   }
 
-  // ── Session ───────────────────────────────────────────────────────────
-
-  function storedKey() {
-    try {
-      return (
-        window.sessionStorage.getItem(KEY_NAME) ||
-        window.localStorage.getItem(KEY_NAME)
-      );
-    } catch (e) {
-      return null; // storage blocked; fall back to in-memory only
-    }
-  }
-
-  function storeKey(key, persist) {
-    try {
-      (persist ? window.localStorage : window.sessionStorage).setItem(
-        KEY_NAME,
-        key
-      );
-      (persist ? window.localStorage : window.sessionStorage).setItem(
-        KEY_SAVED_AT,
-        String(Date.now())
-      );
-    } catch (e) {
-      /* non-fatal: the key still works for this page load */
-    }
-  }
-
-  function forgetKey() {
-    try {
-      window.sessionStorage.removeItem(KEY_NAME);
-      window.localStorage.removeItem(KEY_NAME);
-    } catch (e) {
-      /* nothing to do */
-    }
-  }
+  /* ── Session ─────────────────────────────────────────────────────────── */
 
   /** Return to the sign-in form, keeping any stored key so a reload retries. */
   function showGate(message) {
-    state.key = null;
+    store.update({ key: null, selectedPaymentId: null, activeRow: -1 });
     closeDetail();
     show($("app"), false);
     show($("gate"), true);
     setError($("gate-error"), message || null);
   }
 
-  /** Return to the sign-in form AND discard the stored key.
+  /**
+   * Return to the sign-in form AND discard the stored key.
    *
    * Only for cases where the key itself is the problem (a 401, or an explicit
    * sign-out). A transient failure must use showGate() instead: discarding a
    * perfectly good key because the network blinked forces the user to dig it
-   * out again. */
+   * out again.
+   */
   function signOut(message) {
-    forgetKey();
+    session.clear();
     showGate(message);
   }
 
   function signIn(key, persist) {
-    state.key = key;
-    readHashState();
+    store.update({ key: key });
+    applyHash();
     // Validate by making the cheapest authenticated call available.
     return api("/payments?limit=1").then(function () {
-      if (persist !== null) storeKey(key, persist);
+      if (persist !== null) session.write(key, persist);
       show($("gate"), false);
       show($("app"), true);
       setError($("gate-error"), null);
@@ -189,44 +186,44 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     });
   }
 
-  // ── Payments list ─────────────────────────────────────────────────────
+  /* ── Payments list ───────────────────────────────────────────────────── */
 
   function reload() {
-    state.cursor = null;
-    state.loadedPayments = [];
+    store.resetPaging();
     clear($("rows"));
     loadPayments();
   }
 
   function loadPayments() {
+    var state = store.get();
     if (state.loading) return;
-    state.loading = true;
+    store.update({ loading: true });
     setError($("list-error"), null);
 
-    var query = "/payments?limit=" + state.pageSize;
-    if (state.status) query += "&status=" + encodeURIComponent(state.status);
-    if (state.createdAfter) query += "&created_after=" + encodeURIComponent(state.createdAfter + "T00:00:00Z");
-    if (state.createdBefore) query += "&created_before=" + encodeURIComponent(state.createdBefore + "T23:59:59Z");
-    if (state.cursor) query += "&cursor=" + encodeURIComponent(state.cursor);
-
-    api(query)
+    api(buildListQuery(state))
       .then(function (body) {
         var payments = body.payments || [];
-        state.loadedPayments = state.loadedPayments.concat(payments);
-        payments.forEach(appendRow);
+        var rows = store.get().loadedPayments.concat(payments);
+        store.update({ loadedPayments: rows });
+        renderRows();
 
-        // The offset-mode response returns a cursor even on the final page, so
-        // a short page is what actually signals the end.
-        var more = payments.length === state.pageSize && !!body.next_cursor;
-        state.cursor = more ? body.next_cursor : null;
+        /* The offset-mode response returns a cursor even on the final page, so
+           a short page is what actually signals the end. */
+        var more = payments.length === store.get().pageSize && !!body.next_cursor;
+        store.update({ cursor: more ? body.next_cursor : null });
         show($("load-more"), more);
-        show($("empty"), $("rows").childElementCount === 0);
+        show(
+          $("empty"),
+          store.visiblePayments().length === 0
+        );
       })
       .catch(function (err) {
-        if (err.message !== "unauthorized") setError($("list-error"), err.message);
+        if (err.message !== "unauthorized") {
+          setError($("list-error"), err.message);
+        }
       })
       .then(function () {
-        state.loading = false;
+        store.update({ loading: false });
       });
   }
 
@@ -247,19 +244,83 @@ import { fmtTime, shortId } from "/dashboard/format.js";
       });
   }
 
-  function appendRow(p) {
+  /** Draw the currently visible rows, honouring the search box and `j`/`k`. */
+  function renderRows() {
+    var tbody = $("rows");
+    var visible = store.visiblePayments();
+    var active = store.get().activeRow;
+    clear(tbody);
+
+    visible.forEach(function (p, index) {
+      tbody.appendChild(rowFor(p, index === active));
+    });
+
+    show($("empty"), visible.length === 0);
+    announceRow(visible, active);
+  }
+
+  /**
+   * Announce the highlighted row to assistive technology.
+   *
+   * The `j`/`k` highlight is otherwise a purely visual change: a sighted user
+   * sees the row move, a screen-reader user would hear nothing at all. This
+   * runs on every render, not just on keypress, so a filter change that moves
+   * the highlight is announced too.
+   */
+  function announceRow(visible, active) {
+    var node = $("rows-status");
+    if (!node) return;
+    if (active < 0 || active >= visible.length) {
+      node.textContent = visible.length
+        ? visible.length + (visible.length === 1 ? " payment" : " payments")
+        : "";
+      return;
+    }
+    var p = visible[active];
+    node.textContent =
+      "Row " +
+      (active + 1) +
+      " of " +
+      visible.length +
+      ": " +
+      p.status +
+      ", " +
+      formatAmount(p.amount, p.asset) +
+      ", memo " +
+      p.memo;
+  }
+
+  /** A table cell carrying the column name the mobile card layout shows. */
+  function labelledCell(label, className, text) {
+    var td = el("td", className, text);
+    td.setAttribute("data-label", label);
+    return td;
+  }
+
+  function rowFor(p, isActive) {
     var tr = document.createElement("tr");
     tr.tabIndex = 0;
+    tr.dataset.paymentId = p.id;
+    if (isActive) {
+      tr.className = "row-active";
+      /* Roving tabindex: the highlighted row is the one the keyboard lands on,
+         so tabbing into the table does not restart at row 1. */
+      tr.setAttribute("aria-current", "true");
+    }
 
     var statusCell = document.createElement("td");
     statusCell.setAttribute("data-label", "Status");
     statusCell.appendChild(el("span", pillClass(p.status), p.status));
     tr.appendChild(statusCell);
 
-    tr.appendChild(el("td", null, formatAmount(p.amount, p.asset)));
-    tr.appendChild(el("td", "mono", p.memo));
-    tr.appendChild(el("td", null, fmtTime(p.created_at)));
-    tr.appendChild(el("td", "mono", shortId(p.id)));
+    /* `data-label` is what the ≤720px card layout renders as each row's
+       heading (see `.payments td::before` in dashboard.css). The table header
+       cells are hidden at that width, so without it the cards degrade to an
+       unlabelled list of values. */
+    tr.appendChild(labelledCell("Amount", null, formatAmount(p.amount, p.asset)));
+    tr.appendChild(labelledCell("Memo", "mono", p.memo));
+    tr.appendChild(labelledCell("Created", null, fmtTime(p.created_at)));
+    tr.appendChild(labelledCell("Payment ID", "mono", shortId(p.id)));
 
     tr.addEventListener("click", function () {
       openDetail(p.id);
@@ -271,14 +332,19 @@ import { fmtTime, shortId } from "/dashboard/format.js";
       }
     });
 
-    $("rows").appendChild(tr);
+    return tr;
   }
 
-  // ── Detail panel ──────────────────────────────────────────────────────
+  /* ── Detail panel ────────────────────────────────────────────────────── */
 
   function openDetail(id) {
+    store.update({ selectedPaymentId: id });
     show($("detail"), true);
     show($("scrim"), true);
+    /* Move focus into the panel so the keyboard user is inside the thing that
+       just opened, and so Escape is meaningful without a pointer. */
+    var close = $("detail-close");
+    if (close) close.focus();
 
     var fields = $("detail-fields");
     clear(fields);
@@ -291,7 +357,10 @@ import { fmtTime, shortId } from "/dashboard/format.js";
         [
           ["Status", p.status],
           ["Amount", formatAmount(p.amount, p.asset)],
-          ["Received", p.paid_amount ? formatAmount(p.paid_amount, p.asset) : "—"],
+          [
+            "Received",
+            p.paid_amount ? formatAmount(p.paid_amount, p.asset) : "—",
+          ],
           ["Memo", p.memo],
           ["Destination", p.destination_address],
           ["Transaction", p.tx_hash || "—"],
@@ -301,7 +370,13 @@ import { fmtTime, shortId } from "/dashboard/format.js";
           ["Merchant", p.merchant_id],
           ["Created", fmtTime(p.created_at)],
           ["Updated", fmtTime(p.updated_at)],
-          ["Expires", fmtTime(p.expires_at) + (p.status === "pending" ? " (" + countdown(p.expires_at) + " left)" : "")],
+          [
+            "Expires",
+            fmtTime(p.expires_at) +
+              (p.status === "pending"
+                ? " (" + countdown(p.expires_at) + " left)"
+                : ""),
+          ],
         ].forEach(function (pair) {
           fields.appendChild(el("dt", null, pair[0]));
           if (pair[0] === "Status") {
@@ -328,6 +403,16 @@ import { fmtTime, shortId } from "/dashboard/format.js";
       });
 
     loadDeliveries(id);
+  }
+
+  function closeDetail() {
+    store.update({ selectedPaymentId: null });
+    show($("detail"), false);
+    show($("scrim"), false);
+    /* Return focus to the list so a keyboard user is not dropped at the top of
+       the document after dismissing the panel. */
+    var rows = document.querySelector("#rows tr");
+    if (rows && typeof rows.focus === "function") rows.focus();
   }
 
   function loadDeliveries(paymentId) {
@@ -369,10 +454,22 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     li.appendChild(el("div", "delivery-meta", "created: " + relativeTime(d.created_at)));
     li.lastChild.title = fmtTime(d.created_at);
     if (d.status === "failed") {
-      li.appendChild(el("div", "error", "Last delivery failed; check receiver logs or redeliver."));
+      li.appendChild(
+        el(
+          "div",
+          "error",
+          "Last delivery failed; check receiver logs or redeliver."
+        )
+      );
     }
     if (d.status !== "delivered") {
-      li.appendChild(el("div", "delivery-meta", "retry state: queued for redrive if attempts remain"));
+      li.appendChild(
+        el(
+          "div",
+          "delivery-meta",
+          "retry state: queued for redrive if attempts remain"
+        )
+      );
     }
 
     var button = el("button", "ghost", "Redeliver");
@@ -395,7 +492,12 @@ import { fmtTime, shortId } from "/dashboard/format.js";
           button.disabled = false;
           button.textContent = "Redeliver";
           if (err.message !== "unauthorized") {
-            setError($("deliveries-error"), err.message.indexOf("429") >= 0 ? "Rate limited. Try again shortly." : err.message);
+            setError(
+              $("deliveries-error"),
+              err.message.indexOf("429") >= 0
+                ? "Rate limited. Try again shortly."
+                : err.message
+            );
           }
         });
     });
@@ -405,13 +507,8 @@ import { fmtTime, shortId } from "/dashboard/format.js";
   }
 
   function exportCsv() {
-    var header = ["id", "status", "amount", "asset", "asset_issuer", "memo", "destination_address", "created_at", "expires_at"];
-    var lines = [header.join(",")].concat(state.loadedPayments.map(function (p) {
-      return header.map(function (key) {
-        return '"' + String(p[key] || "").replace(/"/g, '""') + '"';
-      }).join(",");
-    }));
-    var blob = new Blob([lines.join("\n")], { type: "text/csv" });
+    var csv = toCsv(store.get().loadedPayments, CSV_COLUMNS);
+    var blob = new Blob([csv], { type: "text/csv" });
     var url = URL.createObjectURL(blob);
     var a = document.createElement("a");
     a.href = url;
@@ -420,12 +517,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     URL.revokeObjectURL(url);
   }
 
-  function closeDetail() {
-    show($("detail"), false);
-    show($("scrim"), false);
-  }
-
-  // ── Version ───────────────────────────────────────────────────────────
+  /* ── Version ─────────────────────────────────────────────────────────── */
 
   /** The root route answers with "StellarGate API vX.Y.Z". */
   function loadVersion() {
@@ -442,18 +534,18 @@ import { fmtTime, shortId } from "/dashboard/format.js";
       });
   }
 
-  // ── Health ────────────────────────────────────────────────────────────
+  /* ── Health ──────────────────────────────────────────────────────────── */
 
   function updateSessionExpiry() {
-    var saved = window.localStorage.getItem(KEY_SAVED_AT) || window.sessionStorage.getItem(KEY_SAVED_AT);
-    if (!saved) {
-      $("session-expiry").textContent = "";
+    var expiresAt = session.expiresAt();
+    var node = $("session-expiry");
+    if (!node) return;
+    if (expiresAt === null) {
+      node.textContent = "";
       return;
     }
-    var savedAt = Number(saved);
-    var expiresAt = savedAt + 30 * 24 * 60 * 60 * 1000;
-    $("session-expiry").textContent = "session " + countdown(new Date(expiresAt).toISOString());
-    $("session-expiry").title = "Saved " + fmtTime(new Date(savedAt).toISOString());
+    node.textContent = "session " + countdown(new Date(expiresAt).toISOString());
+    node.title = "Saved " + fmtTime(new Date(session.savedAt()).toISOString());
   }
 
   function pollHealth() {
@@ -477,23 +569,187 @@ import { fmtTime, shortId } from "/dashboard/format.js";
       });
   }
 
-  // ── Wiring ────────────────────────────────────────────────────────────
+  /* ── URL hash (filters, never credentials) ───────────────────────────── */
+
+  function applyHash() {
+    store.update(parseHash(window.location.hash));
+    syncFilterUi();
+  }
+
+  function writeHash() {
+    var hash = serializeHash(store.get());
+    /* replaceState, not assign: replace keeps the back button meaningful for
+       navigation, and the hash is written from a fixed key allow-list so a
+       filter value can never smuggle anything into the URL. */
+    window.history.replaceState(
+      null,
+      "",
+      hash ? "#" + hash : window.location.pathname
+    );
+  }
+
+  /* ── Keyboard shortcuts (#721) ───────────────────────────────────────── */
+
+  function openHelp() {
+    show($("help"), true);
+    store.update({ helpOpen: true });
+    var close = $("help-close");
+    if (close) close.focus();
+  }
+
+  function closeHelp() {
+    show($("help"), false);
+    store.update({ helpOpen: false });
+  }
+
+  function toggleHelp() {
+    if (store.get().helpOpen) closeHelp();
+    else openHelp();
+  }
+
+  /** Build the `?` overlay from SHORTCUTS so docs cannot drift from behaviour. */
+  function renderHelp() {
+    var list = $("help-list");
+    if (!list) return;
+    clear(list);
+    SHORTCUTS.forEach(function (s) {
+      var li = el("li", "help-row");
+      var key = el("kbd", null, s.hint);
+      key.setAttribute("data-shortcut", s.keys[0]);
+      li.appendChild(key);
+      li.appendChild(el("span", null, s.label));
+      list.appendChild(li);
+    });
+  }
+
+  function moveActiveRow(delta) {
+    var count = store.visiblePayments().length;
+    store.update({ activeRow: moveRow(store.get().activeRow, count, delta) });
+    renderRows();
+    var active = document.querySelector("#rows tr.row-active");
+    if (active && typeof active.scrollIntoView === "function") {
+      active.scrollIntoView({ block: "nearest" });
+    }
+  }
+
+  /** Open the highlighted row, or do nothing when no row is highlighted. */
+  function openActiveRow() {
+    var state = store.get();
+    var visible = store.visiblePayments();
+    if (state.activeRow < 0 || state.activeRow >= visible.length) return;
+    openDetail(visible[state.activeRow].id);
+  }
+
+  function onKeydown(ev) {
+    /* The help overlay is modal over the app: only its own dismiss keys are
+       honoured while it is open, so a stray `j` cannot move rows behind it. */
+    if (store.get().helpOpen) {
+      if (ev.key === "Escape" || ev.key === "?") {
+        ev.preventDefault();
+        closeHelp();
+      }
+      return;
+    }
+
+    var action = matchShortcut(ev, { activeElement: document.activeElement });
+    if (!action) return;
+
+    if (action === "focusSearch") {
+      var search = $("search");
+      if (!search) return;
+      ev.preventDefault();
+      search.focus();
+      search.select();
+      return;
+    }
+
+    /* Everything below is an in-app action and must not also reach the
+       browser's own defaults (space scrolls, `?` opens quick find in some
+       browsers, `/` opens quick find in Firefox). */
+    ev.preventDefault();
+
+    switch (action) {
+      case "refresh":
+        reload();
+        break;
+      case "nextRow":
+        moveActiveRow(1);
+        break;
+      case "prevRow":
+        moveActiveRow(-1);
+        break;
+      case "closeDrawer":
+        closeDetail();
+        break;
+      case "toggleHelp":
+        toggleHelp();
+        break;
+      default:
+        break;
+    }
+  }
+
+  /* ── Wiring ──────────────────────────────────────────────────────────── */
 
   function syncFilterUi() {
-    Array.prototype.forEach.call(document.querySelectorAll(".chip"), function (chip) {
-      chip.className = (chip.getAttribute("data-status") || "") === state.status ? "chip chip-on" : "chip";
-    });
-    $("auto-refresh").checked = state.autoRefresh;
+    var state = store.get();
+    Array.prototype.forEach.call(
+      document.querySelectorAll(".chip"),
+      function (chip) {
+        chip.className =
+          (chip.getAttribute("data-status") || "") === state.status
+            ? "chip chip-on"
+            : "chip";
+      }
+    );
+
+    var search = $("search");
+    if (search && search.value !== state.search) search.value = state.search;
+
+    var size = $("page-size");
+    if (size) size.value = String(state.pageSize);
+
+    var after = $("created-after");
+    if (after && after.value !== state.createdAfter) after.value = state.createdAfter;
+
+    var before = $("created-before");
+    if (before && before.value !== state.createdBefore) before.value = state.createdBefore;
+
+    var auto = $("auto-refresh");
+    if (auto) auto.checked = state.autoRefresh;
+  }
+
+  /** Re-render on a filter change: rows, chips, and the URL hash together. */
+  function onFilterChange() {
+    syncFilterUi();
+    writeHash();
+    reload();
+  }
+
+  /**
+   * Show the clear button only when there is something to clear.
+   *
+   * `type="search"` gives some browsers a native clear affordance, but not all,
+   * and it is invisible to keyboard users when it is not rendered — an explicit
+   * button keeps "get rid of this filter" reachable everywhere.
+   */
+  function syncSearchClear() {
+    var button = $("search-clear");
+    if (button) button.hidden = !store.get().search;
   }
 
   function init() {
+    renderHelp();
+
     $("gate-form").addEventListener("submit", function (ev) {
       ev.preventDefault();
       var key = $("api-key").value.trim();
       if (!key) return;
       setError($("gate-error"), null);
       signIn(key, $("remember").checked).catch(function (err) {
-        if (err.message !== "unauthorized") setError($("gate-error"), err.message);
+        if (err.message !== "unauthorized") {
+          setError($("gate-error"), err.message);
+        }
       });
     });
 
@@ -504,61 +760,103 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     $("refresh").addEventListener("click", reload);
     $("export-csv").addEventListener("click", exportCsv);
     $("page-size").addEventListener("change", function () {
-      state.pageSize = Number($("page-size").value) || 25;
-      reload();
+      var n = Number($("page-size").value) || 25;
+      store.update({ pageSize: n });
+      onFilterChange();
     });
     $("created-after").addEventListener("change", function () {
-      state.createdAfter = $("created-after").value;
-      reload();
+      store.update({ createdAfter: $("created-after").value });
+      onFilterChange();
     });
     $("created-before").addEventListener("change", function () {
-      state.createdBefore = $("created-before").value;
-      reload();
+      store.update({ createdBefore: $("created-before").value });
+      onFilterChange();
     });
+    $("auto-refresh").addEventListener("change", function () {
+      store.update({ autoRefresh: $("auto-refresh").checked });
+      onFilterChange();
+    });
+
+    /* Search filters the rows already loaded (#693), so it filters on input
+       with no debounce needed: there is no request to batch. */
+    var search = $("search");
+    if (search) {
+      search.addEventListener("input", function () {
+        store.update({ search: search.value.trim() });
+        store.clampActiveRow();
+        renderRows();
+        writeHash();
+        syncSearchClear();
+      });
+    }
+
+    var searchClear = $("search-clear");
+    if (searchClear) {
+      searchClear.addEventListener("click", function () {
+        store.update({ search: "" });
+        renderRows();
+        writeHash();
+        syncSearchClear();
+        var box = $("search");
+        if (box) box.focus();
+      });
+    }
+
     $("load-more").addEventListener("click", loadPayments);
     $("detail-close").addEventListener("click", closeDetail);
     $("scrim").addEventListener("click", closeDetail);
-    $("auto-refresh").addEventListener("change", function () {
-      state.autoRefresh = $("auto-refresh").checked;
-      writeHashState();
+    $("help-close").addEventListener("click", closeHelp);
+    $("help-scrim").addEventListener("click", closeHelp);
+    $("help-open").addEventListener("click", openHelp);
+
+    /* Enter on the highlighted row opens it, so `j`/`k` then Enter is a
+       complete keyboard path through the list. */
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key !== "Enter") return;
+      if (store.get().helpOpen) return;
+      if (document.activeElement && document.activeElement.tagName === "TR") {
+        return;
+      }
+      if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+      if (store.get().activeRow < 0) return;
+      ev.preventDefault();
+      openActiveRow();
     });
 
-    document.addEventListener("keydown", function (ev) {
-      if (ev.key === "Escape") closeDetail();
-    });
+    document.addEventListener("keydown", onKeydown);
 
     Array.prototype.forEach.call(
       document.querySelectorAll(".chip"),
       function (chip) {
         chip.addEventListener("click", function () {
-          Array.prototype.forEach.call(
-            document.querySelectorAll(".chip"),
-            function (c) {
-              c.className = "chip";
-            }
-          );
-          chip.className = "chip chip-on";
-          state.status = chip.getAttribute("data-status") || "";
-          writeHashState();
-          reload();
+          store.update({ status: chip.getAttribute("data-status") || "" });
+          onFilterChange();
         });
       }
     );
 
+    /* Back/forward must move the filters, or a shared URL is a lie. */
+    window.addEventListener("hashchange", function () {
+      if (store.get().key) {
+        applyHash();
+        reload();
+      }
+    });
+
     window.setInterval(function () {
-      if (state.key) pollHealth();
+      if (store.get().key) pollHealth();
     }, 30000);
     window.setInterval(function () {
+      var state = store.get();
       if (state.key && state.autoRefresh && (!state.status || state.status === "pending")) {
         reload();
       }
     }, 15000);
 
-    // Resume an existing session when a key is already stored.
     /* Resume an existing session when a key is already stored. The gate is
        visible until this succeeds, so any failure here simply leaves the user
        looking at the sign-in form rather than at nothing. */
-    var existing = storedKey();
+    var existing = session.read();
     if (existing) {
       signIn(existing, null).catch(function (err) {
         /* A 401 already returned to the gate via signOut() inside api(). Every

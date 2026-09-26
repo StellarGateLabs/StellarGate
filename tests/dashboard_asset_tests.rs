@@ -58,6 +58,29 @@ fn make_config() -> Config {
 const DASHBOARD_HTML: &str = include_str!("../static/dashboard.html");
 const DASHBOARD_CSS: &str = include_str!("../static/dashboard.css");
 const DASHBOARD_JS: &str = include_str!("../static/dashboard.js");
+const DASHBOARD_FORMAT_JS: &str = include_str!("../static/format.js");
+const DASHBOARD_SESSION_JS: &str = include_str!("../static/session.js");
+const DASHBOARD_STATE_JS: &str = include_str!("../static/state.js");
+const DASHBOARD_KEYS_JS: &str = include_str!("../static/keys.js");
+
+/// Every dashboard module, its served path, and its source file. Kept as one
+/// table so a new module cannot be added to the router without also being added
+/// to the serving, content-type and header assertions below.
+const MODULES: &[(&str, &str)] = &[
+    ("/dashboard/format.js", DASHBOARD_FORMAT_JS),
+    ("/dashboard/session.js", DASHBOARD_SESSION_JS),
+    ("/dashboard/state.js", DASHBOARD_STATE_JS),
+    ("/dashboard/keys.js", DASHBOARD_KEYS_JS),
+];
+
+/// Every JS asset route, entry point included.
+const JS_ROUTES: &[&str] = &[
+    "/dashboard/app.js",
+    "/dashboard/format.js",
+    "/dashboard/session.js",
+    "/dashboard/state.js",
+    "/dashboard/keys.js",
+];
 
 #[test]
 fn dashboard_api_requests_use_canonical_v1_base() {
@@ -89,6 +112,136 @@ fn dashboard_api_requests_use_canonical_v1_base() {
         DASHBOARD_JS.matches("/v1").count(),
         1,
         "API_BASE must be the only /v1 literal so requests cannot become /v1/v1/..."
+    );
+}
+
+/// Every relative `import` in a dashboard module must resolve to a route the
+/// router actually serves, and to a file that exists.
+///
+/// Without this, splitting the dashboard into modules (issue #723) would let a
+/// typo ship as a 404 that only shows up as a blank page in the browser — the
+/// entry module fails to evaluate, and the sign-in form the HTML ships with is
+/// the only thing the operator sees. The check runs over the router, so it also
+/// catches a module that exists on disk but was never routed.
+#[tokio::test]
+async fn every_dashboard_module_import_resolves_to_a_served_route() {
+    let server = test_server().await;
+
+    for (source_path, body) in
+        std::iter::once(("/dashboard/app.js", DASHBOARD_JS)).chain(MODULES.iter().copied())
+    {
+        for specifier in relative_imports(body) {
+            let resolved = format!("/dashboard/{specifier}");
+            assert!(
+                JS_ROUTES.contains(&resolved.as_str()),
+                "{source_path} imports {specifier:?}, which resolves to {resolved} — \
+                 no such route. Add it to the router in src/api/mod.rs."
+            );
+
+            let res = server.get(&resolved).await;
+            res.assert_status_ok();
+            assert_eq!(
+                res.header("content-type"),
+                "text/javascript; charset=utf-8",
+                "{resolved} must be served as a JavaScript module"
+            );
+        }
+    }
+}
+
+/// Extract the specifiers of every relative `import ... from "x"` statement.
+fn relative_imports(source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in source.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("import ") else {
+            continue;
+        };
+        // Only the single-line `import { … } from "x";` form is used; a bare
+        // `import "x";` is handled too so a side-effect import is not missed.
+        let Some(from) = rest.rsplit_once(" from ").map(|(_, tail)| tail) else {
+            continue;
+        };
+        let Some(quoted) = from
+            .trim()
+            .strip_prefix('"')
+            .and_then(|s| s.split_once('"'))
+            .map(|(spec, _)| spec)
+        else {
+            continue;
+        };
+        if quoted.starts_with("./") {
+            out.push(quoted.trim_start_matches("./").to_string());
+        }
+    }
+    out
+}
+
+/// The API key must travel in the `Authorization` header and nowhere else
+/// (issue #726).
+///
+/// This is the static half of the guarantee: it fails at compile time if a
+/// future change starts interpolating the key into a URL, appending it to a
+/// query string, or logging it. The matching end-to-end assertion over real
+/// browser traffic lives in the Playwright suite, which is the only place that
+/// can catch a leak built at runtime rather than in source.
+#[test]
+fn dashboard_never_puts_the_api_key_in_a_url_or_the_console() {
+    // The only place the key is read is the header assignment.
+    assert_eq!(
+        DASHBOARD_JS
+            .matches(r#"headers.Authorization = "Bearer " + key"#)
+            .count(),
+        1,
+        "the key must be attached to exactly one place: the Authorization header"
+    );
+
+    for (name, source) in
+        std::iter::once(("dashboard.js", DASHBOARD_JS)).chain(MODULES.iter().map(|(p, b)| (*p, *b)))
+    {
+        // Any interpolation of a credential-looking variable into a string that
+        // reaches a URL, the hash, or the console is the leak we care about.
+        for forbidden in [
+            "api_key=",
+            "apikey=",
+            "access_token=",
+            "?key=",
+            "console.log",
+            "console.debug",
+            "console.info",
+            "console.warn",
+            "console.error",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{name} must not contain {forbidden:?}: the API key belongs in the \
+                 Authorization header only, never in a URL, the hash, or a log line"
+            );
+        }
+
+        // `location` writes are how a secret ends up in browser history and in
+        // any screenshot of the address bar. The hash carries filters only, and
+        // `static/state.js` enforces that with an explicit key allow-list.
+        for forbidden in ["location.href =", "location.search", "location.pathname ="] {
+            if name.ends_with("app.js") {
+                assert!(
+                    !source.contains(forbidden),
+                    "dashboard.js must not assign {forbidden:?}: a credential in the \
+                     address bar persists in history and leaks via the referrer"
+                );
+            }
+        }
+    }
+}
+
+/// Filter state round-trips through the URL hash, and the hash carries nothing
+/// else — it is the one part of the URL an operator is expected to share.
+#[test]
+fn dashboard_hash_state_only_ever_carries_filters() {
+    assert!(
+        DASHBOARD_STATE_JS.contains(r#"const HASH_KEYS = ["status", "search", "auto_refresh"];"#),
+        "the hash allow-list must stay explicit: serialising a state object \
+         wholesale is how a credential ends up in a shareable URL"
     );
 }
 
@@ -140,7 +293,7 @@ const EXPECTED_CSP: &str = "default-src 'none'; \
 async fn dashboard_assets_keep_content_type_and_csp() {
     let server = test_server().await;
 
-    for (path, content_type, body) in [
+    let mut assets: Vec<(&str, &str, &str)> = vec![
         ("/dashboard", "text/html; charset=utf-8", DASHBOARD_HTML),
         (
             "/dashboard/app.css",
@@ -152,7 +305,14 @@ async fn dashboard_assets_keep_content_type_and_csp() {
             "text/javascript; charset=utf-8",
             DASHBOARD_JS,
         ),
-    ] {
+    ];
+    assets.extend(
+        MODULES
+            .iter()
+            .map(|(path, body)| (*path, "text/javascript; charset=utf-8", *body)),
+    );
+
+    for (path, content_type, body) in assets {
         let res = server.get(path).await;
         res.assert_status_ok();
         assert_eq!(
@@ -176,6 +336,25 @@ async fn dashboard_assets_keep_content_type_and_csp() {
     }
 }
 
+/// An unknown file under `/dashboard/` must 404 rather than being resolved from
+/// disk. The modules are individually routed from `include_str!` constants, so
+/// there is no directory to traverse — this pins that property so a future
+/// wildcard route cannot quietly expose `static/`.
+#[tokio::test]
+async fn unknown_dashboard_module_is_not_found() {
+    let server = test_server().await;
+
+    for path in [
+        "/dashboard/../Cargo.toml",
+        "/dashboard/tests/format.test.js",
+        "/dashboard/dashboard.js",
+        "/dashboard/nope.js",
+    ] {
+        let res = server.get(path).await;
+        res.assert_status_not_found();
+    }
+}
+
 /// Each header must appear exactly once — a response builder that appends
 /// instead of replacing would otherwise emit a duplicate `nosniff` alongside
 /// the outer security-header layer's copy.
@@ -183,7 +362,10 @@ async fn dashboard_assets_keep_content_type_and_csp() {
 async fn dashboard_security_headers_are_not_duplicated() {
     let server = test_server().await;
 
-    for path in ["/dashboard", "/dashboard/app.css", "/dashboard/app.js"] {
+    for path in std::iter::once("/dashboard")
+        .chain(std::iter::once("/dashboard/app.css"))
+        .chain(JS_ROUTES.iter().copied())
+    {
         let res = server.get(path).await;
         res.assert_status_ok();
         for name in [

@@ -1658,9 +1658,10 @@ mod tests {
         let (raw, prefix) = generate_api_key();
         let body = raw.strip_prefix("sg_").expect("key starts with sg_");
         assert_eq!(body.len(), 64);
-        assert!(body
-            .chars()
-            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+        assert!(
+            body.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        );
         assert_eq!(prefix.len(), KEY_PREFIX_LEN);
         assert!(raw.starts_with(&prefix));
         assert_ne!(raw, generate_api_key().0);
