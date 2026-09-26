@@ -2144,7 +2144,8 @@ mod tests {
             "transaction_hash": "abc",
             "transaction": { "memo": "MEMO1234", "memo_type": "text", "successful": true }
         }"#;
-        let hp: HorizonPayment = serde_json::from_str(data).unwrap();
+        let hp: HorizonPayment =
+            serde_json::from_str(data).expect("streamed payment JSON should deserialize");
         let p = pending("XLM", "10.00");
         assert!(matches!(
             verify(&p, &hp, &test_assets(), 0),
@@ -2174,7 +2175,8 @@ mod tests {
                 }
             ]}
         }"#;
-        let page: PaymentsPage = serde_json::from_str(body).unwrap();
+        let page: PaymentsPage =
+            serde_json::from_str(body).expect("Horizon payments page JSON should deserialize");
         assert_eq!(page.embedded.records.len(), 1);
         assert_eq!(page.embedded.records[0].memo(), Some("MEMO1234"));
         assert_eq!(
