@@ -59,6 +59,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The payment detail drawer traps keyboard focus and gives it back (issue
+  #714).** Opening a payment moved nothing: focus stayed on the row behind the
+  panel, so a keyboard user tabbed straight back out into the payment table
+  while reading the drawer, with no cue that a panel was open at all. Closing
+  it dropped focus to `<body>`, so the next Tab restarted from the top of the
+  document and the table had to be re-tabbed to get back to the row they were
+  on. The drawer now takes focus on open, wraps Tab in both directions, pulls
+  focus back if it lands outside by any other route (a click on the page behind
+  it), and returns focus to the originating row on close — guarded on
+  `isConnected`, since a refresh between open and close replaces the row and
+  focusing a detached node drops focus to `<body>`, which is the loss this
+  exists to prevent.
+
 - Dashboard maintenance CI now runs a dependency-free JavaScript syntax check
   and static accessibility smoke check for `static/dashboard.*`, so the
   embedded dashboard keeps a small quality gate without introducing an npm

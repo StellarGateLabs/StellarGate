@@ -29,6 +29,9 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     loading: false,
     loadedPayments: [],
     autoRefresh: false,
+    // The table row that opened the detail drawer, so focus can be handed back
+    // to it on close. See `closeDetail`.
+    detailTrigger: null,
   };
 
   // ── Tiny DOM helpers ──────────────────────────────────────────────────
@@ -239,6 +242,10 @@ import { fmtTime, shortId } from "/dashboard/format.js";
   /** Return to the sign-in form, keeping any stored key so a reload retries. */
   function showGate(message) {
     state.key = null;
+    // Clear the trigger before closing. Signing out is not "the user finished
+    // with the drawer", and the row focus would return to is about to be
+    // hidden along with the rest of the app.
+    state.detailTrigger = null;
     closeDetail();
     show($("app"), false);
     show($("gate"), true);
@@ -538,12 +545,12 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     tr.appendChild(el("td", "mono", shortId(p.id)));
 
     tr.addEventListener("click", function () {
-      openDetail(p.id);
+      openDetail(p.id, tr);
     });
     tr.addEventListener("keydown", function (ev) {
       if (ev.key === "Enter" || ev.key === " ") {
         ev.preventDefault();
-        openDetail(p.id);
+        openDetail(p.id, tr);
       }
     });
 
@@ -552,9 +559,112 @@ import { fmtTime, shortId } from "/dashboard/format.js";
 
   // ── Detail panel ──────────────────────────────────────────────────────
 
-  function openDetail(id) {
+  /**
+   * Every element that can hold focus, in document order.
+   *
+   * `tabindex="-1"` is excluded deliberately: such elements are focusable
+   * programmatically but are not in the Tab ring, so the drawer container
+   * itself (which is what gets focus on open, see `focusDetail`) is not a wrap
+   * target — the ring has to skip straight from the last control back to the
+   * first.
+   */
+  var FOCUSABLE = [
+    "a[href]",
+    "button:not([disabled])",
+    "input:not([disabled])",
+    "select:not([disabled])",
+    "textarea:not([disabled])",
+    '[tabindex]:not([tabindex="-1"])',
+  ].join(",");
+
+  function focusableIn(container) {
+    return Array.prototype.filter.call(
+      container.querySelectorAll(FOCUSABLE),
+      function (node) {
+        // `offsetParent` is null for a detached node and, for a fixed-position
+        // element, for one inside a `display: none` subtree — all three of
+        // which must be skipped or the ring would cycle through something the
+        // user cannot see.
+        return node.offsetParent !== null || node.getClientRects().length > 0;
+      }
+    );
+  }
+
+  /**
+   * Move focus into the drawer.
+   *
+   * The container is `tabindex="-1"`, so focusing it announces the drawer
+   * without inserting a phantom stop in the Tab ring; the next Tab lands on the
+   * close button, which is the first focusable in DOM order anyway. Focusing a
+   * specific field instead would mean tracking which fields exist per status,
+   * and focusing the close button outright would skip the announcement
+   * entirely for a screen-reader user.
+   */
+  function focusDetail() {
+    $("detail").focus();
+  }
+
+  /**
+   * Keep Tab inside the drawer (issue #714).
+   *
+   * Without this, Tab from the last control walks into the page behind the
+   * drawer: to the next toolbar button, then out through the document, so a
+   * keyboard user tabbing through the detail fields is silently reading the
+   * payment table again with no visual cue that the drawer was ever there.
+   */
+  function trapDetailFocus(ev) {
+    if (ev.key !== "Tab") return;
+
+    var detail = $("detail");
+    var ring = focusableIn(detail);
+    if (!ring.length) {
+      ev.preventDefault();
+      detail.focus();
+      return;
+    }
+
+    var first = ring[0];
+    var last = ring[ring.length - 1];
+    var active = document.activeElement;
+
+    // Focus is on the container itself (just opened, or focus was reset): the
+    // ring runs forwards from the start and backwards from the end.
+    if (!detail.contains(active) || active === detail) {
+      ev.preventDefault();
+      (ev.shiftKey ? last : first).focus();
+      return;
+    }
+
+    if (ev.shiftKey && active === first) {
+      ev.preventDefault();
+      last.focus();
+    } else if (!ev.shiftKey && active === last) {
+      ev.preventDefault();
+      first.focus();
+    }
+  }
+
+  /**
+   * Pull focus back if something outside the drawer takes it — a click on the
+   * page behind it, a browser restoring focus on refresh, an extension. The
+   * Tab handler above only covers keyboard traversal; this covers the rest.
+   */
+  function keepFocusInDetail(ev) {
+    var detail = $("detail");
+    if (!detail.contains(ev.target)) {
+      focusDetail();
+    }
+  }
+
+  function openDetail(id, trigger) {
+    // Remember the row so focus can go back to it on close. Without this, a
+    // keyboard user who opens a payment and closes it lands on <body>: the
+    // next Tab restarts from the top of the document, so the table has to be
+    // re-tabbed from the filters to reach the row they were on.
+    state.detailTrigger = trigger || null;
     show($("detail"), true);
     show($("scrim"), true);
+    focusDetail();
 
     var fields = $("detail-fields");
     clear(fields);
@@ -723,9 +833,22 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     URL.revokeObjectURL(url);
   }
 
+  /**
+   * Hide the drawer and hand focus back to the row that opened it.
+   *
+   * Guarded on `isConnected`: a refresh or a "Load more" re-render between
+   * open and close replaces the row element, and focusing a detached node
+   * silently drops focus back to <body> — the exact loss this is meant to
+   * prevent.
+   */
   function closeDetail() {
+    var trigger = state.detailTrigger;
     show($("detail"), false);
     show($("scrim"), false);
+    state.detailTrigger = null;
+    if (trigger && trigger.isConnected) {
+      trigger.focus();
+    }
   }
 
   // ── Version ───────────────────────────────────────────────────────────
@@ -823,6 +946,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     $("load-more").addEventListener("click", loadPayments);
     $("detail-close").addEventListener("click", closeDetail);
     $("scrim").addEventListener("click", closeDetail);
+    $("detail").addEventListener("keydown", trapDetailFocus);
     $("auto-refresh").addEventListener("change", function () {
       state.autoRefresh = $("auto-refresh").checked;
       writeHashState();
@@ -830,6 +954,13 @@ import { fmtTime, shortId } from "/dashboard/format.js";
 
     document.addEventListener("keydown", function (ev) {
       if (ev.key === "Escape") closeDetail();
+    });
+
+    /* Only while the drawer is open: without that guard every focus change on
+    the page would be dragged into a hidden drawer. */
+    document.addEventListener("focusin", function (ev) {
+      if ($("detail").contains(ev.target)) return;
+      if (!$("detail").hidden) keepFocusInDetail(ev);
     });
 
     Array.prototype.forEach.call(

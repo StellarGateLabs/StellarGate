@@ -58,6 +58,7 @@ fn make_config() -> Config {
 const DASHBOARD_HTML: &str = include_str!("../static/dashboard.html");
 const DASHBOARD_CSS: &str = include_str!("../static/dashboard.css");
 const DASHBOARD_JS: &str = include_str!("../static/dashboard.js");
+
 const DASHBOARD_FORMAT_JS: &str = include_str!("../static/dashboard-format.js");
 
 #[test]
@@ -117,6 +118,123 @@ fn format_module_exports_required_helpers() {
     assert!(
         DASHBOARD_FORMAT_JS.contains("export function shortId"),
         "dashboard-format.js must export shortId"
+    );
+}
+
+/// Every helper the dashboard calls must actually be defined.
+///
+/// A file built from stacked PRs has a history of calling helpers that were
+/// never written: `formatAmount`, `countdown`, `explorerTx`, `readHashState`,
+/// `writeHashState` and `relativeTime` were all invoked but undefined, and the
+/// first of them runs during sign-in, so the symptom was a page that never left
+/// the sign-in form rather than an error anyone could see. `node --check`
+/// cannot catch it — the file is syntactically perfect.
+///
+/// A full scope analysis would need a JavaScript parser, which this crate
+/// deliberately has no route to, so this pins the names the script depends on.
+/// Adding a helper to the script means adding it here.
+#[test]
+fn every_dashboard_helper_the_script_calls_is_defined() {
+    for helper in [
+        // Amount / time rendering. `formatAmount` and `countdown` are called
+        // from the table and the detail fields; `relativeTime` from every
+        // delivery row.
+        "formatAmount",
+        "countdown",
+        "relativeTime",
+        // Explorer links (#701).
+        "explorerTx",
+        // View state in the URL hash (#696).
+        "readHashState",
+        "writeHashState",
+        // UI plumbing.
+        "syncFilterUi",
+        // Focus management in the detail drawer (#714).
+        "focusDetail",
+        "trapDetailFocus",
+        "keepFocusInDetail",
+    ] {
+        assert!(
+            DASHBOARD_JS.contains(&format!("function {helper}(")),
+            "static/dashboard.js calls `{helper}` but never defines it — every call \
+             site is a runtime ReferenceError, and a syntax check will not see it"
+        );
+    }
+}
+
+/// The detail drawer is a keyboard trap: a screen-reader or keyboard user who
+/// opens it must not be able to tab out into the page behind it, and closing it
+/// must put them back on the row they came from (issue #714).
+///
+/// A modal dialog does not wrap Tab at the ends in any current browser, so this
+/// has to be done by hand even once #715 lands.
+///
+/// Asserted against the shipped asset text rather than a DOM, because there is
+/// no browser in CI — this pins the mechanisms the behaviour rests on, so a
+/// refactor that drops any one of them fails here instead of shipping a drawer
+/// that silently leaks focus.
+#[test]
+fn detail_drawer_traps_focus_and_restores_it() {
+    assert!(
+        DASHBOARD_HTML.contains(r#"<aside id="detail" class="detail" tabindex="-1""#),
+        "the drawer must be programmatically focusable (tabindex=\"-1\") or focus \
+         cannot be moved into it — and it must not be a positive tabindex, which \
+         would add a phantom stop in front of the controls it contains"
+    );
+
+    // Focus in, on open.
+    assert!(
+        DASHBOARD_JS.contains(r#"$("detail").addEventListener("keydown", trapDetailFocus);"#),
+        "the drawer's Tab handling must be bound to the drawer"
+    );
+    assert!(
+        DASHBOARD_JS.contains("function focusDetail()"),
+        "focus must move into the drawer when it opens"
+    );
+    assert!(
+        DASHBOARD_JS.contains("focusDetail();"),
+        "openDetail must call focusDetail, or focus stays on the row behind the drawer"
+    );
+
+    // Focus back out, on close.
+    assert!(
+        DASHBOARD_JS.contains("state.detailTrigger = trigger || null;"),
+        "openDetail must remember the row that opened the drawer"
+    );
+    assert!(
+        DASHBOARD_JS.contains("if (trigger && trigger.isConnected) {"),
+        "closeDetail must return focus to that row, guarded on isConnected — \
+         focusing a node detached by a re-render drops focus to <body>, which is \
+         the loss this exists to prevent"
+    );
+
+    // The trap has to cover both directions and both escape routes.
+    for needle in [
+        r#"if (ev.key !== "Tab") return;"#,
+        r#"if (ev.shiftKey && active === first) {"#,
+        r#"} else if (!ev.shiftKey && active === last) {"#,
+        r#"document.addEventListener("focusin", function (ev) {"#,
+    ] {
+        assert!(
+            DASHBOARD_JS.contains(needle),
+            "the focus trap is missing `{needle}`; Tab must wrap in both directions \
+             and a focus that lands outside the drawer by any other route (a click \
+             on the page behind it) must be pulled back"
+        );
+    }
+}
+
+/// Rows are what focus returns to, so they have to be reachable by keyboard in
+/// the first place.
+#[test]
+fn payment_rows_are_keyboard_reachable_and_activate_on_enter() {
+    assert!(
+        DASHBOARD_JS.contains("tr.tabIndex = 0;"),
+        "each payment row must be focusable, or there is nowhere to return focus to"
+    );
+    assert!(
+        DASHBOARD_JS.contains("openDetail(p.id, tr);"),
+        "rows must pass themselves to openDetail so focus can be handed back"
     );
 }
 

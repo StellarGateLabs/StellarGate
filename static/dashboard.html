@@ -117,10 +117,13 @@
         </section>
       </main>
 
-      <!-- Detail panel, opened by clicking a row. -->
-      <aside id="detail" class="detail" hidden aria-label="Payment detail">
+      <!-- Detail panel, opened by clicking a row. `tabindex="-1"` makes the
+           panel itself programmatically focusable so opening it can move focus
+           into the drawer and announce it; it is deliberately not in the Tab
+           ring. #715 converts this to a real <dialog>. -->
+      <aside id="detail" class="detail" tabindex="-1" hidden aria-label="Payment detail">
         <div class="detail-head">
-          <h2>Payment</h2>
+          <h2 id="detail-title">Payment</h2>
           <button id="detail-close" class="ghost" aria-label="Close">&times;</button>
         </div>
         <dl id="detail-fields" class="fields"></dl>
