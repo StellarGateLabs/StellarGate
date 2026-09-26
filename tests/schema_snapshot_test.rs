@@ -100,6 +100,23 @@ fn snapshot_statements() -> Vec<String> {
         .collect()
 }
 
+/// Reorder the snapshot into an order a fresh database can actually execute.
+///
+/// The file is stored in SQLite's own `(type, name)` order — which sorts every
+/// `CREATE INDEX` ahead of every `CREATE TABLE` — because that is what
+/// `sqlite_master` returns and the comparison in
+/// `migrated_schema_matches_the_checked_in_snapshot` is textual. Executing that
+/// order is a different problem: an index on a table that does not exist yet
+/// fails with `no such table`, and so does a trigger referencing one. So
+/// replaying hoists the `CREATE TABLE`s to the front and leaves the order
+/// within each group alone.
+fn replay_order(statements: Vec<String>) -> Vec<String> {
+    let (tables, dependent): (Vec<String>, Vec<String>) = statements
+        .into_iter()
+        .partition(|s| s.to_ascii_uppercase().starts_with("CREATE TABLE"));
+    tables.into_iter().chain(dependent).collect()
+}
+
 #[tokio::test]
 async fn migrated_schema_matches_the_checked_in_snapshot() {
     let current = current_schema_statements().await;
@@ -154,7 +171,7 @@ async fn database_file_from_current_release_upgrades_cleanly() {
     stands in for a database the previous build created. */
     {
         let pool = file.pool().await;
-        for stmt in snapshot_statements() {
+        for stmt in replay_order(snapshot_statements()) {
             sqlx::query(sqlx::AssertSqlSafe(stmt))
                 .execute(&pool)
                 .await

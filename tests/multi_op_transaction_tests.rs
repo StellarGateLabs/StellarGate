@@ -157,6 +157,11 @@ async fn seed_pending_payment(pool: &db::Db, webhook_url: Option<&str>) -> Strin
 fn make_half_payment(paging_token: &str) -> HorizonPayment {
     HorizonPayment {
         kind: "payment".into(),
+        // Added by #614/#615: the dedup key is (payment_id, tx_hash,
+        // operation_index), so a multi-op transaction credits each operation
+        // independently. Absent from a real response only on pre-protocol-10
+        // Horizon, where it defaults to 0.
+        operation_index: 0,
         amount: Some("5.0000000".into()),
         asset_type: Some("native".into()),
         asset_code: None,
@@ -175,6 +180,29 @@ fn make_half_payment(paging_token: &str) -> HorizonPayment {
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
+/// The `event` field of every webhook the mock received, in arrival order.
+///
+/// Asserting on the sequence rather than a bare count is the point: a
+/// half-payment firing `payment.underpaid` before the completing operation
+/// fires `payment.completed` is the documented underpayment contract
+/// (WEBHOOK_REFERENCE.md), so a count-only assertion would pass just as
+/// happily if the gateway dispatched `payment.completed` twice.
+async fn delivered_events(mock_server: &MockServer) -> Vec<String> {
+    mock_server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|req| {
+            serde_json::from_slice::<serde_json::Value>(&req.body)
+                .expect("webhook body is JSON")["event"]
+                .as_str()
+                .expect("every payload carries an event")
+                .to_string()
+        })
+        .collect()
+}
+
 /// **Core regression test for issue #613.**
 ///
 /// A single Stellar transaction contains two 5 XLM payment operations that
@@ -183,7 +211,9 @@ fn make_half_payment(paging_token: &str) -> HorizonPayment {
 /// therefore different `operation_index` values).
 ///
 /// Expected outcome: both operations are credited, the intent reaches
-/// `completed`, and exactly one `payment.completed` webhook is dispatched.
+/// `completed`, and the events dispatched are the documented pair — the first
+/// operation underpays and fires `payment.underpaid`, the second brings the
+/// total up to the expected amount and fires `payment.completed`.
 ///
 /// Before the fix, the second operation would silently hit the `(payment_id,
 /// tx_hash)` PRIMARY KEY conflict, be discarded, and the intent would remain
@@ -208,10 +238,13 @@ async fn multi_op_same_tx_credits_full_amount() {
     let op1 = make_half_payment("101");
 
     // Process op 0 — intent goes underpaid (5 of 10 XLM received).
-    let settled0 = reconcile_payment(&state, &op0)
+    //
+    // `reconcile_payment` returns whether it *updated the row*, not whether the
+    // intent reached `completed`; the underpayment transition is an update, so
+    // it returns true. The resulting status is the assertion that matters.
+    reconcile_payment(&state, &op0)
         .await
         .expect("op0 reconcile must not error");
-    assert!(!settled0, "first half-payment must not complete the intent");
 
     let payment = db::get_payment(&pool, &payment_id)
         .await
@@ -240,14 +273,12 @@ async fn multi_op_same_tx_credits_full_amount() {
         "intent must be completed after both ops are credited"
     );
 
-    // Exactly one completed webhook should have been dispatched.
+    // The documented event sequence: underpaid first, then completed.
     tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
-    let received = mock_server.received_requests().await.unwrap();
     assert_eq!(
-        received.len(),
-        1,
-        "exactly one webhook must be dispatched (payment.completed); got {}",
-        received.len()
+        delivered_events(&mock_server).await,
+        ["payment.underpaid", "payment.completed"],
+        "each operation must dispatch its own transition event"
     );
 
     // Both operations must be in the processed_transactions ledger.
@@ -259,8 +290,8 @@ async fn multi_op_same_tx_credits_full_amount() {
     );
 }
 
-/// Re-processing the same two operations (as a poller rescan would) must be a
-/// complete no-op: the intent stays `completed` and no extra webhooks fire.
+/// Re-processing the same two operations (as a poller rescan would) must be
+/// a complete no-op: the intent stays `completed` and no extra webhooks fire.
 #[tokio::test]
 async fn multi_op_idempotent_on_rescan() {
     let mock_server = MockServer::start().await;
@@ -287,10 +318,11 @@ async fn multi_op_idempotent_on_rescan() {
     let payment = db::get_payment(&pool, &payment_id).await.unwrap().unwrap();
     assert_eq!(payment.status, "completed");
 
-    let after_first_pass = mock_server.received_requests().await.unwrap().len();
+    let first_pass = delivered_events(&mock_server).await;
     assert_eq!(
-        after_first_pass, 1,
-        "should have exactly one webhook after first pass"
+        first_pass,
+        ["payment.underpaid", "payment.completed"],
+        "first pass must dispatch one event per status transition"
     );
 
     // Second pass: rescan with the same operations.
@@ -306,11 +338,10 @@ async fn multi_op_idempotent_on_rescan() {
     );
 
     // No new webhooks.
-    let after_rescan = mock_server.received_requests().await.unwrap().len();
     assert_eq!(
-        after_rescan, after_first_pass,
-        "rescan must not fire additional webhooks; got {} total after rescan",
-        after_rescan
+        delivered_events(&mock_server).await,
+        first_pass,
+        "rescan must not fire additional webhooks"
     );
 
     // Stroop total must remain exactly 10 XLM.
@@ -357,6 +388,11 @@ async fn single_op_tx_still_works() {
 
     let hp = HorizonPayment {
         kind: "payment".into(),
+        // Added by #614/#615: the dedup key is (payment_id, tx_hash,
+        // operation_index), so a multi-op transaction credits each operation
+        // independently. Absent from a real response only on pre-protocol-10
+        // Horizon, where it defaults to 0.
+        operation_index: 0,
         amount: Some("10.0000000".into()),
         asset_type: Some("native".into()),
         asset_code: None,

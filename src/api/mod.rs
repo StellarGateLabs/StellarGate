@@ -285,27 +285,52 @@ fn api_v1(
 ) -> axum::Router<Arc<AppState>> {
     /* Merchant provisioning and API key lifecycle. All admin-gated behind
     ADMIN_PROVISIONING_SECRET: this service has no self-service signup, and
-    minting or revoking a credential is an operator action. */
+    minting or revoking a credential is an operator action. The admin layer
+    goes on each `MethodRouter` for the same reason as the merchant auth layer
+    below — a 405 on a known path stays a 405 rather than becoming a 401. */
+    let admin_layer = || middleware::from_fn_with_state(state.clone(), require_admin_secret);
     let merchants = axum::Router::new()
-        .route("/", post(provision_merchant))
-        .route("/{id}/keys", post(issue_api_key).get(list_api_keys))
-        .route("/{id}/keys/{key_id}", axum::routing::delete(revoke_api_key))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_admin_secret,
-        ));
+        .route("/", post(provision_merchant).route_layer(admin_layer()))
+        .route(
+            "/{id}/keys",
+            post(issue_api_key)
+                .get(list_api_keys)
+                .route_layer(admin_layer()),
+        )
+        .route(
+            "/{id}/keys/{key_id}",
+            axum::routing::delete(revoke_api_key).route_layer(admin_layer()),
+        );
 
     /* Auth middleware on the write + list routes and the webhook listing.
     The per-payment status endpoint handles credentials itself, because it
     serves both authenticated and anonymous callers — see
-    `payments::get_by_id`. */
+    `payments::get_by_id`.
+
+    The credential layer is attached to each `MethodRouter`, not to the
+    `Router` around them. That distinction decides who answers a wrong method
+    on a known path: `Router::route_layer` keeps its middleware out of the way
+    of the *router's* 404, but a 405 is produced by the inner
+    `MethodRouter`, which `Router::route_layer` treats as an ordinary matched
+    route. The credential check therefore ran first and an unauthenticated
+    `PUT /v1/payments` came back 401 instead of the 405 the API documents
+    (#635). `MethodRouter::route_layer` is documented for exactly this — it
+    "will only run if the request matches a route", leaving the 405 fallback to
+    answer unauthenticated. No handler is reachable without a credential
+    either way; the only difference is the status a caller gets for a method
+    the route does not implement. */
+    let auth_layer = || middleware::from_fn_with_state(state.clone(), auth_middleware);
     let payments_authed = axum::Router::new()
-        .route("/", post(payments::create).get(payments::list))
-        .route("/{id}/webhooks", get(payments::list_webhooks))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ));
+        .route(
+            "/",
+            post(payments::create)
+                .get(payments::list)
+                .route_layer(auth_layer()),
+        )
+        .route(
+            "/{id}/webhooks",
+            get(payments::list_webhooks).route_layer(auth_layer()),
+        );
 
     /* Redelivery gets its own sub-router so `merchant_redeliver_limit_middleware`
     (issue #468) applies only here, not to every authenticated payments route.
@@ -316,19 +341,15 @@ fn api_v1(
     then the merchant limiter (runs second, reads it). The last `route_layer`
     added is the outermost, so auth must stay below the limiter here —
     `test_redeliver_runs_auth_before_merchant_limiter` pins this order. */
-    let redeliver = axum::Router::new()
-        .route(
-            "/{id}/webhooks/{delivery_id}/redeliver",
-            post(payments::redeliver_webhook),
-        )
-        .route_layer(middleware::from_fn_with_state(
-            merchant_redeliver_limit,
-            merchant_redeliver_limit_middleware,
-        ))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ));
+    let redeliver = axum::Router::new().route(
+        "/{id}/webhooks/{delivery_id}/redeliver",
+        post(payments::redeliver_webhook)
+            .route_layer(middleware::from_fn_with_state(
+                merchant_redeliver_limit,
+                merchant_redeliver_limit_middleware,
+            ))
+            .route_layer(auth_layer()),
+    );
 
     axum::Router::new().nest("/merchants", merchants).nest(
         "/payments",

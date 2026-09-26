@@ -271,7 +271,24 @@ impl HorizonPayment {
     /// tests without one) we default to `0`, which is the correct value for
     /// any single-operation transaction and for records written before this
     /// field existed (issue #616).
+    ///
+    /// The field Horizon sends directly wins when it is present. Reading only
+    /// the paging token — as this did — makes the whole multi-op fix depend on
+    /// a token that has to happen to parse as an integer: a record whose token
+    /// is not numeric falls back to `0`, so every operation in that transaction
+    /// collapses onto one `processed_transactions` row, the second is discarded
+    /// as already-seen, and the intent stays underpaid. That is the exact bug
+    /// #613 reported, still reachable through a perfectly ordinary response.
+    ///
+    /// `0` is indistinguishable from "field absent" once `#[serde(default)]` has
+    /// run, so a zero falls through to the token: for a real single-operation
+    /// payment the token encodes the correct index anyway, and it keeps records
+    /// written before this field existed addressed by the value they were
+    /// already using.
     pub fn operation_index(&self) -> i64 {
+        if self.operation_index != 0 {
+            return self.operation_index;
+        }
         self.paging_token
             .as_deref()
             .and_then(|t| t.parse::<i64>().ok())

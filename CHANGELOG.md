@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`main` did not compile, and its newest tests did not pass.** This is not a
+  behaviour change; it is the minimum needed to get to a green baseline. None
+  of it is mine — every item below landed on `main` in the last few merges.
+
+  - **`src/api/payments.rs` had no `axum` imports at all.** The commit that
+    removed the duplicated `use` block deleted the whole item, leaving
+    `use axum::{Json};` and 73 errors across the file. Deduped, not removed.
+  - **`HorizonPayment::operation_index()` ignored the field of the same name.**
+    It read only the paging token and parsed it as an integer, so any record
+    whose token is not numeric fell back to `0` — which puts every operation of
+    that transaction on one `processed_transactions` row, discards the second
+    as already-seen, and leaves the intent `underpaid`. That is precisely the
+    bug #613 reported, still reachable through an ordinary Horizon response,
+    and it is what made the new `multi_op_credit_tests` fail. The field Horizon
+    sends directly now wins when present; a zero still falls through to the
+    token, because `#[serde(default)]` makes "absent" indistinguishable from
+    zero, and that keeps pre-#616 rows addressed as they already were.
+  - **`test_wrong_method_on_known_path_returns_405` (#635) failed.** The
+    credential layers were attached with `Router::route_layer`, which protects
+    the *router's* 404 but not the inner `MethodRouter`'s 405, so an
+    unauthenticated `PUT /v1/payments` returned `401` instead of `405`. The
+    layers now attach per `MethodRouter`, which is what that API is documented
+    for. No handler becomes reachable without a credential; only the status for
+    an unimplemented method changes.
+  - **`rate_limit_headers_track_quota_before_and_after_exhaustion` had its API
+    key literal replaced with `******`** by a secret-scrubbing pass, so it
+    asserted on a `401`. It provisions a merchant and uses that key.
+  - **`database_file_from_current_release_upgrades_cleanly` replayed the schema
+    snapshot in file order**, which is SQLite's `(type, name)` order — every
+    `CREATE INDEX` ahead of every `CREATE TABLE` — so the replay died on
+    `no such table: main.api_keys`. The replay hoists the `CREATE TABLE`s; the
+    textual comparison is unchanged.
+  - **Two `multi_op_transaction_tests` (#613) asserted a contract the gateway
+    has not had since underpayment events landed** — that a half-payment
+    neither updates the row nor fires a webhook. `reconcile_payment` reports
+    whether the row was *updated*, and an underpayment is an update that fires
+    the documented `payment.underpaid` event. They now assert the status
+    transition and the exact event sequence
+    `["payment.underpaid", "payment.completed"]`, which is stricter than the
+    request count they replaced: it would no longer pass on two
+    `payment.completed` deliveries.
+  - **Three error responses in `openapi.yaml` referenced a schema that does not
+    exist.** They `$ref`'d `components/schemas/Error`; the schema in the file
+    is `ErrorResponse`, and the other 28 references already said so.
+    `redocly lint` failed on `no-unresolved-refs`, so the spec could not be
+    used to generate a client for the `400`/`409` responses on
+    `POST …/redeliver`.
+
 ### Added
 
 - Dashboard maintenance CI now runs a dependency-free JavaScript syntax check

@@ -36,14 +36,14 @@ use std::sync::Arc;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
 use stellargate::{
+    AppState,
     config::{AcceptedAsset, Config, ListenerMode},
     db::{self, NewPayment},
-    horizon::{reconcile_payment, HorizonPayment, TransactionRef},
-    AppState,
+    horizon::{HorizonPayment, TransactionRef, reconcile_payment},
 };
 use wiremock::{
-    matchers::{method, path},
     Mock, MockServer, ResponseTemplate,
+    matchers::{method, path},
 };
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -202,7 +202,10 @@ async fn two_ops_same_tx_credits_full_sum() {
     let r0 = reconcile_payment(&state, &op0)
         .await
         .expect("op0 reconciliation must not error");
-    assert!(r0, "op0 must trigger a settlement transition (pending → underpaid)");
+    assert!(
+        r0,
+        "op0 must trigger a settlement transition (pending → underpaid)"
+    );
 
     let after_op0 = db::get_payment(&pool, &payment_id)
         .await
@@ -222,7 +225,10 @@ async fn two_ops_same_tx_credits_full_sum() {
     let r1 = reconcile_payment(&state, &op1)
         .await
         .expect("op1 reconciliation must not error");
-    assert!(r1, "op1 must trigger a settlement transition (underpaid → completed)");
+    assert!(
+        r1,
+        "op1 must trigger a settlement transition (underpaid → completed)"
+    );
 
     let after_op1 = db::get_payment(&pool, &payment_id)
         .await
@@ -252,11 +258,10 @@ async fn two_ops_same_tx_credits_full_sum() {
     );
 
     // Verify the recorded `processed_transactions` sum directly.
-    let total = db::sum_processed_stroops(&pool, &payment_id)
-        .await
-        .unwrap();
+    let total = db::sum_processed_stroops(&pool, &payment_id).await.unwrap();
     assert_eq!(
-        total, 100_000_000, // 10 XLM in stroops
+        total,
+        100_000_000, // 10 XLM in stroops
         "processed_transactions must sum to 100_000_000 stroops (10 XLM)"
     );
 }
@@ -292,10 +297,7 @@ async fn same_op_reprocessed_is_idempotent() {
         .expect("second reconciliation must not error");
     assert!(!second, "re-presenting the same operation must be a no-op");
 
-    let payment = db::get_payment(&pool, &payment_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let payment = db::get_payment(&pool, &payment_id).await.unwrap().unwrap();
     assert_eq!(payment.status, "completed");
 
     // Only one webhook delivery row despite two reconcile calls.
@@ -310,9 +312,7 @@ async fn same_op_reprocessed_is_idempotent() {
     );
 
     // processed_transactions sum must not be doubled.
-    let total = db::sum_processed_stroops(&pool, &payment_id)
-        .await
-        .unwrap();
+    let total = db::sum_processed_stroops(&pool, &payment_id).await.unwrap();
     assert_eq!(total, 50_000_000, "5 XLM = 50_000_000 stroops, not doubled");
 }
 
@@ -343,10 +343,7 @@ async fn three_ops_same_tx_all_credited() {
             .unwrap_or_else(|e| panic!("op {i} reconciliation failed: {e}"));
     }
 
-    let payment = db::get_payment(&pool, &payment_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let payment = db::get_payment(&pool, &payment_id).await.unwrap().unwrap();
     assert_eq!(
         payment.status, "completed",
         "intent must be completed after three 1 XLM operations totalling 3 XLM"
@@ -357,11 +354,10 @@ async fn three_ops_same_tx_all_credited() {
         "paid_amount must be 3 XLM"
     );
 
-    let total = db::sum_processed_stroops(&pool, &payment_id)
-        .await
-        .unwrap();
+    let total = db::sum_processed_stroops(&pool, &payment_id).await.unwrap();
     assert_eq!(
-        total, 30_000_000, // 3 XLM in stroops
+        total,
+        30_000_000, // 3 XLM in stroops
         "processed_transactions must sum to 30_000_000 stroops (3 XLM)"
     );
 }
