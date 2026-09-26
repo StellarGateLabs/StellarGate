@@ -875,15 +875,21 @@ pub async fn update_payment_status(
     Ok(result.rows_affected() == 1)
 }
 
-/// Record that transaction `tx_hash`, worth `amount_stroops`, has been credited
-/// to intent `payment_id`. Returns `true` when this is the first time the
-/// transaction was recorded for the intent, and `false` when it was already
-/// present (a re-seen record on a later poll cycle, over the stream, or from a
-/// concurrent reconciler).
+/// Record that transaction `tx_hash` operation `operation_index`, worth
+/// `amount_stroops`, has been credited to intent `payment_id`. Returns `true`
+/// when this is the first time the operation was recorded for the intent, and
+/// `false` when it was already present (a re-seen record on a later poll
+/// cycle, over the stream, or from a concurrent reconciler).
 ///
-/// The `(payment_id, tx_hash)` primary key plus `ON CONFLICT DO NOTHING` makes
-/// this the atomic dedup point: SQLite serialises writers, so exactly one of
-/// two racing inserts for the same transaction observes `rows_affected() == 1`.
+/// The `(payment_id, tx_hash, operation_index)` primary key plus
+/// `ON CONFLICT DO NOTHING` makes this the atomic dedup point: SQLite
+/// serialises writers, so exactly one of two racing inserts for the same
+/// operation observes `rows_affected() == 1`.
+///
+/// Multiple operations within the same transaction each carry a distinct
+/// `operation_index` (0, 1, 2, …), so they are each tracked independently —
+/// a transaction with two payment operations for the same intent now credits
+/// both instead of silently discarding the second (issues #614, #615).
 pub async fn record_processed_tx(
     pool: &Db,
     payment_id: &str,
