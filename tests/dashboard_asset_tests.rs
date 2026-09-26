@@ -58,6 +58,7 @@ fn make_config() -> Config {
 const DASHBOARD_HTML: &str = include_str!("../static/dashboard.html");
 const DASHBOARD_CSS: &str = include_str!("../static/dashboard.css");
 const DASHBOARD_JS: &str = include_str!("../static/dashboard.js");
+const DASHBOARD_FORMAT_JS: &str = include_str!("../static/dashboard-format.js");
 
 #[test]
 fn dashboard_api_requests_use_canonical_v1_base() {
@@ -89,6 +90,33 @@ fn dashboard_api_requests_use_canonical_v1_base() {
         DASHBOARD_JS.matches("/v1").count(),
         1,
         "API_BASE must be the only /v1 literal so requests cannot become /v1/v1/..."
+    );
+}
+
+/// The format module must be loaded as an ES module import (type="module")
+/// with the correct path so the browser resolves it against the same origin.
+#[test]
+fn dashboard_imports_format_module() {
+    assert!(
+        DASHBOARD_JS.contains(r#"import { fmtTime, shortId } from "/dashboard/format.js";"#),
+        "dashboard.js must import fmtTime and shortId from /dashboard/format.js"
+    );
+    assert!(
+        DASHBOARD_HTML.contains(r#"<script type="module" src="/dashboard/app.js">"#),
+        "dashboard.html must load app.js as a module script so ES import statements resolve"
+    );
+}
+
+/// The format module must export the two helpers the main script depends on.
+#[test]
+fn format_module_exports_required_helpers() {
+    assert!(
+        DASHBOARD_FORMAT_JS.contains("export function fmtTime"),
+        "dashboard-format.js must export fmtTime"
+    );
+    assert!(
+        DASHBOARD_FORMAT_JS.contains("export function shortId"),
+        "dashboard-format.js must export shortId"
     );
 }
 
@@ -176,6 +204,76 @@ async fn dashboard_assets_keep_content_type_and_csp() {
     }
 }
 
+/// The format.js ES module must be served with the correct content type, the
+/// dashboard CSP, and baseline security headers — the same contract as every
+/// other dashboard asset (#725).
+#[tokio::test]
+async fn dashboard_format_js_served_with_correct_content_type_and_csp() {
+    let server = test_server().await;
+
+    let res = server.get("/dashboard/format.js").await;
+    res.assert_status_ok();
+    assert_eq!(
+        res.header("content-type"),
+        "text/javascript; charset=utf-8",
+        "/dashboard/format.js served with the wrong content type"
+    );
+    assert_eq!(
+        res.header("content-security-policy"),
+        EXPECTED_CSP,
+        "/dashboard/format.js must carry the dashboard CSP unchanged"
+    );
+    assert_eq!(
+        res.header("x-content-type-options"),
+        "nosniff",
+        "/dashboard/format.js"
+    );
+    assert_eq!(
+        res.header("referrer-policy"),
+        "no-referrer",
+        "/dashboard/format.js"
+    );
+    assert_eq!(
+        res.header("cache-control"),
+        "no-store",
+        "/dashboard/format.js"
+    );
+    assert_eq!(
+        res.text(),
+        DASHBOARD_FORMAT_JS,
+        "/dashboard/format.js must serve the include_str! asset byte-for-byte"
+    );
+}
+
+/// Requesting an unknown path under /dashboard/ must return 404 with the
+/// standard JSON error envelope, not an asset or an empty body (#725).
+#[tokio::test]
+async fn dashboard_unknown_asset_returns_404() {
+    let server = test_server().await;
+
+    for path in [
+        "/dashboard/nonexistent.js",
+        "/dashboard/unknown.css",
+        "/dashboard/missing",
+        "/dashboard/app.js.map",
+        "/dashboard/../../etc/passwd",
+    ] {
+        let res = server.get(path).await;
+        assert_eq!(
+            res.status_code(),
+            404,
+            "{path} should return 404 for an unknown dashboard asset"
+        );
+        // The body must be the standard JSON error envelope, not an HTML page.
+        let body: serde_json::Value = res.json();
+        assert_eq!(
+            body.get("code").and_then(|v| v.as_str()),
+            Some("not_found"),
+            "{path} error envelope must have code=not_found"
+        );
+    }
+}
+
 /// Each header must appear exactly once — a response builder that appends
 /// instead of replacing would otherwise emit a duplicate `nosniff` alongside
 /// the outer security-header layer's copy.
@@ -183,7 +281,12 @@ async fn dashboard_assets_keep_content_type_and_csp() {
 async fn dashboard_security_headers_are_not_duplicated() {
     let server = test_server().await;
 
-    for path in ["/dashboard", "/dashboard/app.css", "/dashboard/app.js"] {
+    for path in [
+        "/dashboard",
+        "/dashboard/app.css",
+        "/dashboard/app.js",
+        "/dashboard/format.js",
+    ] {
         let res = server.get(path).await;
         res.assert_status_ok();
         for name in [

@@ -19,6 +19,8 @@
   --idle: #4b5563;
   --idle-bg: #eef0f3;
   --radius: 8px;
+  --skeleton-base: #e3e6ea;
+  --skeleton-shine: #f0f2f5;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -38,6 +40,8 @@
     --err-bg: #3a1a17;
     --idle: #9aa3af;
     --idle-bg: #262a31;
+    --skeleton-base: #2c313a;
+    --skeleton-shine: #363c47;
   }
 }
 
@@ -303,10 +307,68 @@ main {
   border-bottom: none;
 }
 
+/* ── Empty state ──────────────────────────────────────────────────────── */
+
+/* #720: structured empty state with icon, message and optional retry */
+.empty-state {
+  padding: 2.5rem 1.5rem;
+  text-align: center;
+  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.empty-state-icon {
+  font-size: 2rem;
+  line-height: 1;
+  opacity: 0.5;
+}
+
+.empty-state-title {
+  font-weight: 600;
+  color: var(--text);
+  font-size: 0.95rem;
+}
+
+.empty-state-body {
+  font-size: 0.88rem;
+  max-width: 320px;
+}
+
+/* Legacy inline empty paragraph (kept for backward compat with id="empty") */
 .empty {
   padding: 2rem;
   text-align: center;
   color: var(--muted);
+}
+
+/* ── Error state ──────────────────────────────────────────────────────── */
+
+/* #720: structured error state with message and retry button */
+.error-state {
+  padding: 1.5rem;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.error-state-message {
+  color: var(--err);
+  background: var(--err-bg);
+  border-radius: var(--radius);
+  padding: 0.6rem 0.75rem;
+  font-size: 0.9rem;
+  max-width: 360px;
+  width: 100%;
+}
+
+.error-state button {
+  font-size: 0.88rem;
+  padding: 0.4rem 0.9rem;
 }
 
 .table-foot {
@@ -339,6 +401,64 @@ main {
   background: var(--idle-bg);
 }
 
+/* ── Skeleton loading rows (#719) ─────────────────────────────────────── */
+
+/* Skeleton placeholder block: a rounded rectangle filled with the base
+   colour. The shimmer keyframe is only applied inside the
+   prefers-reduced-motion: no-preference guard below, so users who request
+   reduced motion see a static placeholder instead (#719, #722). */
+.skeleton-cell {
+  display: inline-block;
+  height: 0.85em;
+  border-radius: 4px;
+  background: var(--skeleton-base);
+  vertical-align: middle;
+}
+
+.skeleton-row td {
+  border-bottom: 1px solid var(--border);
+}
+
+/* Widths for each column skeleton — keeps the placeholder proportions
+   plausible without showing real data. */
+.skeleton-row .sk-status  { width: 5rem; }
+.skeleton-row .sk-amount  { width: 6rem; }
+.skeleton-row .sk-memo    { width: 7rem; }
+.skeleton-row .sk-date    { width: 9rem; }
+.skeleton-row .sk-id      { width: 8rem; }
+
+/* Detail panel skeleton blocks */
+.skeleton-field {
+  height: 0.85em;
+  border-radius: 4px;
+  background: var(--skeleton-base);
+  display: block;
+}
+.skeleton-field-short { width: 60%; }
+.skeleton-field-long  { width: 90%; }
+.skeleton-field-full  { width: 100%; }
+
+/* #719 + #722: shimmer animation is gated behind the no-preference query
+   so users who opted into reduced motion see a static skeleton instead. */
+@keyframes skeleton-shimmer {
+  0%   { background-position: -400px 0; }
+  100% { background-position:  400px 0; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .skeleton-cell,
+  .skeleton-field {
+    background: linear-gradient(
+      90deg,
+      var(--skeleton-base)  25%,
+      var(--skeleton-shine) 50%,
+      var(--skeleton-base)  75%
+    );
+    background-size: 800px 100%;
+    animation: skeleton-shimmer 1.6s ease-in-out infinite;
+  }
+}
+
 /* ── Detail panel ──────────────────────────────────────────────────────── */
 
 .detail {
@@ -354,6 +474,20 @@ main {
   z-index: 5;
 }
 
+/* #722: slide-in transition wrapped in prefers-reduced-motion: no-preference
+   so the panel appears instantly for users who prefer reduced motion. */
+@media (prefers-reduced-motion: no-preference) {
+  .detail {
+    transition: transform 0.25s ease;
+  }
+
+  .detail[hidden] {
+    display: block !important;
+    transform: translateX(100%);
+    pointer-events: none;
+  }
+}
+
 .detail-head {
   display: flex;
   align-items: center;
@@ -365,6 +499,19 @@ main {
   inset: 0;
   background: rgba(0, 0, 0, 0.35);
   z-index: 4;
+}
+
+/* #722: scrim fade-in wrapped in prefers-reduced-motion: no-preference. */
+@media (prefers-reduced-motion: no-preference) {
+  .scrim {
+    transition: opacity 0.2s ease;
+  }
+
+  .scrim[hidden] {
+    display: block !important;
+    opacity: 0;
+    pointer-events: none;
+  }
 }
 
 .fields {
@@ -447,5 +594,12 @@ main {
     color: var(--muted);
     font-size: 0.78rem;
     text-transform: uppercase;
+  }
+
+  /* Stack skeleton cells on mobile */
+  .skeleton-row td {
+    display: flex;
+    justify-content: flex-end;
+    padding: 0.65rem 0.9rem;
   }
 }
