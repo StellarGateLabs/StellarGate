@@ -7,7 +7,147 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`main` did not compile, and its newest tests did not pass.** This is not a
+  behaviour change; it is the minimum needed to get to a green baseline. None
+  of it is mine — every item below landed on `main` in the last few merges.
+
+  - **`src/api/payments.rs` had no `axum` imports at all.** The commit that
+    removed the duplicated `use` block deleted the whole item, leaving
+    `use axum::{Json};` and 73 errors across the file. Deduped, not removed.
+  - **`HorizonPayment::operation_index()` ignored the field of the same name.**
+    It read only the paging token and parsed it as an integer, so any record
+    whose token is not numeric fell back to `0` — which puts every operation of
+    that transaction on one `processed_transactions` row, discards the second
+    as already-seen, and leaves the intent `underpaid`. That is precisely the
+    bug #613 reported, still reachable through an ordinary Horizon response,
+    and it is what made the new `multi_op_credit_tests` fail. The field Horizon
+    sends directly now wins when present; a zero still falls through to the
+    token, because `#[serde(default)]` makes "absent" indistinguishable from
+    zero, and that keeps pre-#616 rows addressed as they already were.
+  - **`test_wrong_method_on_known_path_returns_405` (#635) failed.** The
+    credential layers were attached with `Router::route_layer`, which protects
+    the *router's* 404 but not the inner `MethodRouter`'s 405, so an
+    unauthenticated `PUT /v1/payments` returned `401` instead of `405`. The
+    layers now attach per `MethodRouter`, which is what that API is documented
+    for. No handler becomes reachable without a credential; only the status for
+    an unimplemented method changes.
+  - **`rate_limit_headers_track_quota_before_and_after_exhaustion` had its API
+    key literal replaced with `******`** by a secret-scrubbing pass, so it
+    asserted on a `401`. It provisions a merchant and uses that key.
+  - **`database_file_from_current_release_upgrades_cleanly` replayed the schema
+    snapshot in file order**, which is SQLite's `(type, name)` order — every
+    `CREATE INDEX` ahead of every `CREATE TABLE` — so the replay died on
+    `no such table: main.api_keys`. The replay hoists the `CREATE TABLE`s; the
+    textual comparison is unchanged.
+  - **Two `multi_op_transaction_tests` (#613) asserted a contract the gateway
+    has not had since underpayment events landed** — that a half-payment
+    neither updates the row nor fires a webhook. `reconcile_payment` reports
+    whether the row was *updated*, and an underpayment is an update that fires
+    the documented `payment.underpaid` event. They now assert the status
+    transition and the exact event sequence
+    `["payment.underpaid", "payment.completed"]`, which is stricter than the
+    request count they replaced: it would no longer pass on two
+    `payment.completed` deliveries.
+  - **Three error responses in `openapi.yaml` referenced a schema that does not
+    exist.** They `$ref`'d `components/schemas/Error`; the schema in the file
+    is `ErrorResponse`, and the other 28 references already said so.
+    `redocly lint` failed on `no-unresolved-refs`, so the spec could not be
+    used to generate a client for the `400`/`409` responses on
+    `POST …/redeliver`.
+
 ### Added
+
+- **A manual light/dark override (issue #713).** The dashboard followed the OS
+  palette with no way to disagree with it. A toggle now sets `data-theme` on
+  `<html>` and remembers the choice in `localStorage` under
+  `stellargate.theme`. It is on both the sign-in card and the top bar, since
+  whichever panel is on screen should offer it, and both are bound by
+  `data-theme-toggle` so they stay in step from one handler.
+
+  Three details that a plain two-state toggle gets wrong:
+
+  - **The preference is tri-state.** No stored value means no `data-theme`
+    attribute at all, so the CSS falls through to `prefers-color-scheme` and a
+    later OS change is still picked up. Pinning whatever was on screen at first
+    paint would turn "follow the OS" into a permanent override nobody asked
+    for. An unrecognised stored value is treated as no preference rather than
+    pinning the page to a half-understood theme.
+  - **It is applied before the first paint.** The choice is read by a small
+    classic script in `<head>` (`static/dashboard-theme.js`, served at
+    `/dashboard/theme.js`), because `app.js` is a module and a module is
+    deferred by definition — folding the bootstrap in would mean the page
+    paints once in the OS palette and then repaints, flashing on every load. It
+    is a separate file rather than an inline block because the dashboard CSP is
+    `script-src 'self'` with no `unsafe-inline`.
+  - **It sets `color-scheme` as well as the tokens.** Without it the date
+    pickers, the `<select>` and the scrollbar keep the OS palette on a page
+    that has changed. The default declares `color-scheme: light dark`, and each
+    override pins one.
+
+  The bootstrap reads and writes only that one preference — it is deliberately
+  not a second reader of the API key, which lives in the same origin's storage.
+
+- **Every dashboard colour pair audited against WCAG 2.1 AA, in both themes
+  (issue #718).** Four real failures, all of them the kind that survives review
+  because they look fine to the person looking:
+
+  - **There was no focus ring.** Nothing in the stylesheet styled
+    `:focus`/`:focus-visible`, so keyboard focus was whatever hairline the
+    browser drew, in a colour this stylesheet never chose and no audit covered —
+    2.4.7 Focus Visible, in the AA range. There is now a real ring in a
+    `--focus` token per theme, drawn with `outline` (which follows
+    `border-radius` and is not clipped by an ancestor's `overflow`) at a 2px
+    `outline-offset`, with an inset variant for table rows because Safari draws
+    row outlines inconsistently.
+
+  - **Control boundaries were at 1.25:1.** One `--border` token did two jobs: a
+    decorative separator *and* the edge of every button and input. WCAG 1.4.11
+    requires 3:1 for the boundary of a user-interface component, so the two are
+    now separate tokens — `--border` still draws table rules and card edges,
+    where a 3:1 line would put a heavy rule through every row of the payments
+    table, and the new `--control-border` draws what the user has to be able to
+    see to click. Worth naming which failure this was: it is invisible to
+    someone with normal vision on a good monitor, which is precisely why it
+    needs a number rather than an opinion.
+
+  - **The date filters and the page-size `<select>` had no rule at all.** They
+    were drawn entirely by the user agent, so their borders were in a colour
+    this stylesheet never picked, followed neither theme, and were never
+    audited. They are the controls most likely to be on screen at once.
+
+  - **Two status pills missed 4.5:1, by 0.02 and 0.03.** `--ok` on `--ok-bg`
+    was 4.48:1 and `--warn` on `--warn-bg` 4.47:1. Both are darkened
+    (`#17803d` → `#146c34`, `#9a6700` → `#946100`), which is also the
+    direction that helps: on a tinted background a darker foreground can only
+    get better.
+
+  The audit is a file rather than a claim:
+  `scripts/check-dashboard-contrast.mjs` implements the WCAG sRGB → linear →
+  relative-luminance → contrast maths dependency-free, reads the real
+  `static/dashboard.css` block by block, and checks 96 pairs across all four
+  theme blocks. It self-tests its own maths against the published WCAG worked
+  examples, because a contrast checker that computes the wrong ratio is worse
+  than no checker — it reports a green tick on colours nobody can read. It runs
+  in the dashboard CI job. Every theme must declare the same tokens, so a
+  colour edited in one palette and not the other fails rather than silently
+  resolving to another theme's value — which is also what catches a new token
+  like #719's `--skeleton-*` being added to `:root` and forgotten in the dark
+  blocks.
+
+- **The payment detail drawer traps keyboard focus and gives it back (issue
+  #714).** Opening a payment moved nothing: focus stayed on the row behind the
+  panel, so a keyboard user tabbed straight back out into the payment table
+  while reading the drawer, with no cue that a panel was open at all. Closing
+  it dropped focus to `<body>`, so the next Tab restarted from the top of the
+  document and the table had to be re-tabbed to get back to the row they were
+  on. The drawer now takes focus on open, wraps Tab in both directions, pulls
+  focus back if it lands outside by any other route (a click on the page behind
+  it), and returns focus to the originating row on close — guarded on
+  `isConnected`, since a refresh between open and close replaces the row and
+  focusing a detached node drops focus to `<body>`, which is the loss this
+  exists to prevent.
 
 - Dashboard maintenance CI now runs a dependency-free JavaScript syntax check
   and static accessibility smoke check for `static/dashboard.*`, so the
@@ -15,6 +155,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   build step.
 
 ### Changed
+
+- **The payment detail drawer is a real modal `<dialog>` (issue #715).** It was
+  an `<aside>` under a separate `#scrim` div, which is only *visually* on top:
+  `Tab`, the address bar and the accessibility tree all still reach the page
+  behind it, because nothing marks that content as inert. `showModal()` puts the
+  dialog in the top layer, so the page behind is genuinely unreachable, and it
+  brings the `::backdrop` (replacing the hand-rolled scrim) plus Escape and
+  `cancel` handling from the user agent. `aria-modal="true"` and
+  `aria-labelledby` on the heading name it for assistive tech, so a screen
+  reader announces "Payment, dialog" on entry rather than a bare "dialog".
+
+  The explicit focus trap from #714 stays: a modal dialog does not wrap `Tab`
+  at the ends in any current browser. Focus is restored from the dialog's
+  `close` event rather than from `closeDetail`, so it also runs for the routes
+  that bypass it — Escape, and a re-open on another row — and the
+  document-level Escape handler is gone, since a modal dialog already handles
+  it and a second `close()` could only ever be a no-op.
+
+  #722's slide-in transition now keys off `:not([open])` instead of `[hidden]`,
+  because a `<dialog>` has no `hidden` attribute, and `display`/`overlay` are
+  transitioned discretely so the drawer stays in the top layer while it
+  animates out. A browser without `allow-discrete` support closes instantly,
+  which is what the reduced-motion path does anyway.
 
 - **Rust edition 2021 → 2024 (issue #662).** No `/v1` API change. `cargo fix
   --edition` only required wrapping the test-only `env::set_var`/`remove_var`

@@ -202,6 +202,26 @@ deploy. Sign in with any merchant API key.
 | Webhook deliveries | Every attempt for a payment, with a one-click **Redeliver** |
 | Health | Live `/ready` indicator, polled every 30s |
 
+The detail panel is a modal `<dialog>`: opened with `showModal()`, so the rest
+of the page is inert rather than merely covered, and it is a keyboard trap
+while open — it takes focus when it opens, `Tab` and `Shift+Tab` cycle inside
+it (a modal dialog does not wrap at the ends in any current browser), `Escape`
+or a click outside closes it, and focus goes back to the row you opened it
+from. Without all that, a keyboard user tabs straight out into the payment
+table behind the panel and, on close, lands on `<body>` with the next `Tab`
+restarting from the top of the document.
+
+The page follows the OS light/dark preference, and a toggle on the sign-in card
+and in the top bar overrides it. The choice is remembered in `localStorage`
+under `stellargate.theme` and applied before the first paint, so it never
+flashes; with nothing stored, the page keeps following the OS.
+
+**Accessibility.** The detail panel is a real modal `<dialog>` with a focus
+trap and a focus ring of its own, and the light and dark palettes are both held
+to WCAG 2.1 AA. `scripts/check-dashboard-contrast.mjs` re-checks every colour
+pair in CI, reading the real stylesheet, so a token cannot drift out of the
+standard unnoticed.
+
 **How it's built.** The page is plain HTML, CSS, and dependency-free
 JavaScript, compiled into the binary with `include_str!`. There is no npm, no
 bundler, and no `node_modules`: the deployable artifact stays a single Rust

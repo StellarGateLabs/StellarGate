@@ -293,15 +293,22 @@ fn api_v1(
 ) -> axum::Router<Arc<AppState>> {
     /* Merchant provisioning and API key lifecycle. All admin-gated behind
     ADMIN_PROVISIONING_SECRET: this service has no self-service signup, and
-    minting or revoking a credential is an operator action. */
+    minting or revoking a credential is an operator action. The admin layer
+    goes on each `MethodRouter` for the same reason as the merchant auth layer
+    below — a 405 on a known path stays a 405 rather than becoming a 401. */
+    let admin_layer = || middleware::from_fn_with_state(state.clone(), require_admin_secret);
     let merchants = axum::Router::new()
-        .route("/", post(provision_merchant))
-        .route("/{id}/keys", post(issue_api_key).get(list_api_keys))
-        .route("/{id}/keys/{key_id}", axum::routing::delete(revoke_api_key))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_admin_secret,
-        ));
+        .route("/", post(provision_merchant).route_layer(admin_layer()))
+        .route(
+            "/{id}/keys",
+            post(issue_api_key)
+                .get(list_api_keys)
+                .route_layer(admin_layer()),
+        )
+        .route(
+            "/{id}/keys/{key_id}",
+            axum::routing::delete(revoke_api_key).route_layer(admin_layer()),
+        );
 
     /* Auth middleware on the write + list routes and the webhook listing.
     The per-payment status endpoint handles credentials itself, because it
@@ -336,19 +343,15 @@ fn api_v1(
     then the merchant limiter (runs second, reads it). The last `route_layer`
     added is the outermost, so auth must stay below the limiter here —
     `test_redeliver_runs_auth_before_merchant_limiter` pins this order. */
-    let redeliver = axum::Router::new()
-        .route(
-            "/{id}/webhooks/{delivery_id}/redeliver",
-            post(payments::redeliver_webhook),
-        )
-        .route_layer(middleware::from_fn_with_state(
-            merchant_redeliver_limit,
-            merchant_redeliver_limit_middleware,
-        ))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ));
+    let redeliver = axum::Router::new().route(
+        "/{id}/webhooks/{delivery_id}/redeliver",
+        post(payments::redeliver_webhook)
+            .route_layer(middleware::from_fn_with_state(
+                merchant_redeliver_limit,
+                merchant_redeliver_limit_middleware,
+            ))
+            .route_layer(auth_layer()),
+    );
 
     /* The summary aggregates one merchant's payments, so it needs the same
     credential check as the list it summarises. It is layered per method for

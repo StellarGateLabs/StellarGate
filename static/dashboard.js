@@ -55,6 +55,9 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     loading: false,
     loadedPayments: [],
     autoRefresh: false,
+    // The table row that opened the detail drawer, so focus can be handed back
+    // to it on close. See `closeDetail`.
+    detailTrigger: null,
   };
 
   // ── Tiny DOM helpers ──────────────────────────────────────────────────
@@ -625,12 +628,12 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     tr.appendChild(labelledCell("Payment ID", "mono", shortId(p.id)));
 
     tr.addEventListener("click", function () {
-      openDetail(p.id);
+      openDetail(p.id, tr);
     });
     tr.addEventListener("keydown", function (ev) {
       if (ev.key === "Enter" || ev.key === " ") {
         ev.preventDefault();
-        openDetail(p.id);
+        openDetail(p.id, tr);
       }
     });
 
