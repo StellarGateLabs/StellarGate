@@ -197,10 +197,18 @@ deploy. Sign in with any merchant API key.
 
 | View | What it does |
 |---|---|
-| Payments | Table of the merchant's payments, filterable by status, paged with the keyset cursor |
+| Payments | Table of the merchant's payments, filterable by one or more statuses, paged with the keyset cursor |
 | Payment detail | Full record — amounts, memo, destination, transaction hash, timestamps |
 | Webhook deliveries | Every attempt for a payment, with a one-click **Redeliver** |
 | Health | Live `/ready` indicator, polled every 30s |
+
+**Filtering by several statuses.** `GET /v1/payments` accepts a single
+`status`, so pressing one status chip filters on the server. Pressing several
+(for example *Underpaid* and *Expired*) fetches unfiltered pages and filters
+them in the browser: a page can then show fewer rows than the page size, or
+none, while **Load more** still has further pages to fetch. The pressed chips
+are kept in the URL hash (`#status=underpaid,expired`), so the view can be
+bookmarked.
 
 **How it's built.** The page is plain HTML, CSS, and dependency-free
 JavaScript, compiled into the binary with `include_str!`. There is no npm, no

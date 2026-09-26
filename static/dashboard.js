@@ -18,10 +18,12 @@ import { fmtTime, shortId } from "/dashboard/format.js";
   var API_BASE = "/v1";
   var KEY_NAME = "stellargate.apiKey";
   var KEY_SAVED_AT = "stellargate.apiKeySavedAt";
+  var STATUSES = ["pending", "completed", "underpaid", "expired"];
 
   var state = {
     key: null,
-    status: "",
+    // Pressed status chips, in STATUSES order. Empty means "All".
+    statuses: [],
     pageSize: 25,
     createdAfter: "",
     createdBefore: "",
@@ -148,7 +150,11 @@ import { fmtTime, shortId } from "/dashboard/format.js";
         if (kv.length !== 2) return;
         var key = decodeURIComponent(kv[0]);
         var value = decodeURIComponent(kv[1]);
-        if (key === "status") state.status = value;
+        if (key === "status") {
+          state.statuses = STATUSES.filter(function (s) {
+            return value.split(",").indexOf(s) >= 0;
+          });
+        }
         if (key === "autoRefresh") state.autoRefresh = value === "1";
       });
     } catch (e) {
@@ -159,7 +165,9 @@ import { fmtTime, shortId } from "/dashboard/format.js";
   function writeHashState() {
     try {
       var parts = [];
-      if (state.status) parts.push("status=" + encodeURIComponent(state.status));
+      if (state.statuses.length) {
+        parts.push("status=" + state.statuses.map(encodeURIComponent).join(","));
+      }
       if (state.autoRefresh) parts.push("autoRefresh=1");
       var hash = parts.length ? "#" + parts.join("&") : "";
       window.history.replaceState(null, "", window.location.pathname + window.location.search + hash);
@@ -263,6 +271,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     state.key = key;
     state.selected = {};
     readHashState();
+    syncFilterUi();
     // Validate by making the cheapest authenticated call available.
     return api("/payments?limit=1").then(function () {
       if (persist !== null) storeKey(key, persist);
@@ -442,7 +451,11 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     announce("Loading payments");
 
     var query = "/payments?limit=" + state.pageSize;
-    if (state.status) query += "&status=" + encodeURIComponent(state.status);
+    // The list API accepts a single `status`. With one chip pressed the server
+    // filters; with several, unfiltered pages are fetched and filtered below.
+    // Known limitation: a page can then hold fewer matching rows than the page
+    // size (even none) while "Load more" still has further pages to fetch.
+    if (state.statuses.length === 1) query += "&status=" + encodeURIComponent(state.statuses[0]);
     if (state.createdAfter) query += "&created_after=" + encodeURIComponent(state.createdAfter + "T00:00:00Z");
     if (state.createdBefore) query += "&created_before=" + encodeURIComponent(state.createdBefore + "T23:59:59Z");
     if (state.cursor) query += "&cursor=" + encodeURIComponent(state.cursor);
@@ -457,8 +470,13 @@ import { fmtTime, shortId } from "/dashboard/format.js";
         clearSkeletonRows();
 
         var payments = body.payments || [];
-        state.loadedPayments = state.loadedPayments.concat(payments);
-        payments.forEach(appendRow);
+        var shown = state.statuses.length > 1
+          ? payments.filter(function (p) {
+              return state.statuses.indexOf(p.status) >= 0;
+            })
+          : payments;
+        state.loadedPayments = state.loadedPayments.concat(shown);
+        shown.forEach(appendRow);
         syncSelectionUi();
 
         // Remove any previous inline state nodes before rendering new ones.
@@ -472,11 +490,13 @@ import { fmtTime, shortId } from "/dashboard/format.js";
         show($("load-more"), more);
 
         // #720: show filter-tailored empty state when the list is empty.
-        if ($("rows").childElementCount === 0) {
+        if ($("rows").childElementCount === 0 && !more) {
           var emptyNode = buildEmptyState(
             "📭",
             "No payments found",
-            emptyMessageForFilter(state.status),
+            state.statuses.length > 1
+              ? "No payments match the selected statuses."
+              : emptyMessageForFilter(state.statuses[0] || ""),
             null
           );
           emptyNode.id = "list-state";
@@ -875,7 +895,8 @@ import { fmtTime, shortId } from "/dashboard/format.js";
 
   function syncFilterUi() {
     Array.prototype.forEach.call(document.querySelectorAll(".chip"), function (chip) {
-      var isActive = (chip.getAttribute("data-status") || "") === state.status;
+      var status = chip.getAttribute("data-status") || "";
+      var isActive = status ? state.statuses.indexOf(status) >= 0 : state.statuses.length === 0;
       chip.className = isActive ? "chip chip-on" : "chip";
       chip.setAttribute("aria-pressed", isActive ? "true" : "false");
     });
@@ -944,14 +965,15 @@ import { fmtTime, shortId } from "/dashboard/format.js";
       document.querySelectorAll(".chip"),
       function (chip) {
         chip.addEventListener("click", function () {
-          Array.prototype.forEach.call(
-            document.querySelectorAll(".chip"),
-            function (c) {
-              c.className = "chip";
-            }
-          );
-          chip.className = "chip chip-on";
-          state.status = chip.getAttribute("data-status") || "";
+          var status = chip.getAttribute("data-status") || "";
+          var pressed = state.statuses;
+          // "All" clears the selection; any other chip toggles itself.
+          state.statuses = status
+            ? STATUSES.filter(function (s) {
+                return (s === status) !== (pressed.indexOf(s) >= 0);
+              })
+            : [];
+          syncFilterUi();
           writeHashState();
           clearSelection();
           reload();
@@ -963,7 +985,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
       if (state.key) pollHealth();
     }, 30000);
     window.setInterval(function () {
-      if (state.key && state.autoRefresh && (!state.status || state.status === "pending")) {
+      if (state.key && state.autoRefresh && (state.statuses.length === 0 || state.statuses.indexOf("pending") >= 0)) {
         loadSummary();
         reload();
       }
