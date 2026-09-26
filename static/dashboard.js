@@ -909,6 +909,109 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     if (outside) closeDetail();
   }
 
+  // ── Theme ──────────────────────────────────────────────────────────────
+
+  var THEME_KEY = "stellargate.theme";
+  var THEME_QUERY =
+    typeof window.matchMedia === "function"
+      ? window.matchMedia("(prefers-color-scheme: dark)")
+      : null;
+
+  function storedTheme() {
+    try {
+      var value = window.localStorage.getItem(THEME_KEY);
+      return value === "light" || value === "dark" ? value : null;
+    } catch (e) {
+      return null; // storage blocked; follow the OS for this load
+    }
+  }
+
+  /** The theme actually in effect, whether chosen or inherited from the OS. */
+  function effectiveTheme() {
+    var chosen = storedTheme();
+    if (chosen) return chosen;
+    if (THEME_QUERY) return THEME_QUERY.matches ? "dark" : "light";
+    return "light";
+  }
+
+  function isDark() {
+    return effectiveTheme() === "dark";
+  }
+
+  /**
+   * Apply a theme to the document, or clear the override with `null`.
+   *
+   * `null` removes the attribute rather than pinning a resolved value: with no
+   * attribute the CSS falls through to `prefers-color-scheme`, so "follow the
+   * OS" keeps working and a later OS change is still picked up instead of being
+   * frozen into a permanent override nobody asked for. `dashboard-theme.js` has
+   * already set the attribute before the first paint; this re-applies it and
+   * keeps the two controls in step.
+   */
+  function applyTheme(theme) {
+    try {
+      if (theme) window.localStorage.setItem(THEME_KEY, theme);
+      else window.localStorage.removeItem(THEME_KEY);
+    } catch (e) {
+      /* still applied for this page load, just not remembered */
+    }
+    if (theme) document.documentElement.setAttribute("data-theme", theme);
+    else document.documentElement.removeAttribute("data-theme");
+    syncThemeUi();
+  }
+
+  /**
+   * Point every theme control at the theme in effect.
+   *
+   * The control appears on both panels, so this is selected by
+   * `data-theme-toggle` rather than by id: one handler, both buttons, and
+   * nothing to forget when a third is added.
+   */
+  function syncThemeUi() {
+    var dark = isDark();
+    var title = dark ? "Switch to light theme" : "Switch to dark theme";
+    var glyph = dark ? "☀" : "☾";
+    Array.prototype.forEach.call(
+      document.querySelectorAll("[data-theme-toggle]"),
+      function (button) {
+        // The accessible name stays "Dark theme" in both states and
+        // `aria-pressed` carries whether it is on. A label that swapped between
+        // "Dark" and "Light" would be a moving target for anyone navigating by
+        // that name, and would describe the action rather than the state.
+        button.setAttribute("aria-pressed", dark ? "true" : "false");
+        button.setAttribute("title", title);
+        var text = button.querySelector(".visually-hidden");
+        if (text) text.textContent = "Dark theme";
+        var icon = button.querySelector(".theme-icon");
+        if (icon) icon.textContent = glyph;
+      }
+    );
+  }
+
+  function initTheme() {
+    Array.prototype.forEach.call(
+      document.querySelectorAll("[data-theme-toggle]"),
+      function (button) {
+        button.addEventListener("click", function () {
+          applyTheme(isDark() ? "light" : "dark");
+        });
+      }
+    );
+
+    /* While the operator has expressed no preference, an OS theme change — a
+    system setting change, a laptop lid — has to move the control with it, or
+    the button goes on describing a theme that is no longer on screen. Once a
+    choice is stored the attribute overrides the media query and the control
+    already points at the stored value, so there is nothing to do. */
+    if (THEME_QUERY && typeof THEME_QUERY.addEventListener === "function") {
+      THEME_QUERY.addEventListener("change", function () {
+        if (!storedTheme()) syncThemeUi();
+      });
+    }
+
+    syncThemeUi();
+  }
+
   // ── Version ───────────────────────────────────────────────────────────
 
   /** The root route answers with "StellarGate API vX.Y.Z". */
@@ -973,6 +1076,10 @@ import { fmtTime, shortId } from "/dashboard/format.js";
   }
 
   function init() {
+    // Before anything else: the control's label and glyph have to reflect the
+    // theme already applied by dashboard-theme.js, whatever the panel state.
+    initTheme();
+
     $("gate-form").addEventListener("submit", function (ev) {
       ev.preventDefault();
       var key = $("api-key").value.trim();

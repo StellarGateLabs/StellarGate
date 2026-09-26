@@ -20,7 +20,7 @@ jobs:
           node-version: "22"
 
       - name: JavaScript syntax check
-        run: node --check static/dashboard.js
+        run: node --check static/dashboard.js && node --check static/dashboard-theme.js
 
       - name: Accessibility smoke check
         run: node scripts/check-dashboard-a11y.mjs

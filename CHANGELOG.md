@@ -59,6 +59,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A manual light/dark override (issue #713).** The dashboard followed the OS
+  palette with no way to disagree with it. A toggle now sets `data-theme` on
+  `<html>` and remembers the choice in `localStorage` under
+  `stellargate.theme`. It is on both the sign-in card and the top bar, since
+  whichever panel is on screen should offer it, and both are bound by
+  `data-theme-toggle` so they stay in step from one handler.
+
+  Three details that a plain two-state toggle gets wrong:
+
+  - **The preference is tri-state.** No stored value means no `data-theme`
+    attribute at all, so the CSS falls through to `prefers-color-scheme` and a
+    later OS change is still picked up. Pinning whatever was on screen at first
+    paint would turn "follow the OS" into a permanent override nobody asked
+    for. An unrecognised stored value is treated as no preference rather than
+    pinning the page to a half-understood theme.
+  - **It is applied before the first paint.** The choice is read by a small
+    classic script in `<head>` (`static/dashboard-theme.js`, served at
+    `/dashboard/theme.js`), because `app.js` is a module and a module is
+    deferred by definition — folding the bootstrap in would mean the page
+    paints once in the OS palette and then repaints, flashing on every load. It
+    is a separate file rather than an inline block because the dashboard CSP is
+    `script-src 'self'` with no `unsafe-inline`.
+  - **It sets `color-scheme` as well as the tokens.** Without it the date
+    pickers, the `<select>` and the scrollbar keep the OS palette on a page
+    that has changed. The default declares `color-scheme: light dark`, and each
+    override pins one.
+
+  The bootstrap reads and writes only that one preference — it is deliberately
+  not a second reader of the API key, which lives in the same origin's storage.
+
 - **The payment detail drawer traps keyboard focus and gives it back (issue
   #714).** Opening a payment moved nothing: focus stayed on the row behind the
   panel, so a keyboard user tabbed straight back out into the payment table

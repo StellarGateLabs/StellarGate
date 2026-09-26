@@ -103,6 +103,53 @@ check(
   "payment rows must be focusable or there is nowhere to return focus to",
 );
 
+// ── Theme override (issue #713) ──────────────────────────────────────────────
+
+// Comments name these attributes and selectors, so strip them before matching.
+const markup = html.replace(/<!--[\s\S]*?-->/g, "");
+const style = readFileSync("static/dashboard.css", "utf8");
+
+check(
+  (markup.match(/data-theme-toggle/g) || []).length === 2,
+  "the theme override needs a control on both the sign-in gate and the top bar — " +
+    "whichever panel is on screen should offer it",
+);
+check(
+  /aria-pressed=/.test(markup),
+  "the theme toggle is a toggle button, so its state must be exposed with " +
+    "aria-pressed; its name has to stay constant for that to mean anything",
+);
+check(
+  /class="visually-hidden"/.test(markup),
+  "an icon-only control needs a visually-hidden text label or it has no " +
+    "accessible name at all",
+);
+check(
+  /<script[^>]+src="\/dashboard\/theme\.js"/.test(markup) &&
+    html.indexOf("/dashboard/theme.js") < html.indexOf("</head>"),
+  "the stored theme must be applied by a classic script in <head>; a module is " +
+    "deferred and so runs after the first paint, flashing the wrong theme",
+);
+check(
+  /html\[data-theme="dark"\]/.test(style),
+  "the dark palette must be reachable from the data-theme attribute, not only " +
+    "from prefers-color-scheme — otherwise the override does nothing",
+);
+check(
+  /prefers-color-scheme: dark/.test(style),
+  "with no stored preference the OS setting must still decide",
+);
+check(
+  /:root:not\(\[data-theme\]\)/.test(style),
+  'the OS palette must be scoped to :root:not([data-theme]), or a stored "light" ' +
+    "choice loses to an OS preference of dark",
+);
+check(
+  /color-scheme:\s*dark/.test(style) && /color-scheme:\s*light/.test(style),
+  "an explicit override must also set color-scheme, or the native controls (the " +
+    "date pickers, the <select>, the scrollbar) keep the OS palette",
+);
+
 if (failures.length > 0) {
   console.error(failures.join("\n"));
   process.exit(1);

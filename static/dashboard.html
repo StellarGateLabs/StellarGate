@@ -5,6 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>StellarGate Dashboard</title>
     <link rel="stylesheet" href="/dashboard/app.css" />
+    <!-- Applies the stored theme preference before the first paint. Must be a
+         classic script in <head>: a module is deferred, so it would run after
+         the page has already painted in the OS palette and flash. A separate
+         file rather than an inline block because the dashboard CSP is
+         `script-src 'self'` with no `unsafe-inline`. See #713. -->
+    <script src="/dashboard/theme.js"></script>
     <link
       rel="icon"
       href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>&#9733;</text></svg>"
@@ -22,7 +28,24 @@
            the API key in the URL and the browser history. A POST lands the key
            in a request body that this route answers with 405. -->
       <form id="gate-form" class="card gate-card" method="post" autocomplete="off">
-        <h1>StellarGate</h1>
+        <div class="gate-head">
+          <h1>StellarGate</h1>
+          <!-- The theme control appears here and in the top bar because both
+               panels are individually visible states of the same page:
+               whichever one is on screen should offer the override.
+               `data-theme-toggle` is what the script binds, so both stay in
+               sync from one handler. -->
+          <button
+            type="button"
+            class="ghost theme-toggle"
+            data-theme-toggle
+            aria-pressed="false"
+            title="Switch to dark theme"
+          >
+            <span class="theme-icon" aria-hidden="true">&#9788;</span>
+            <span class="visually-hidden">Dark theme</span>
+          </button>
+        </div>
         <p class="muted">Sign in with a merchant API key to view payments.</p>
         <label for="api-key">API key</label>
         <input
@@ -59,6 +82,16 @@
           <span id="health" class="pill pill-idle" title="Gateway health">
             checking&hellip;
           </span>
+          <button
+            type="button"
+            class="ghost theme-toggle"
+            data-theme-toggle
+            aria-pressed="false"
+            title="Switch to dark theme"
+          >
+            <span class="theme-icon" aria-hidden="true">&#9788;</span>
+            <span class="visually-hidden">Dark theme</span>
+          </button>
           <button id="sign-out" class="ghost">Sign out</button>
         </div>
       </header>

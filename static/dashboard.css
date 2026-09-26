@@ -2,7 +2,31 @@
    Self-contained: no external fonts or assets, so the page works offline and
    under a restrictive Content-Security-Policy. */
 
+/* ── Theme tokens ──────────────────────────────────────────────────────────
+ *
+ * Two palettes, four blocks, and each palette written once per selector.
+ *
+ * `:root` carries the light palette and declares `color-scheme: light dark`,
+ * which says "both are supported, follow the OS" — and is also what makes the
+ * native date pickers, the <select> and the scrollbar follow the theme instead
+ * of staying OS-coloured while the page around them changes.
+ *
+ * The `prefers-color-scheme` block is scoped to `:root:not([data-theme])`, so
+ * it stops applying the moment the operator has chosen one (#713). The two
+ * `data-theme` blocks then carry higher specificity than `:root` and win over
+ * it outright. Leaving the media query unscoped would make a stored "light"
+ * choice lose to an OS preference of dark.
+ *
+ * The light palette is written once (in `:root`) and restated only in the
+ * explicit light override; the dark palette appears in the media query and in
+ * the explicit dark override, because both are selectors something can target.
+ *
+ * Every colour pair here is checked against WCAG 2.1 AA by
+ * `scripts/check-dashboard-contrast.mjs`, in both themes — see that script for
+ * the thresholds, the pairs and what counts as a non-text one. */
+
 :root {
+  color-scheme: light dark;
   --bg: #f6f7f9;
   --surface: #ffffff;
   --border: #e3e6ea;
@@ -24,7 +48,7 @@
 }
 
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme]) {
     --bg: #14161a;
     --surface: #1c1f24;
     --border: #2c313a;
@@ -45,6 +69,50 @@
   }
 }
 
+/* An explicit light choice on a dark OS. */
+html[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --border: #e3e6ea;
+  --text: #1a1d21;
+  --muted: #6b7280;
+  --accent: #3b5bdb;
+  --accent-text: #ffffff;
+  --ok: #17803d;
+  --ok-bg: #e7f6ec;
+  --warn: #9a6700;
+  --warn-bg: #fff4e0;
+  --err: #b42318;
+  --err-bg: #fdeceb;
+  --idle: #4b5563;
+  --idle-bg: #eef0f3;
+  --skeleton-base: #e3e6ea;
+  --skeleton-shine: #f0f2f5;
+}
+
+/* An explicit dark choice on a light OS. */
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #14161a;
+  --surface: #1c1f24;
+  --border: #2c313a;
+  --text: #e8eaed;
+  --muted: #9aa3af;
+  --accent: #7c93f5;
+  --accent-text: #14161a;
+  --ok: #6ee7a0;
+  --ok-bg: #16301f;
+  --warn: #f5c451;
+  --warn-bg: #33280c;
+  --err: #f5867c;
+  --err-bg: #3a1a17;
+  --idle: #9aa3af;
+  --idle-bg: #262a31;
+  --skeleton-base: #2c313a;
+  --skeleton-shine: #363c47;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -56,6 +124,23 @@
    authoritative, so declare it once here rather than per-component. */
 [hidden] {
   display: none !important;
+}
+
+/* Present to assistive technology, absent from the visual layout.
+   `clip-path` rather than the older `clip: rect()` because the latter is
+   deprecated; both are needed alongside it, since removing an element from the
+   box tree with `display: none` or `visibility: hidden` also removes it from
+   the accessibility tree — which is the opposite of what this is for. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
 }
 
 body {
@@ -131,6 +216,41 @@ h3 {
   font-size: 0.85rem;
   font-weight: 600;
   margin-top: 0.5rem;
+}
+
+/* Title and theme control share the top line of the sign-in card. */
+.gate-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.gate-head h1 {
+  margin-bottom: 0;
+}
+
+/* ── Theme toggle ────────────────────────────────────────────────────────────
+ *
+ * The control is a toggle button, so its accessible name stays constant
+ * ("Dark theme") and `aria-pressed` carries the state. A label that swapped
+ * between "Dark" and "Light" would be a moving target for anyone navigating by
+ * that name, and would describe the action rather than the state.
+ *
+ * The glyph shows where the control takes you, not where you are — a moon on a
+ * light page, a sun on a dark one — which is the convention every OS and app
+ * uses for this and the reason it is worth an icon rather than two words. */
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  padding: 0;
+  flex: none;
+  line-height: 1;
+}
+.theme-icon {
+  font-size: 1.05rem;
 }
 
 .gate-card input[type="password"] {

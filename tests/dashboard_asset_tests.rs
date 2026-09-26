@@ -58,6 +58,27 @@ fn make_config() -> Config {
 const DASHBOARD_HTML: &str = include_str!("../static/dashboard.html");
 const DASHBOARD_CSS: &str = include_str!("../static/dashboard.css");
 const DASHBOARD_JS: &str = include_str!("../static/dashboard.js");
+const DASHBOARD_THEME_JS: &str = include_str!("../static/dashboard-theme.js");
+
+/// The document with its `<!-- … -->` comments removed.
+///
+/// The dashboard's markup is heavily commented, and those comments name the
+/// very attributes the assertions below look for — counting them without
+/// stripping would read a comment as an attribute.
+fn strip_html_comments(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(open) = rest.find("<!--") {
+        out.push_str(&rest[..open]);
+        rest = match rest[open..].find("-->") {
+            Some(close) => &rest[open + close + 3..],
+            // Unterminated comment: nothing after it can be trusted as markup.
+            None => return out,
+        };
+    }
+    out.push_str(rest);
+    out
+}
 
 const DASHBOARD_FORMAT_JS: &str = include_str!("../static/dashboard-format.js");
 
@@ -154,6 +175,11 @@ fn every_dashboard_helper_the_script_calls_is_defined() {
         "closeModal",
         "dismissOnBackdrop",
         "onDetailClosed",
+        // Theme override (#713).
+        "initTheme",
+        "applyTheme",
+        "effectiveTheme",
+        "syncThemeUi",
         // Focus management in the detail drawer (#714).
         "focusDetail",
         "trapDetailFocus",
@@ -322,6 +348,151 @@ fn payment_rows_are_keyboard_reachable_and_activate_on_enter() {
 
 const TEST_ADMIN_SECRET: &str = "test-admin-secret";
 
+/// The stored theme must be applied before the first paint (issue #713).
+///
+/// A flash of the wrong palette on every load is the whole problem this
+/// arrangement exists to avoid, and it comes back the moment the bootstrap is
+/// deferred: `app.js` is a module, and a module runs after the document has
+/// been parsed and painted. So the bootstrap is a separate classic script
+/// referenced from `<head>`, and an inline block would not do either — the
+/// dashboard CSP is `script-src 'self'` with no `unsafe-inline`, so it would be
+/// blocked outright.
+#[test]
+fn theme_is_applied_before_first_paint() {
+    assert!(
+        DASHBOARD_HTML.contains(r#"<script src="/dashboard/theme.js"></script>"#),
+        "the theme bootstrap must be a classic <script src> in the document, not a \
+         module (deferred, so it runs after the first paint) and not an inline \
+         block (blocked by the dashboard CSP)"
+    );
+    let head_end = DASHBOARD_HTML
+        .find("</head>")
+        .expect("the document has a <head>");
+    let script_at = DASHBOARD_HTML
+        .find(r#"<script src="/dashboard/theme.js"></script>"#)
+        .expect("the theme bootstrap is referenced");
+    assert!(
+        script_at < head_end,
+        "the theme bootstrap must be in <head>, or it cannot run before the body \
+         is painted"
+    );
+    assert!(
+        DASHBOARD_HTML.contains("type=\"module\" src=\"/dashboard/app.js\""),
+        "app.js stays a module in the body; the two must not be merged, because a \
+         module is deferred by definition"
+    );
+
+    // The bootstrap decides the theme on its own, with no help from app.js.
+    assert!(
+        DASHBOARD_THEME_JS.contains(r#"root.setAttribute("data-theme", theme);"#),
+        "the bootstrap must set data-theme on <html> itself"
+    );
+    assert!(
+        DASHBOARD_THEME_JS.contains(r#"window.localStorage.getItem(KEY)"#),
+        "the bootstrap must read the stored preference before anything renders"
+    );
+    assert!(
+        DASHBOARD_THEME_JS.contains(r#"value === "light" || value === "dark""#),
+        "an unrecognised stored value must be treated as no preference, or a stale \
+         or hand-edited value pins the page to a half-understood theme"
+    );
+
+    // The API key must not be reachable from the theme path. Both keys live in
+    // the same origin's storage, so this is the assertion that keeps the theme
+    // bootstrap from becoming a second reader of the credential.
+    assert!(
+        !DASHBOARD_THEME_JS.contains("apiKey"),
+        "the theme bootstrap must not touch the API key"
+    );
+}
+
+/// The override has to be a tri-state, not a binary.
+///
+/// No stored preference means the OS decides, and that has to stay true after
+/// the control is used — pinning the theme that happened to be in effect at
+/// first paint would turn "follow the OS" into a permanent override the
+/// operator never asked for, and stop a later OS change from showing up.
+#[test]
+fn theme_override_is_tri_state_and_persisted() {
+    assert!(
+        DASHBOARD_JS.contains(r#"var THEME_KEY = "stellargate.theme";"#),
+        "the preference must be stored under a stable key"
+    );
+    assert!(
+        DASHBOARD_JS.contains("window.localStorage.setItem(THEME_KEY, theme);"),
+        "choosing a theme must persist it"
+    );
+    assert!(
+        DASHBOARD_JS.contains("window.localStorage.removeItem(THEME_KEY);"),
+        "clearing the override must remove it, not store a resolved value"
+    );
+    assert!(
+        DASHBOARD_JS.contains(r#"document.documentElement.removeAttribute("data-theme")"#),
+        "clearing the override must drop the attribute so the CSS falls through \
+         to prefers-color-scheme again"
+    );
+    assert!(
+        DASHBOARD_CSS.contains(":root:not([data-theme])"),
+        "the OS palette must stop applying once an override exists, or a stored \
+         \"light\" choice loses to an OS preference of dark"
+    );
+    for selector in [r#"html[data-theme="light"]"#, r#"html[data-theme="dark"]"#] {
+        assert!(
+            DASHBOARD_CSS.contains(selector),
+            "{selector} must exist, or the stored choice has nothing to select on"
+        );
+    }
+    // `color-scheme` is what carries an explicit override to the parts of the
+    // page CSS does not paint: the date pickers, the <select>, the scrollbar.
+    assert!(
+        DASHBOARD_CSS.contains("color-scheme: light dark;"),
+        "the default must declare both palettes are supported so the OS picks"
+    );
+    for block in ["light", "dark"] {
+        assert!(
+            DASHBOARD_CSS.contains(&format!("color-scheme: {block};")),
+            "an explicit {block} override must set color-scheme: {block}, or the \
+             native controls keep the OS palette on a page that has changed"
+        );
+    }
+}
+
+/// The control is a toggle button, so its name is constant and `aria-pressed`
+/// carries the state.
+#[test]
+fn theme_toggle_is_a_toggle_button_on_both_panels() {
+    // Comments explain the control and name the attribute, so they are stripped
+    // before counting attributes.
+    let markup = strip_html_comments(DASHBOARD_HTML);
+    let toggles = markup.matches("data-theme-toggle").count();
+    assert_eq!(
+        toggles, 2,
+        "both the sign-in gate and the top bar need the control — whichever panel \
+         is on screen should offer the override"
+    );
+    assert!(
+        DASHBOARD_HTML.contains("class=\"visually-hidden\""),
+        "the icon-only control needs a visually-hidden text label, or it has no \
+         accessible name at all"
+    );
+    assert!(
+        DASHBOARD_HTML.contains(r#"aria-pressed="false""#),
+        "a toggle button must expose its state with aria-pressed"
+    );
+    assert!(
+        DASHBOARD_JS.contains(r#"button.setAttribute("aria-pressed", dark ? "true" : "false")"#),
+        "the control's state must follow the theme in effect"
+    );
+    assert!(
+        DASHBOARD_JS.contains("function syncThemeUi()"),
+        "both controls must be kept in step from one place"
+    );
+    assert!(
+        DASHBOARD_JS.contains(r#"document.querySelectorAll("[data-theme-toggle]")"#),
+        "controls must be bound by attribute, so a third one needs no new wiring"
+    );
+}
+
 async fn test_server() -> TestServer {
     let cfg = make_config();
     let pool = SqlitePoolOptions::new()
@@ -379,6 +550,14 @@ async fn dashboard_assets_keep_content_type_and_csp() {
             "/dashboard/app.js",
             "text/javascript; charset=utf-8",
             DASHBOARD_JS,
+        ),
+        // Applied before the first paint, so it must be a real, CSP-allowed
+        // script of its own — see `theme_is_applied_before_first_paint` for why
+        // it cannot be folded into app.js.
+        (
+            "/dashboard/theme.js",
+            "text/javascript; charset=utf-8",
+            DASHBOARD_THEME_JS,
         ),
     ] {
         let res = server.get(path).await;
@@ -486,6 +665,7 @@ async fn dashboard_security_headers_are_not_duplicated() {
         "/dashboard/app.css",
         "/dashboard/app.js",
         "/dashboard/format.js",
+        "/dashboard/theme.js",
     ] {
         let res = server.get(path).await;
         res.assert_status_ok();

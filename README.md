@@ -211,6 +211,11 @@ from. Without all that, a keyboard user tabs straight out into the payment
 table behind the panel and, on close, lands on `<body>` with the next `Tab`
 restarting from the top of the document.
 
+The page follows the OS light/dark preference, and a toggle on the sign-in card
+and in the top bar overrides it. The choice is remembered in `localStorage`
+under `stellargate.theme` and applied before the first paint, so it never
+flashes; with nothing stored, the page keeps following the OS.
+
 **How it's built.** The page is plain HTML, CSS, and dependency-free
 JavaScript, compiled into the binary with `include_str!`. There is no npm, no
 bundler, and no `node_modules`: the deployable artifact stays a single Rust
