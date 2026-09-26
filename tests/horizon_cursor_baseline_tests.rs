@@ -21,8 +21,9 @@ use std::sync::Arc;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use stellargate::{
+    AppState,
     config::{AcceptedAsset, Config, ListenerMode},
-    db, horizon, AppState,
+    db, horizon,
 };
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -231,7 +232,9 @@ async fn reused_account_old_open_intent_is_not_skipped() {
     // would still have to include the payment itself.
     create_backdated_pending(&state, MEMO, "5", OLD_TOKEN.saturating_sub(1)).await;
 
-    let settled = horizon::poll_once(&state, &tokio::sync::watch::channel(false).1).await.unwrap();
+    let settled = horizon::poll_once(&state, &tokio::sync::watch::channel(false).1)
+        .await
+        .unwrap();
     assert_eq!(
         settled, 1,
         "the old intent's payment must be found and settled despite 400+ \
@@ -262,7 +265,9 @@ async fn payment_just_behind_the_tip_is_not_skipped() {
     let state = make_state(server.uri()).await;
     create_backdated_pending(&state, MEMO, "5", MATCHED_TOKEN.saturating_sub(1)).await;
 
-    let settled = horizon::poll_once(&state, &tokio::sync::watch::channel(false).1).await.unwrap();
+    let settled = horizon::poll_once(&state, &tokio::sync::watch::channel(false).1)
+        .await
+        .unwrap();
     assert_eq!(
         settled, 1,
         "a payment sitting just behind the tip must not be skipped by the \
@@ -282,6 +287,8 @@ async fn fresh_account_with_no_history_still_settles_the_first_payment() {
     let state = make_state(server.uri()).await;
     create_backdated_pending(&state, MEMO, "5", 1).await;
 
-    let settled = horizon::poll_once(&state, &tokio::sync::watch::channel(false).1).await.unwrap();
+    let settled = horizon::poll_once(&state, &tokio::sync::watch::channel(false).1)
+        .await
+        .unwrap();
     assert_eq!(settled, 1);
 }

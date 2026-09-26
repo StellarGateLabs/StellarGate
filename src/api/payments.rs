@@ -1,13 +1,21 @@
-use crate::{api::AuthenticatedMerchant, db, money, AppState};
+use crate::{AppState, api::AuthenticatedMerchant, db, money};
 use axum::{
-    async_trait,
-    extract::{ConnectInfo, Extension, FromRequest, FromRequestParts, Path, Query, Request, State},
+    extract::{
+        ConnectInfo, Extension, FromRequest, FromRequestParts, OptionalFromRequest, Path, Query,
+        Request, State,
+    },
     http::{request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
+    extract::{
+        ConnectInfo, Extension, FromRequest, FromRequestParts, OptionalFromRequest, Path, Query,
+        Request, State,
+    },
+    http::{HeaderMap, StatusCode, request::Parts},
+    response::{IntoResponse, Response},
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -67,7 +75,6 @@ impl From<anyhow::Error> for AppError {
 /// instead of axum's default 422 plaintext rejection.
 pub struct JsonBody<T>(pub T);
 
-#[async_trait]
 impl<T, S> FromRequest<S> for JsonBody<T>
 where
     T: serde::de::DeserializeOwned,
@@ -76,7 +83,7 @@ where
     type Rejection = AppError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        match Json::<T>::from_request(req, state).await {
+        match <Json<T> as FromRequest<S>>::from_request(req, state).await {
             Ok(Json(value)) => Ok(JsonBody(value)),
             Err(rejection) => {
                 use axum::extract::rejection::JsonRejection;
@@ -105,6 +112,24 @@ where
     }
 }
 
+/// Lets handlers take `Option<JsonBody<T>>` for an optional body. axum 0.8
+/// requires an explicit impl for `Option<_>` extractors; this keeps 0.7's
+/// behaviour, where any rejection (missing, empty or invalid body) yields
+/// `None` rather than an error response.
+impl<T, S> OptionalFromRequest<S> for JsonBody<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request(req: Request, state: &S) -> Result<Option<Self>, Self::Rejection> {
+        Ok(<Self as FromRequest<S>>::from_request(req, state)
+            .await
+            .ok())
+    }
+}
+
 /// A drop-in replacement for `Query<T>` that maps a query-string failure into
 /// our standard `{"code": "...", "error": "..."}` 400 instead of axum's
 /// plaintext rejection.
@@ -116,7 +141,6 @@ where
 /// offending key and lists the accepted ones.
 pub struct QueryParams<T>(pub T);
 
-#[async_trait]
 impl<T, S> FromRequestParts<S> for QueryParams<T>
 where
     T: serde::de::DeserializeOwned,
@@ -259,22 +283,19 @@ pub async fn create(
     payment with 200 instead of creating a new one. If the mapped payment row
     is missing (e.g. a previous winner crashed after inserting the key but
     before creating the payment), delete the stale mapping and proceed. */
-    if let Some(key) = idempotency_key {
-        if let Some(existing_id) =
+    if let Some(key) = idempotency_key
+        && let Some(existing_id) =
             db::find_payment_id_by_idempotency_key(&state.pool, &merchant_id, key).await?
-        {
-            if let Some(payment) = db::get_payment(&state.pool, &existing_id).await? {
-                return Ok((StatusCode::OK, Json(to_json(&payment))));
-            }
-            sqlx::query(
-                "DELETE FROM idempotency_keys WHERE merchant_id = ? AND idempotency_key = ?",
-            )
+    {
+        if let Some(payment) = db::get_payment(&state.pool, &existing_id).await? {
+            return Ok((StatusCode::OK, Json(to_json(&payment))));
+        }
+        sqlx::query("DELETE FROM idempotency_keys WHERE merchant_id = ? AND idempotency_key = ?")
             .bind(&merchant_id)
             .bind(key)
             .execute(&state.pool)
             .await
             .map_err(anyhow::Error::from)?;
-        }
     }
 
     let id = Uuid::new_v4().to_string();
@@ -413,6 +434,8 @@ pub struct ListQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub cursor: Option<String>,
+    pub created_after: Option<String>,
+    pub created_before: Option<String>,
 }
 
 const DEFAULT_LIMIT: i64 = 20;
@@ -429,17 +452,17 @@ pub async fn list(
     Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, AppError> {
-    if let Some(s) = &q.status {
-        if !VALID_STATUSES.contains(&s.as_str()) {
-            return Err(AppError::bad_request(
-                "invalid_status",
-                format!(
-                    "invalid status '{}'; valid: {}",
-                    s,
-                    VALID_STATUSES.join(", ")
-                ),
-            ));
-        }
+    if let Some(s) = &q.status
+        && !VALID_STATUSES.contains(&s.as_str())
+    {
+        return Err(AppError::bad_request(
+            "invalid_status",
+            format!(
+                "invalid status '{}'; valid: {}",
+                s,
+                VALID_STATUSES.join(", ")
+            ),
+        ));
     }
 
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
@@ -453,6 +476,8 @@ pub async fn list(
             &state.pool,
             &merchant_id,
             q.status.as_deref(),
+            q.created_after.as_deref(),
+            q.created_before.as_deref(),
             limit,
             Some((&cursor_ts, &cursor_id)),
         )
@@ -476,6 +501,8 @@ pub async fn list(
             &state.pool,
             &merchant_id,
             q.status.as_deref(),
+            q.created_after.as_deref(),
+            q.created_before.as_deref(),
             limit,
             offset,
         )
@@ -492,6 +519,14 @@ pub async fn list(
             "next_cursor": next_cursor,
         })))
     }
+}
+
+pub async fn summary(
+    State(state): State<Arc<AppState>>,
+    Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
+) -> Result<Json<Value>, AppError> {
+    let summary = db::payments_summary(&state.pool, &merchant_id).await?;
+    Ok(Json(json!({ "summary": summary })))
 }
 
 fn encode_cursor(ts: &str, id: &str) -> String {
@@ -596,15 +631,7 @@ pub async fn list_webhooks(
 
     Ok(Json(json!({
         "payment_id": payment.id,
-        "deliveries": deliveries.iter().map(|d| json!({
-            "id": d.id,
-            "url": d.url,
-            "event": d.event(),
-            "status": d.status,
-            "attempts": d.attempts,
-            "last_attempt": d.last_attempt,
-            "created_at": d.created_at,
-        })).collect::<Vec<_>>(),
+        "deliveries": deliveries.iter().map(delivery_to_json).collect::<Vec<_>>(),
     })))
 }
 
@@ -624,6 +651,8 @@ pub struct RedeliverQuery {
 /// One delivery as the API exposes it. The stored `payload` is deliberately
 /// omitted — it is the signed event body, it can be large, and a listing is for
 /// triage rather than replay.
+// Kept for the delivery-detail response; not yet referenced by a handler.
+#[allow(dead_code)]
 fn delivery_to_json(d: &db::WebhookDelivery) -> Value {
     json!({
         "id": d.id,
@@ -643,8 +672,8 @@ pub async fn redeliver_webhook(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
     Path((payment_id, delivery_id)): Path<(String, String)>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    _headers: HeaderMap,
     QueryParams(query): QueryParams<RedeliverQuery>,
 ) -> Result<StatusCode, AppError> {
     // Verify payment exists and belongs to the caller. A payment owned by

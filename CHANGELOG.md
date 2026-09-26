@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Dashboard maintenance CI now runs a dependency-free JavaScript syntax check
+  and static accessibility smoke check for `static/dashboard.*`, so the
+  embedded dashboard keeps a small quality gate without introducing an npm
+  build step.
+
+### Changed
+
+- **Rust edition 2021 → 2024 (issue #662).** No `/v1` API change. `cargo fix
+  --edition` only required wrapping the test-only `env::set_var`/`remove_var`
+  calls in `unsafe` (they are unsafe in 2024). It also flagged `tokio::select!`
+  / `if let` temporary drop-order changes in `expiry`, `horizon` and
+  `retention`; none change behaviour here. Nested `if let` chains were folded
+  with let-chains, and the tree was reformatted with the 2024 `rustfmt` style.
+- **Dockerfile base images are pinned by `@sha256` digest (issue #664)**
+  (`rust:1.94-bookworm`, `debian:bookworm-slim`), matching the 1.94 MSRV.
+- Clippy is clean under `-D warnings` again (issue #663): unused test-only
+  helpers are explicitly allowed with a reason, and case-insensitive
+  comparisons use `eq_ignore_ascii_case`.
+
+- **`reqwest` 0.12 → 0.13 (issue #645).** The `rustls-tls` feature is now
+  `rustls`, which uses the `aws-lc-rs` crypto provider and verifies server
+  certificates against the **operating system's trust store**
+  (`rustls-platform-verifier`) instead of the Mozilla roots bundled into the
+  binary (`webpki-roots`). The Docker runtime image already installs
+  `ca-certificates`. A bare-metal or custom-image deployment must have a
+  system CA bundle, or outbound Horizon and webhook requests fail TLS
+  verification. Building now needs a C compiler for `aws-lc-sys` (already
+  present in `rust:*-bookworm`).
+
 ### Fixed
 
 - **`GET /metrics` is no longer reachable anonymously.** It was registered on

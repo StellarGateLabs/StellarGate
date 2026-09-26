@@ -80,12 +80,11 @@ CREATE TABLE processed_transactions (
             but the first (issue #224). Reject it in the schema as well as at
             the write path. */
             tx_hash TEXT NOT NULL CHECK (tx_hash <> ''),
-            /* Zero-based index of this operation within its transaction.
-            Combined with tx_hash to form a unique key per operation so that
-            multiple operations in one transaction are each credited
-            independently (issues #614, #615). Defaults to 0 for
-            single-operation transactions and for rows backfilled from legacy
-            data that predate this column. */
+            /* Index of this operation within its transaction (0-based). Used
+            together with tx_hash to uniquely identify a single payment
+            operation so that a multi-op transaction credits each op
+            independently (issue #613). Defaults to 0 for rows added before
+            this column existed (issue #616). */
             operation_index INTEGER NOT NULL DEFAULT 0,
             amount_stroops INTEGER NOT NULL,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
@@ -103,4 +102,14 @@ CREATE TABLE webhook_deliveries (
             last_attempt TEXT,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
         , acknowledged_at TEXT, manual_attempts INTEGER NOT NULL DEFAULT 0)
+;
+CREATE TRIGGER trg_api_keys_keep_one_active
+         BEFORE UPDATE OF revoked_at ON api_keys
+         WHEN OLD.revoked_at IS NULL
+          AND NEW.revoked_at IS NOT NULL
+          AND (SELECT COUNT(*) FROM api_keys
+                WHERE merchant_id = OLD.merchant_id AND revoked_at IS NULL) <= 1
+         BEGIN
+             SELECT RAISE(ABORT, 'last_active_key');
+         END
 ;

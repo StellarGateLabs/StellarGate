@@ -106,7 +106,20 @@ allow.
 
 ## Toolchain & CI Policy
 
-Blocking CI jobs (like formatting and clippy) are strictly tied to our pinned MSRV (1.88) as defined in `rust-toolchain.toml`. This ensures that your local `cargo clippy` and `cargo fmt` results perfectly match CI. An advisory lint job runs on the latest stable toolchain to catch upcoming lints, but it is set to `continue-on-error: true` and will not block your pull request.
+Blocking CI jobs (like formatting and clippy) are strictly tied to our pinned MSRV (1.94) as defined in `rust-toolchain.toml`. This ensures that your local `cargo clippy` and `cargo fmt` results perfectly match CI. An advisory lint job runs on the latest stable toolchain to catch upcoming lints, but it is set to `continue-on-error: true` and will not block your pull request.
+
+## Dependency Upgrade Policy
+
+Dependency upgrades should be small, reviewable, and documented. For routine
+patch or minor updates, keep the lockfile change together with any required
+source change and add a short `CHANGELOG.md` entry when runtime behavior,
+minimum supported Rust version, build tooling, TLS roots, or deployment
+requirements change. Major upgrades need an issue first, because they can alter
+security posture, API behavior, or production build requirements.
+
+When an upgrade changes the Rust toolchain, Docker image, system packages, or
+release workflow, update `README.md`, `DEPLOYMENT.md`, and the relevant example
+environment files in the same PR.
 
 ## Commit Messages
 

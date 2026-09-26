@@ -12,21 +12,19 @@
 //!
 //! Methodology: a file-backed (not `:memory:` — issue #309 means an
 //! in-memory pool with more than one connection is actually N separate
-//! databases) SQLite pool opened with the exact PRAGMAs `main.rs::open_pool`
-//! uses in production (WAL, `synchronous = NORMAL`, a busy timeout), and a
-//! fixed pool size matching `DB_POOL_MAX_CONNECTIONS`'s documented default.
-//! `CONCURRENCY` tasks each insert payments back-to-back for `DURATION`,
-//! contending for SQLite's single writer exactly as concurrent request
-//! handlers would. This isolates the write path itself from HTTP, auth, and
-//! JSON overhead, which is the part issue #321 is actually about — every
-//! writer this service has (payment creation, settlement, webhook delivery
-//! bookkeeping, `last_used_at`) goes through the same single-writer lock this
-//! measures.
+//! databases) SQLite pool opened through `db::open_pool`, the function
+//! `main.rs` uses in production (WAL, `synchronous = NORMAL`, a busy
+//! timeout), and a fixed pool size matching `DB_POOL_MAX_CONNECTIONS`'s
+//! documented default. `CONCURRENCY` tasks each insert payments
+//! back-to-back for `DURATION`, contending for SQLite's single writer exactly
+//! as concurrent request handlers would. This isolates the write path itself
+//! from HTTP, auth, and JSON overhead, which is the part issue #321 is
+//! actually about — every writer this service has (payment creation,
+//! settlement, webhook delivery bookkeeping, `last_used_at`) goes through the
+//! same single-writer lock this measures.
 
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use stellargate::db::{self, NewPayment};
 
@@ -41,19 +39,17 @@ async fn measures_sustained_payment_creation_throughput() {
     let db_path = dir.join("bench.db");
     let database_url = format!("sqlite://{}", db_path.display());
 
-    // Mirrors main.rs::open_pool exactly, so this measures the production
-    // configuration rather than a more (or less) favorable one.
-    let opts = SqliteConnectOptions::from_str(&database_url)
-        .unwrap()
-        .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal)
-        .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(Duration::from_millis(5000));
-    let pool = SqlitePoolOptions::new()
-        .max_connections(10) // DB_POOL_MAX_CONNECTIONS default
-        .connect_with(opts)
-        .await
-        .unwrap();
+    // The production pool itself, so this measures the production
+    // configuration rather than a more (or less) favorable copy of it — and so
+    // a before/after run across a sqlx upgrade (issue #643) measures whatever
+    // the new sqlx does with those options.
+    let pool = db::open_pool(
+        &database_url,
+        10,                          // DB_POOL_MAX_CONNECTIONS default
+        Duration::from_millis(5000), // DB_BUSY_TIMEOUT_MS default
+    )
+    .await
+    .unwrap();
     db::migrate(&pool).await.unwrap();
 
     let completed = Arc::new(AtomicU64::new(0));

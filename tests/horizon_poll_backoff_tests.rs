@@ -13,8 +13,9 @@ use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use stellargate::{
+    AppState,
     config::{AcceptedAsset, Config, ListenerMode},
-    db, horizon, AppState,
+    db, horizon,
 };
 use uuid::Uuid;
 use wiremock::matchers::{method, path, query_param};
@@ -107,10 +108,9 @@ async fn fetch_recent_payments_reports_retry_after_on_429() {
         .await;
 
     let client = reqwest::Client::new();
-    let err =
-        horizon::fetch_recent_payments(&client, &server.uri(), GATEWAY, "0", 200)
-            .await
-            .expect_err("a 429 must be reported as an error");
+    let err = horizon::fetch_recent_payments(&client, &server.uri(), GATEWAY, "0", 200)
+        .await
+        .expect_err("a 429 must be reported as an error");
 
     let horizon_err = err
         .downcast_ref::<horizon::HorizonHttpError>()
@@ -131,10 +131,9 @@ async fn fetch_recent_payments_429_without_retry_after_has_none() {
         .await;
 
     let client = reqwest::Client::new();
-    let err =
-        horizon::fetch_recent_payments(&client, &server.uri(), GATEWAY, "0", 200)
-            .await
-            .unwrap_err();
+    let err = horizon::fetch_recent_payments(&client, &server.uri(), GATEWAY, "0", 200)
+        .await
+        .unwrap_err();
 
     let horizon_err = err.downcast_ref::<horizon::HorizonHttpError>().unwrap();
     assert!(horizon_err.is_rate_limited());
@@ -154,10 +153,9 @@ async fn fetch_recent_payments_500_is_not_rate_limited() {
         .await;
 
     let client = reqwest::Client::new();
-    let err =
-        horizon::fetch_recent_payments(&client, &server.uri(), GATEWAY, "0", 200)
-            .await
-            .unwrap_err();
+    let err = horizon::fetch_recent_payments(&client, &server.uri(), GATEWAY, "0", 200)
+        .await
+        .unwrap_err();
 
     let horizon_err = err.downcast_ref::<horizon::HorizonHttpError>().unwrap();
     assert!(!horizon_err.is_rate_limited());
@@ -184,15 +182,9 @@ async fn fetch_recent_payments_encodes_an_opaque_cursor() {
         .await;
 
     let client = reqwest::Client::new();
-    let records = horizon::fetch_recent_payments(
-        &client,
-        &server.uri(),
-        GATEWAY,
-        cursor,
-        200,
-    )
-    .await
-    .unwrap();
+    let records = horizon::fetch_recent_payments(&client, &server.uri(), GATEWAY, cursor, 200)
+        .await
+        .unwrap();
 
     assert!(records.is_empty());
 }
@@ -233,7 +225,9 @@ async fn poll_once_stops_at_the_per_cycle_page_cap() {
         .await;
 
     let state = make_state(server.uri()).await;
-    let settled = horizon::poll_once(&state, &tokio::sync::watch::channel(false).1).await.unwrap();
+    let settled = horizon::poll_once(&state, &tokio::sync::watch::channel(false).1)
+        .await
+        .unwrap();
     assert_eq!(settled, 0);
 
     let requests = server.received_requests().await.unwrap();

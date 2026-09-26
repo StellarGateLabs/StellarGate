@@ -1,4 +1,5 @@
 pub mod api;
+pub mod audit;
 pub mod config;
 pub mod db;
 pub mod expiry;
@@ -145,11 +146,7 @@ impl TaskHealth {
     /// before spawning the child task.
     pub fn task_started(&self, name: &'static str) {
         self.inner.started.fetch_add(1, Ordering::Relaxed);
-        let mut tasks = self
-            .inner
-            .tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
         let state = tasks.entry(name).or_default();
         state.running = true;
         // A fresh start clears the disabled marker: a restarted task is no
@@ -161,11 +158,7 @@ impl TaskHealth {
     /// return). Does **not** increment the failure counter.
     pub fn task_stopped(&self, name: &'static str) {
         self.inner.stopped.fetch_add(1, Ordering::Relaxed);
-        let mut tasks = self
-            .inner
-            .tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
         let state = tasks.entry(name).or_default();
         state.running = false;
     }
@@ -174,11 +167,7 @@ impl TaskHealth {
     /// **and** the task's `consecutive_failures` streak; marks it not running.
     pub fn task_failed(&self, name: &'static str) {
         self.inner.failed.fetch_add(1, Ordering::Relaxed);
-        let mut tasks = self
-            .inner
-            .tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
         let state = tasks.entry(name).or_default();
         state.running = false;
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
@@ -194,11 +183,7 @@ impl TaskHealth {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(name);
-        let mut tasks = self
-            .inner
-            .tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
         let state = tasks.entry(name).or_default();
         state.running = false;
         state.disabled_reason = Some(reason);
@@ -207,11 +192,7 @@ impl TaskHealth {
     /// Called by the supervisor's stability timer: `name` has been running
     /// long enough to be considered stable. Resets consecutive-failure count.
     pub fn note_stable(&self, name: &'static str) {
-        let mut tasks = self
-            .inner
-            .tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(state) = tasks.get_mut(name) {
             state.consecutive_failures = 0;
         }
@@ -221,11 +202,7 @@ impl TaskHealth {
     /// Increments the restart counter without changing the running state
     /// (the supervisor marks it running again on the next `task_started`).
     pub fn task_restarted(&self, name: &'static str) {
-        let mut tasks = self
-            .inner
-            .tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
         let state = tasks.entry(name).or_default();
         state.restarts = state.restarts.saturating_add(1);
     }
@@ -250,11 +227,7 @@ impl TaskHealth {
             .required
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let tasks = self
-            .inner
-            .tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
         required
             .iter()
             .copied()
@@ -275,11 +248,7 @@ impl TaskHealth {
             .required
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let tasks = self
-            .inner
-            .tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
         required
             .iter()
             .filter(|name| {
@@ -299,11 +268,7 @@ impl TaskHealth {
             .required
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let tasks = self
-            .inner
-            .tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
         required
             .iter()
             .filter(|name| {
@@ -350,11 +315,7 @@ impl TaskHealth {
             .required
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let tasks = self
-            .inner
-            .tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
         required
             .iter()
             .copied()
@@ -414,7 +375,6 @@ impl TaskHealth {
     pub fn gateway_account_exists(&self) -> bool {
         self.inner.gateway_account_exists.load(Ordering::Relaxed)
     }
-
 }
 
 impl Default for TaskHealth {

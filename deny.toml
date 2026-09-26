@@ -8,9 +8,8 @@
 # default, so only the scope/ignore knobs need to be set explicitly.
 [advisories]
 version = 2
-# Deny any crate with an active security advisory. This is the schema v2
-# default, but stated explicitly so a reader does not have to know the default.
-vulnerability = "deny"
+# Note: the `vulnerability` key was removed in cargo-deny 0.18 (advisories with
+# a vulnerability are always denied under schema v2), so it is not set here.
 # Check every crate in the tree (not just the workspace) for unmaintained
 # advisories — a supply-chain risk for a payments service.
 unmaintained = "all"
@@ -22,31 +21,9 @@ unmaintained = "all"
 # .github/workflows/supply-chain.yml). Remove an entry as soon as its removal
 # condition is met.
 ignore = [
-    # RUSTSEC-2023-0071 — Marvin timing side-channel in `rsa`.
-    #
-    # Why ignored: `rsa` is pulled in only through sqlx's MySQL backend
-    # (`sqlx-mysql`), which we do not enable — we depend on `sqlx` with the
-    # `sqlite` feature only, so the vulnerable code is never compiled or
-    # executed. It appears in Cargo.lock (and is therefore flagged by the
-    # advisory scanners, which read the lockfile) purely as an optional,
-    # unbuilt transitive dependency.
-    #
-    # Triage (2026-08-26): rsa 0.9.10 still present in Cargo.lock. No fixed
-    # release published upstream; RUSTSEC-2023-0071 remains open. sqlx has not
-    # removed the MySQL backend from resolution. StellarGate enables the
-    # `sqlite` feature only — the vulnerable code is unreachable.
-    #
-    # Removal condition — drop this ignore as soon as ANY of these holds:
-    #   1. A fixed `rsa` release is published (track RustSec advisory
-    #      RUSTSEC-2023-0071 and https://github.com/RustCrypto/RSA/issues/19).
-    #   2. `rsa` leaves the dependency tree entirely (e.g. sqlx removes the
-    #      transitive path, or we drop the MySQL backend from resolution).
-    #   3. StellarGate begins enabling sqlx's MySQL backend — in which case the
-    #      code IS reachable and this must become a real fix, not an ignore.
-    #
-    # Review by: 2027-01-01 (next quarterly). Tracking issue: StellarGateLabs#154.
-    # Keep in sync with the `--ignore` flag in supply-chain.yml.
-    { id = "RUSTSEC-2023-0071", reason = "rsa reachable only via sqlx's unenabled MySQL backend; no fixed release yet. Remove when fixed/removed upstream. Review by 2027-01-01. See StellarGateLabs#154." },
+    # RUSTSEC-2023-0071 (rsa, via sqlx-mysql) was ignored here until 2026-09-24.
+    # sqlx 0.9 no longer resolves `rsa`, so the ignore was removed together with
+    # the matching `ignore:` in .github/workflows/{ci,supply-chain}.yml.
 ]
 
 # ── Licenses ──────────────────────────────────────────────────────────────────
@@ -63,17 +40,16 @@ allow = [
     "Apache-2.0 WITH LLVM-exception", # compiler-builtins and related LLVM crates
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "ISC",                             # ring and rustls-webpki, via the rustls TLS stack
-    # webpki-roots — the Mozilla CA root store. A permissive *data* licence
+    "ISC",                             # ring, aws-lc-rs and rustls-webpki, via the rustls TLS stack
+    # webpki-root-certs — the Mozilla CA root store. A permissive *data* licence
     # (no copyleft, redistribution unrestricted) covering the certificate set
     # rather than code. Arrives with the rustls stack.
     "CDLA-Permissive-2.0",
-    "Unicode-DFS-2016",                # unicode-ident, icu_* and related crates
     "Unicode-3.0",                     # newer unicode-ident / icu_* releases
     "Zlib",                            # miniz_oxide and compression crates
 ]
-# Note: "OpenSSL" was removed with the move to rustls (sqlx uses
-# runtime-tokio-rustls, reqwest uses rustls-tls). openssl-sys is no longer in
+# Note: "OpenSSL" was removed with the move to rustls (reqwest uses its
+# `rustls` feature; sqlx's SQLite driver needs no TLS). openssl-sys is no longer in
 # the tree, and keeping the allowance would let it return unnoticed.
 
 # ── Bans ──────────────────────────────────────────────────────────────────────
@@ -85,7 +61,8 @@ multiple-versions = "deny"
 # Wildcard ("*") version requirements are allowed for now.
 wildcards = "allow"
 
-# Known duplicate versions as of 2026-08-26. Every entry below is a
+# Known duplicate versions as of 2026-09-24 (re-audited after the axum 0.8,
+# sqlx 0.9, reqwest 0.13 and tower-http 0.7 upgrades; stale skips pruned). Every entry below is a
 # transitively-forced version split that cannot be resolved without waiting for
 # upstream crates to unify on a single major. They are listed here so that
 # `multiple-versions = "deny"` above rejects any *new* unregistered duplicate
@@ -95,18 +72,16 @@ wildcards = "allow"
 # remove the corresponding skip entry so the policy tightens automatically.
 
 [[bans.skip]]
-# rand 0.8 required by sqlx; 0.9 by governor; 0.10 by newer transitive deps.
-# Collapse when sqlx and governor align on a single rand major.
+# rand 0.8 is required by governor 0.7; 0.9 is our direct dependency (and
+# proptest's); 0.10 (unskipped, so it is the "unique" version) comes from
+# axum-test via rust-multipart-rfc7578_2 (dev-only).
+# Collapse when governor moves off rand 0.8 (needs a governor major bump).
 name = "rand"
 version = "=0.8.7"
 
 [[bans.skip]]
 name = "rand"
 version = "=0.9.5"
-
-[[bans.skip]]
-name = "rand"
-version = "=0.10.2"
 
 [[bans.skip]]
 # rand_chacha splits alongside rand majors.
@@ -131,8 +106,9 @@ name = "rand_core"
 version = "=0.10.1"
 
 [[bans.skip]]
-# sha2 0.10 / digest 0.10 required by sqlx and hmac 0.12;
-# sha2 0.11 / digest 0.11 required by hmac 0.13 (pulled by newer crypto stack).
+# sha2 0.10 / digest 0.10 required by sqlx-core and sqlx-macros-core 0.9;
+# sha2 0.11 / digest 0.11 is our direct dependency (with hmac 0.13).
+# Collapse when sqlx moves to the RustCrypto 0.11 generation.
 name = "sha2"
 version = "=0.10.9"
 
@@ -144,11 +120,6 @@ version = "=0.10.7"
 [[bans.skip]]
 name = "digest"
 version = "=0.11.3"
-
-[[bans.skip]]
-# hmac 0.12 required by sqlx; 0.13 required by our direct dep (webhooks).
-name = "hmac"
-version = "=0.12.1"
 
 [[bans.skip]]
 # crypto-common splits alongside the RustCrypto digest/sha2 version bump.
@@ -169,15 +140,6 @@ name = "block-buffer"
 version = "=0.12.1"
 
 [[bans.skip]]
-# const-oid splits across the RustCrypto version bump.
-name = "const-oid"
-version = "=0.9.6"
-
-[[bans.skip]]
-name = "const-oid"
-version = "=0.10.2"
-
-[[bans.skip]]
 # cpufeatures splits across the RustCrypto version bump.
 name = "cpufeatures"
 version = "=0.2.17"
@@ -187,14 +149,14 @@ name = "cpufeatures"
 version = "=0.3.0"
 
 [[bans.skip]]
-# tower-http 0.6 required by axum 0.7; 0.7 is pulled by a newer transitive dep.
-# Collapse when axum bumps its tower-http requirement.
+# tower-http 0.6 required by reqwest 0.13; 0.7 is our direct dependency.
+# Collapse when reqwest bumps its tower-http requirement.
 name = "tower-http"
 version = "=0.6.11"
 
 [[bans.skip]]
-# getrandom 0.2 required by older rand/uuid transitive chain;
-# 0.3 and 0.4 by newer chains.
+# getrandom 0.2 via rand_core 0.6 (governor's rand 0.8); 0.3 via rand_core 0.9
+# and tempfile; 0.4 via rand 0.10 and uuid.
 name = "getrandom"
 version = "=0.2.17"
 
@@ -207,22 +169,14 @@ name = "getrandom"
 version = "=0.4.3"
 
 [[bans.skip]]
-# hashbrown splits across multiple collections/indexmap majors.
+# hashbrown: 0.14 via dashmap (moka/governor), 0.16 via sqlx-core/hashlink,
+# 0.17 via indexmap.
 name = "hashbrown"
 version = "=0.14.5"
 
 [[bans.skip]]
 name = "hashbrown"
-version = "=0.15.5"
-
-[[bans.skip]]
-name = "hashbrown"
 version = "=0.17.1"
-
-[[bans.skip]]
-# http 0.2 required by older tower/hyper chain; 1.x by newer axum/hyper stack.
-name = "http"
-version = "=0.2.12"
 
 [[bans.skip]]
 # r-efi splits between two platform-abstraction crate generations.
@@ -234,17 +188,9 @@ name = "r-efi"
 version = "=6.0.0"
 
 [[bans.skip]]
-# redox_syscall splits between older/newer Redox platform crates.
-name = "redox_syscall"
-version = "=0.5.18"
-
-[[bans.skip]]
-name = "redox_syscall"
-version = "=0.9.3"
-
-[[bans.skip]]
-# syn 2 and 3 coexist due to different proc-macro crates being at different
-# migration stages. Collapse when all proc-macro deps unify on syn 3.
+# syn 2 (sqlx-macros, tracing-attributes, synstructure, expect-json-macros) and
+# syn 3 (serde_derive, futures-macro, displaydoc, educe, ...) coexist while
+# proc-macro crates migrate. Collapse when all proc-macro deps unify on syn 3.
 name = "syn"
 version = "=2.0.119"
 
@@ -253,105 +199,10 @@ name = "syn"
 version = "=3.0.3"
 
 [[bans.skip]]
-# thiserror 1.x required by older deps; 2.x by newer ones.
-name = "thiserror"
-version = "=1.0.69"
-
-[[bans.skip]]
-name = "thiserror-impl"
-version = "=1.0.69"
-
-[[bans.skip]]
-# webpki-roots 0.26 required by older rustls chain; 1.x by newer one.
-name = "webpki-roots"
-version = "=0.26.11"
-
-[[bans.skip]]
-# windows-sys 0.48/0.52 required by older winapi consumers; 0.61 by newer ones.
-name = "windows-sys"
-version = "=0.48.0"
-
-[[bans.skip]]
-name = "windows-sys"
-version = "=0.52.0"
-
-[[bans.skip]]
-name = "windows-sys"
-version = "=0.61.2"
-
-[[bans.skip]]
-# windows-targets and windows_* arch crates split alongside windows-sys.
-name = "windows-targets"
-version = "=0.48.5"
-
-[[bans.skip]]
-name = "windows-targets"
-version = "=0.52.6"
-
-[[bans.skip]]
-name = "windows_aarch64_gnullvm"
-version = "=0.48.5"
-
-[[bans.skip]]
-name = "windows_aarch64_gnullvm"
-version = "=0.52.6"
-
-[[bans.skip]]
-name = "windows_aarch64_msvc"
-version = "=0.48.5"
-
-[[bans.skip]]
-name = "windows_aarch64_msvc"
-version = "=0.52.6"
-
-[[bans.skip]]
-name = "windows_i686_gnu"
-version = "=0.48.5"
-
-[[bans.skip]]
-name = "windows_i686_gnu"
-version = "=0.52.6"
-
-[[bans.skip]]
-name = "windows_i686_gnullvm"
-version = "=0.52.6"
-
-[[bans.skip]]
-name = "windows_i686_msvc"
-version = "=0.48.5"
-
-[[bans.skip]]
-name = "windows_i686_msvc"
-version = "=0.52.6"
-
-[[bans.skip]]
-name = "windows_x86_64_gnu"
-version = "=0.48.5"
-
-[[bans.skip]]
-name = "windows_x86_64_gnu"
-version = "=0.52.6"
-
-[[bans.skip]]
-name = "windows_x86_64_gnullvm"
-version = "=0.48.5"
-
-[[bans.skip]]
-name = "windows_x86_64_gnullvm"
-version = "=0.52.6"
-
-[[bans.skip]]
-name = "windows_x86_64_msvc"
-version = "=0.48.5"
-
-[[bans.skip]]
-name = "windows_x86_64_msvc"
-version = "=0.52.6"
-
-[[bans.skip]]
-# wit-bindgen splits between wasmtime generations pulled by different deps.
-name = "wit-bindgen"
-version = "=0.51.0"
+# base64 0.23 required by reqwest 0.13; 0.22 by sqlx-core and (dev-only)
+# wiremock. Collapse when sqlx and wiremock move to base64 0.23.
+name = "base64"
+version = "=0.22.1"
 
 # ── Sources ───────────────────────────────────────────────────────────────────
 [sources]

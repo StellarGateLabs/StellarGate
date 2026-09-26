@@ -19,34 +19,12 @@ jobs:
       # rustsec/audit-check ships a prebuilt binary and caches it, so this
       # job no longer pays the ~60 s compile cost of `cargo install cargo-audit`.
       #
-      # TEMPORARY IGNORE — RUSTSEC-2023-0071 (Marvin timing side-channel in
-      # `rsa`). `rsa` is pulled in only via sqlx's unused MySQL backend (we
-      # enable the `sqlite` feature only), so the vulnerable code is never
-      # compiled. It is flagged because it still appears in Cargo.lock as an
-      # unbuilt optional transitive dependency of sqlx-mysql.
-      #
-      # Triage (2026-08-26): rsa 0.9.10 is still in Cargo.lock. No fixed
-      # release has been published upstream (RustSec RUSTSEC-2023-0071 remains
-      # open; track https://github.com/RustCrypto/RSA/issues/19). The sqlx
-      # team has not removed the MySQL backend from resolution. We do not
-      # enable the sqlx `mysql` feature, so the vulnerable code path is never
-      # compiled or executed in any StellarGate binary or test.
-      #
-      # This is a tracked, time-boxed exception, NOT a permanent waiver. Remove
-      # the `ignore` entry as soon as any removal condition is met:
-      #   * a fixed `rsa` release ships, or
-      #   * `rsa` leaves the dependency tree, or
-      #   * we start enabling sqlx's MySQL backend (then it needs a real fix).
-      # Review by: 2027-01-01 (next quarterly). Tracking issue: StellarGateLabs#154.
-      # Rationale + removal conditions are kept in sync in deny.toml.
-      #
       # The weekly `schedule:` cron above re-runs this audit against a fresh
       # advisory DB, so a newly-published fix surfaces without a code change.
       - name: Run cargo audit
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2023-0071
 
   deny:
     name: cargo deny (licenses + bans + sources + advisories)

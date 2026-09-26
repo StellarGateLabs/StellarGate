@@ -18,7 +18,7 @@
 // bodies or URL path parameters.
 //
 // The `route` label specifically uses the matched axum route pattern
-// (e.g. "/v1/payments/:id") and never the raw request URI, so payment IDs,
+// (e.g. "/v1/payments/{id}") and never the raw request URI, so payment IDs,
 // merchant IDs, or delivery IDs never appear in metric label values regardless
 // of how many unique identifiers flow through the service.
 
@@ -295,7 +295,9 @@ impl HorizonMetrics {
 
     /// Record a repeated-cursor-4xx incident.
     pub fn record_repeated_cursor_4xx(&self) {
-        self.inner.repeated_cursor_4xx.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .repeated_cursor_4xx
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record one SSE stream reconnect.
@@ -374,7 +376,7 @@ impl RouteLatency {
 }
 
 /// HTTP request counters and a latency histogram, labelled by the matched
-/// route pattern (e.g. `/v1/payments/:id`) and method — never the raw URI or
+/// route pattern (e.g. `/v1/payments/{id}`) and method — never the raw URI or
 /// a path parameter — so cardinality stays bounded by the fixed route table
 /// regardless of how many distinct payment or merchant ids are requested.
 ///
@@ -386,7 +388,7 @@ pub struct HttpMetrics {
 }
 
 #[derive(Default)]
-struct HttpMetricsInner {
+pub(crate) struct HttpMetricsInner {
     /// (method, route, status) -> count.
     requests: HashMap<(String, String, u16), u64>,
     /// (method, route) -> latency distribution.
@@ -402,7 +404,7 @@ impl HttpMetrics {
 
     /// Record one completed HTTP request.
     ///
-    /// `route` MUST be the matched axum route template (e.g. `/v1/payments/:id`),
+    /// `route` MUST be the matched axum route template (e.g. `/v1/payments/{id}`),
     /// never the raw request URI. This is enforced by convention: the HTTP
     /// metrics middleware extracts the route from axum's `MatchedPath` extension,
     /// which only contains the template. Raw URIs contain path parameters
@@ -672,11 +674,7 @@ impl TrustlineMetrics {
     /// Replaces the prior state for exactly the assets checked, so an asset
     /// removed from `ACCEPTED_ASSETS` between checks simply stops being
     /// reported rather than lingering at its last known value.
-    pub fn record_check<'a>(
-        &self,
-        checked: impl IntoIterator<Item = &'a str>,
-        missing: &[String],
-    ) {
+    pub fn record_check<'a>(&self, checked: impl IntoIterator<Item = &'a str>, missing: &[String]) {
         self.record_check_full(checked, missing, &[], &[]);
     }
 
@@ -709,16 +707,11 @@ impl TrustlineMetrics {
         }
         drop(map);
 
-        let mut unauth_map = lock_or_recover(
-            &self.inner.unauthorized,
-            "trustline_metrics.unauthorized",
-        );
+        let mut unauth_map =
+            lock_or_recover(&self.inner.unauthorized, "trustline_metrics.unauthorized");
         unauth_map.clear();
         for &code in &checked_codes {
-            unauth_map.insert(
-                code.to_string(),
-                unauthorized.iter().any(|u| u == code),
-            );
+            unauth_map.insert(code.to_string(), unauthorized.iter().any(|u| u == code));
         }
         drop(unauth_map);
 
@@ -771,10 +764,7 @@ impl TrustlineMetrics {
 
     /// Snapshot of unauthorized state, sorted by asset code.
     pub fn snapshot_unauthorized(&self) -> Vec<(String, bool)> {
-        let map = lock_or_recover(
-            &self.inner.unauthorized,
-            "trustline_metrics.unauthorized",
-        );
+        let map = lock_or_recover(&self.inner.unauthorized, "trustline_metrics.unauthorized");
         let mut out: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
@@ -808,6 +798,8 @@ impl Default for TrustlineMetrics {
 /// value is derived from request bodies, URL path parameters, merchant data,
 /// or any other per-tenant identifier. See the LABEL SAFETY comment at the
 /// top of this module for the full policy.
+// One parameter per metrics subsystem; bundling them would only add indirection.
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     webhook: &WebhookMetrics,
     auth: &AuthMetrics,
@@ -906,17 +898,13 @@ pub fn render(
         "stellargate_tasks_started_total {}\n",
         tasks.started()
     ));
-    out.push_str(
-        "# HELP stellargate_tasks_stopped_total Total clean background task stops.\n",
-    );
+    out.push_str("# HELP stellargate_tasks_stopped_total Total clean background task stops.\n");
     out.push_str("# TYPE stellargate_tasks_stopped_total counter\n");
     out.push_str(&format!(
         "stellargate_tasks_stopped_total {}\n",
         tasks.stopped()
     ));
-    out.push_str(
-        "# HELP stellargate_tasks_failed_total Total background task panics.\n",
-    );
+    out.push_str("# HELP stellargate_tasks_failed_total Total background task panics.\n");
     out.push_str("# TYPE stellargate_tasks_failed_total counter\n");
     out.push_str(&format!(
         "stellargate_tasks_failed_total {}\n",
@@ -1319,9 +1307,9 @@ mod tests {
     #[test]
     fn http_metrics_labels_are_bounded_by_route_not_raw_path() {
         let http = HttpMetrics::new();
-        http.record("GET", "/v1/payments/:id", 200, 5);
-        http.record("GET", "/v1/payments/:id", 200, 15);
-        http.record("GET", "/v1/payments/:id", 404, 3);
+        http.record("GET", "/v1/payments/{id}", 200, 5);
+        http.record("GET", "/v1/payments/{id}", 200, 15);
+        http.record("GET", "/v1/payments/{id}", 404, 3);
 
         let rendered = render_all(
             &WebhookMetrics::new(),
@@ -1335,25 +1323,25 @@ mod tests {
 
         assert!(
             rendered.contains(
-                "stellargate_http_requests_total{method=\"GET\",route=\"/v1/payments/:id\",status=\"200\"} 2"
+                "stellargate_http_requests_total{method=\"GET\",route=\"/v1/payments/{id}\",status=\"200\"} 2"
             ),
             "got:\n{rendered}"
         );
         assert!(
             rendered.contains(
-                "stellargate_http_requests_total{method=\"GET\",route=\"/v1/payments/:id\",status=\"404\"} 1"
+                "stellargate_http_requests_total{method=\"GET\",route=\"/v1/payments/{id}\",status=\"404\"} 1"
             ),
             "got:\n{rendered}"
         );
         assert!(
             rendered.contains(
-                "stellargate_http_request_duration_seconds_count{method=\"GET\",route=\"/v1/payments/:id\"} 3"
+                "stellargate_http_request_duration_seconds_count{method=\"GET\",route=\"/v1/payments/{id}\"} 3"
             ),
             "the latency histogram must aggregate over the same bounded route \
              label as the counter:\n{rendered}"
         );
         assert!(
-            rendered.contains("stellargate_http_request_duration_seconds_sum{method=\"GET\",route=\"/v1/payments/:id\"} 0.023"),
+            rendered.contains("stellargate_http_request_duration_seconds_sum{method=\"GET\",route=\"/v1/payments/{id}\"} 0.023"),
             "sum must be in seconds, not milliseconds:\n{rendered}"
         );
     }
@@ -1578,7 +1566,11 @@ mod tests {
         // 75 <= 100 (index 2), so buckets 2..=8 (all from le=100 up) and +Inf increment.
         // le=50 (index 1) should be 0; le=100 (index 2) should be 1.
         assert_eq!(wm.latency_bucket(1), 0, "le=50 bucket should be 0 for 75ms");
-        assert_eq!(wm.latency_bucket(2), 1, "le=100 bucket should be 1 for 75ms");
+        assert_eq!(
+            wm.latency_bucket(2),
+            1,
+            "le=100 bucket should be 1 for 75ms"
+        );
         // +Inf bucket is always at index LATENCY_BUCKETS_MS.len() = 9
         assert_eq!(
             wm.latency_bucket(LATENCY_BUCKETS_MS.len()),
@@ -1596,7 +1588,11 @@ mod tests {
 
         // 100 <= 100 (index 2) — increments le=100.
         // 100 > 50 — le=50 (index 1) stays 0.
-        assert_eq!(wm.latency_bucket(1), 0, "le=50 bucket should be 0 for 100ms");
+        assert_eq!(
+            wm.latency_bucket(1),
+            0,
+            "le=50 bucket should be 0 for 100ms"
+        );
         assert_eq!(
             wm.latency_bucket(2),
             1,
@@ -1630,12 +1626,11 @@ mod tests {
 
         // 99_999 exceeds all named buckets (max is 10_000).
         // All named buckets (indices 0..8) should be 0.
-        for i in 0..LATENCY_BUCKETS_MS.len() {
+        for (i, le) in LATENCY_BUCKETS_MS.iter().enumerate() {
             assert_eq!(
                 wm.latency_bucket(i),
                 0,
-                "named bucket {i} (le={}) should be 0 for 99_999ms",
-                LATENCY_BUCKETS_MS[i]
+                "named bucket {i} (le={le}) should be 0 for 99_999ms"
             );
         }
         assert_eq!(

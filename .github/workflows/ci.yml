@@ -65,7 +65,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        rust: [1.88, stable]
+        rust: [1.94, stable]
     steps:
       - uses: actions/checkout@v4
 
@@ -84,7 +84,7 @@ jobs:
             ${{ runner.os }}-cargo-${{ matrix.rust }}-
 
       # Without this the repo's rust-toolchain.toml would pin every matrix leg
-      # to the MSRV, so the `stable` leg would silently retest 1.88 and report
+      # to the MSRV, so the `stable` leg would silently retest 1.94 and report
       # a green check for a toolchain it never ran.
       - name: Test with locked dependencies
         run: cargo test --locked
@@ -135,7 +135,6 @@ jobs:
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2023-0071
 
   # Coverage report uploaded as an artifact for inspection.
   # A hard numeric gate can be added here once a baseline is established.
@@ -147,7 +146,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.94"
 
       - uses: actions/cache@v4
         with:

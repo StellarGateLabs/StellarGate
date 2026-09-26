@@ -3,7 +3,7 @@
 
 [![CI](https://github.com/StellarGateLabs/StellarGate/actions/workflows/ci.yml/badge.svg)](https://github.com/StellarGateLabs/StellarGate/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](https://www.rust-lang.org)
 
 A payment gateway API built on [Stellar](https://stellar.org) for accepting, verifying, and settling payments in XLM, USDC, and any other Stellar asset you configure.
 
@@ -126,7 +126,7 @@ tests/             Integration tests (API, concurrency, rate limits, webhooks, t
 
 | Layer | Choice |
 |---|---|
-| Language | Rust (2021 edition, 1.88+) |
+| Language | Rust (2024 edition, 1.94+) |
 | HTTP | [axum](https://github.com/tokio-rs/axum) + [tower-http](https://github.com/tower-rs/tower-http) |
 | Database | SQLite via [sqlx](https://github.com/launchbadge/sqlx) (WAL mode) |
 | Async runtime | [tokio](https://tokio.rs) |
@@ -139,7 +139,7 @@ tests/             Integration tests (API, concurrency, rate limits, webhooks, t
 
 ### Prerequisites
 
-- **Rust 1.88 or newer** — [install via rustup](https://rustup.rs)
+- **Rust 1.94 or newer** — [install via rustup](https://rustup.rs)
 - A Stellar account public key to receive payments (testnet keys: [Stellar Laboratory](https://laboratory.stellar.org/#account-creator))
 
 ### Install and Run
@@ -206,8 +206,10 @@ deploy. Sign in with any merchant API key.
 JavaScript, compiled into the binary with `include_str!`. There is no npm, no
 bundler, and no `node_modules`: the deployable artifact stays a single Rust
 binary, and the dashboard cannot drift out of sync with the API it ships
-alongside. It is also a plain client of the documented REST API — it uses no
-private endpoints, so anything it displays you can fetch yourself.
+alongside. CI still runs `node --check static/dashboard.js` and a small static
+accessibility smoke check so dashboard changes get fast feedback without adding
+a frontend toolchain. It is also a plain client of the documented REST API —
+it uses no private endpoints, so anything it displays you can fetch yourself.
 
 **Security.**
 
@@ -1661,7 +1663,7 @@ cargo fmt                   # format
 cargo clippy --all-targets -- -D warnings
 ```
 
-CI enforces all four on every pull request, plus a [`cargo audit`](https://github.com/rustsec/rustsec) RustSec advisory scan (also run weekly on a schedule) and an [OpenAPI lint](https://redocly.com/docs/cli) of `openapi.yaml`. The test suite additionally cross-checks the spec's documented paths against the live router (`tests/openapi_contract.rs`), so a route added without a matching spec change — or a spec change with no route — fails the build. The test suite runs on both the minimum supported Rust version (1.88) and stable; `cargo fmt` and `cargo clippy` currently run on stable only, which can differ from the pinned toolchain you get locally (#294).
+CI enforces all four on every pull request, plus a [`cargo audit`](https://github.com/rustsec/rustsec) RustSec advisory scan (also run weekly on a schedule) and an [OpenAPI lint](https://redocly.com/docs/cli) of `openapi.yaml`. The test suite additionally cross-checks the spec's documented paths against the live router (`tests/openapi_contract.rs`), so a route added without a matching spec change — or a spec change with no route — fails the build. The test suite runs on both the minimum supported Rust version (1.94) and stable; `cargo fmt` and `cargo clippy` currently run on stable only, which can differ from the pinned toolchain you get locally (#294).
 
 `deny.toml` is present but no workflow runs `cargo deny` yet, so its license, ban, and duplicate-version policy is not currently enforced (#293).
 

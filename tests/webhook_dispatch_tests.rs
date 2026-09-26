@@ -6,14 +6,15 @@
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use stellargate::{
+    AppState,
     config::{AcceptedAsset, Config, ListenerMode},
     db,
     horizon::{self, HorizonPayment, TransactionRef},
-    webhook, AppState,
+    webhook,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

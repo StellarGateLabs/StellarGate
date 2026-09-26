@@ -17,8 +17,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use stellargate::{
+    AppState,
     config::{AcceptedAsset, Config, ListenerMode},
-    db, horizon, AppState,
+    db, horizon,
 };
 use uuid::Uuid;
 use wiremock::matchers::{method, path, query_param};

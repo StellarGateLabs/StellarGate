@@ -179,10 +179,7 @@ mod tests {
     fn display_produces_expected_messages() {
         // Each variant's Display must map to its documented human-readable
         // string — the same message the API and logs surface on a bad config.
-        assert_eq!(
-            StrkeyError::Length.to_string(),
-            "must be 56 characters"
-        );
+        assert_eq!(StrkeyError::Length.to_string(), "must be 56 characters");
         assert_eq!(
             StrkeyError::Alphabet.to_string(),
             "contains non-base32 characters"

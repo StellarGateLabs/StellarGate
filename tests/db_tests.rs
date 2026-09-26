@@ -1,5 +1,6 @@
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
+use std::time::Duration;
 use stellargate::db;
 
 #[tokio::test]
@@ -184,7 +185,10 @@ async fn api_keys_are_stored_hashed_not_plaintext() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_ne!(merchant_hash, raw_key, "merchants.api_key_hash must not store the raw key");
+    assert_ne!(
+        merchant_hash, raw_key,
+        "merchants.api_key_hash must not store the raw key"
+    );
     assert_eq!(merchant_hash, expected_digest);
 
     let key_hash: String =
@@ -192,6 +196,133 @@ async fn api_keys_are_stored_hashed_not_plaintext() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_ne!(key_hash, raw_key, "api_keys.key_hash must not store the raw key");
+    assert_ne!(
+        key_hash, raw_key,
+        "api_keys.key_hash must not store the raw key"
+    );
     assert_eq!(key_hash, expected_digest);
+}
+
+// ── production pool settings (issue #642) ────────────────────────────────────
+
+/// A throwaway on-disk database URL. WAL needs a real file: an in-memory
+/// database silently keeps `journal_mode = memory` whatever is requested.
+fn temp_db_url() -> (std::path::PathBuf, String) {
+    let dir = std::env::temp_dir().join(format!("stellargate-pool-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let url = format!("sqlite://{}", dir.join("pool.db").display());
+    (dir, url)
+}
+
+/// `db::open_pool` must leave every pooled connection in WAL mode with
+/// `synchronous = NORMAL`, the configured busy timeout and foreign keys on.
+/// Two connections are held at once so the PRAGMAs are checked on more than
+/// the first connection the pool happens to open: all but `journal_mode` are
+/// per-connection settings.
+#[tokio::test]
+async fn open_pool_applies_production_pragmas_to_every_connection() {
+    let (dir, url) = temp_db_url();
+    let pool = db::open_pool(&url, 2, Duration::from_millis(1234))
+        .await
+        .unwrap();
+
+    let mut conns = vec![pool.acquire().await.unwrap(), pool.acquire().await.unwrap()];
+    for conn in &mut conns {
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&mut **conn)
+            .await
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+
+        // 0 = OFF, 1 = NORMAL, 2 = FULL, 3 = EXTRA.
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&mut **conn)
+            .await
+            .unwrap();
+        assert_eq!(synchronous, 1, "synchronous must be NORMAL");
+
+        let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&mut **conn)
+            .await
+            .unwrap();
+        assert_eq!(busy_timeout, 1234);
+
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut **conn)
+            .await
+            .unwrap();
+        assert_eq!(foreign_keys, 1, "sqlx enables foreign keys by default");
+    }
+
+    drop(conns);
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `create_if_missing` must still be honoured: a fresh deployment points
+/// `DATABASE_URL` at a file that does not exist yet.
+#[tokio::test]
+async fn open_pool_creates_a_missing_database_file() {
+    let (dir, url) = temp_db_url();
+    let path = dir.join("pool.db");
+    assert!(!path.exists());
+
+    let pool = db::open_pool(&url, 1, Duration::from_millis(5000))
+        .await
+        .unwrap();
+    db::migrate(&pool).await.unwrap();
+    assert!(path.exists());
+
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two writers contending for SQLite's single write lock must wait out the
+/// busy timeout rather than fail with `SQLITE_BUSY` the moment the lock is
+/// taken. One connection holds an open write transaction while the other
+/// tries to write, then the first commits well inside the timeout.
+#[tokio::test]
+async fn open_pool_busy_timeout_lets_a_contending_writer_wait() {
+    let (dir, url) = temp_db_url();
+    let pool = db::open_pool(&url, 2, Duration::from_millis(5000))
+        .await
+        .unwrap();
+    db::migrate(&pool).await.unwrap();
+
+    let mut holder = pool.acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO kv_state (key, value) VALUES ('a', '1')")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let waiter = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            sqlx::query("INSERT INTO kv_state (key, value) VALUES ('b', '2')")
+                .execute(&pool)
+                .await
+        })
+    };
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    sqlx::query("COMMIT").execute(&mut *holder).await.unwrap();
+    drop(holder);
+
+    waiter
+        .await
+        .unwrap()
+        .expect("the second writer must wait for the lock, not fail with SQLITE_BUSY");
+
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kv_state WHERE key IN ('a', 'b')")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 2);
+
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&dir);
 }

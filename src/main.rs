@@ -3,21 +3,18 @@
 //! everything on shutdown.
 
 use anyhow::Result;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use std::future::Future;
 use std::net::SocketAddr;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use stellargate::{
-    api,
+    AppState, TaskHealth, api,
     config::{Config, ListenerMode},
     db, expiry, horizon,
     metrics::{
-        AuthMetrics, HorizonMetrics, HttpMetrics, PaymentMetrics, TrustlineMetrics,
-        WebhookMetrics,
+        AuthMetrics, HorizonMetrics, HttpMetrics, PaymentMetrics, TrustlineMetrics, WebhookMetrics,
     },
-    retention, webhook, AppState, TaskHealth,
+    retention, webhook,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -41,7 +38,12 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
     let cfg = Config::from_env()?;
-    let pool = open_pool(&cfg).await?;
+    let pool = db::open_pool(
+        &cfg.database_url,
+        cfg.db_pool_max_connections,
+        Duration::from_millis(cfg.db_busy_timeout_ms),
+    )
+    .await?;
     db::migrate(&pool).await?;
     /* One-off, best-effort reconstruction of `payments.asset_issuer` for rows
     created before the column existed. Needs the accepted-asset allow-list, so
@@ -137,21 +139,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Open the SQLite pool in WAL mode so a single writer and many readers can
-/// proceed concurrently.
-async fn open_pool(cfg: &Config) -> Result<db::Db> {
-    let opts = SqliteConnectOptions::from_str(&cfg.database_url)?
-        .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal)
-        .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(Duration::from_millis(cfg.db_busy_timeout_ms));
-
-    Ok(SqlitePoolOptions::new()
-        .max_connections(cfg.db_pool_max_connections)
-        .connect_with(opts)
-        .await?)
-}
-
 fn http_client(timeout: Duration) -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .timeout(timeout)
@@ -193,11 +180,11 @@ where
 /// Await a background task. A `JoinError` means it panicked, which is recorded
 /// so the failure counter — and any alert watching it — fires.
 async fn join_task(handle: JoinHandle<()>, name: &'static str, health: &TaskHealth) {
-    if let Err(e) = handle.await {
-        if e.is_panic() {
-            warn!("background task panicked");
-            health.task_failed(name);
-        }
+    if let Err(e) = handle.await
+        && e.is_panic()
+    {
+        warn!("background task panicked");
+        health.task_failed(name);
     }
 }
 

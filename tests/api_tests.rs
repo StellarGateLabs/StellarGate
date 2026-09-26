@@ -1,13 +1,13 @@
 use axum::http::StatusCode;
 use axum_test::TestServer;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
 use std::sync::Arc;
 use stellargate::{
-    api,
+    AppState, api,
     config::{Config, ListenerMode},
-    db, AppState,
+    db,
 };
 use time::format_description::well_known::Rfc3339;
 
@@ -91,7 +91,7 @@ async fn server_with_config(cfg: Config) -> (TestServer, db::Db) {
         task_health: stellargate::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
-    let server = TestServer::new(router).unwrap();
+    let server = TestServer::new(router);
     (server, pool)
 }
 
@@ -126,7 +126,7 @@ async fn server_with_config_and_trustlines(
         task_health: stellargate::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
-    let server = TestServer::new(router).unwrap();
+    let server = TestServer::new(router);
     (server, pool)
 }
 
@@ -651,10 +651,12 @@ async fn test_webhook_url_http_rejected_on_public_network() {
     res.assert_status(StatusCode::BAD_REQUEST);
     let body: Value = res.json();
     assert_eq!(body["code"], "invalid_webhook_url");
-    assert!(body["error"]
-        .as_str()
-        .unwrap()
-        .contains("must be an HTTPS URL on public network"));
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("must be an HTTPS URL on public network")
+    );
 }
 
 #[tokio::test]
@@ -1776,6 +1778,54 @@ async fn test_cannot_revoke_the_last_active_key() {
         .assert_status_ok();
 }
 
+/// Two concurrent revocations of a merchant's only two keys must never leave it
+/// with zero active keys (TOCTOU race on the last-key guard, issue #618).
+#[tokio::test]
+async fn test_concurrent_revocations_never_remove_the_last_active_key() {
+    let (server, pool) = test_server_with_pool().await;
+    let res = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    let body: Value = res.json();
+    let merchant_id = body["merchant_id"].as_str().unwrap().to_string();
+    let key_a = body["key_id"].as_str().unwrap().to_string();
+
+    let res = server
+        .post(&format!("/merchants/{merchant_id}/keys"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .json(&json!({ "label": "second" }))
+        .await;
+    res.assert_status(StatusCode::CREATED);
+    let key_b = res.json::<Value>()["key_id"].as_str().unwrap().to_string();
+
+    let revoke = |key_id: String| {
+        let path = format!("/merchants/{merchant_id}/keys/{key_id}");
+        let server = &server;
+        async move {
+            server
+                .delete(&path)
+                .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+                .await
+                .status_code()
+        }
+    };
+    let (a, b) = tokio::join!(revoke(key_a), revoke(key_b));
+
+    assert_eq!(
+        [a, b].iter().filter(|s| **s == StatusCode::OK).count(),
+        1,
+        "exactly one revoke may succeed; got {a} and {b}"
+    );
+    assert_eq!(
+        db::count_active_api_keys(&pool, &merchant_id)
+            .await
+            .unwrap(),
+        1,
+        "the merchant must keep at least one active key"
+    );
+}
+
 /// Listing keys must never expose a usable credential.
 #[tokio::test]
 async fn test_listing_keys_never_returns_the_secret() {
@@ -2255,4 +2305,118 @@ async fn test_both_mounts_share_the_same_data() {
         .await;
     via_v1.assert_status_ok();
     assert_eq!(via_v1.json::<Value>()["id"], json!(id));
+}
+
+// ── axum 0.8 upgrade guards (issues #635, #636) ──────────────────────────
+
+/// Baseline security headers the outermost layers stamp on every response,
+/// including the router's own 404/405s which no handler produces.
+fn assert_security_headers(res: &axum_test::TestResponse, what: &str) {
+    assert_eq!(res.header("x-content-type-options"), "nosniff", "{what}");
+    assert_eq!(res.header("cache-control"), "no-store", "{what}");
+    assert_eq!(res.header("referrer-policy"), "no-referrer", "{what}");
+    res.assert_contains_header("x-request-id");
+}
+
+/// An unknown path — at the root, under `/v1`, and under a known prefix —
+/// must hit `.fallback(not_found)` with the exact JSON error body (#635).
+#[tokio::test]
+async fn test_unknown_paths_return_identical_json_404() {
+    let server = test_server().await;
+
+    for path in [
+        "/nope",
+        "/v1/nope",
+        "/v1/payments/abc/nope",
+        "/payments/abc/nope",
+    ] {
+        let res = server.get(path).await;
+        res.assert_status(StatusCode::NOT_FOUND);
+        assert_eq!(
+            res.header("content-type"),
+            "application/json",
+            "{path} 404 must be JSON"
+        );
+        assert_eq!(
+            res.json::<Value>(),
+            json!({ "error": "not found", "code": "not_found" }),
+            "{path} 404 body shape changed"
+        );
+        assert_security_headers(&res, path);
+    }
+}
+
+/// A wrong method on a known path is a 405, not the 404 fallback, and still
+/// carries the security headers and an `Allow` header listing the real
+/// methods (#635).
+#[tokio::test]
+async fn test_wrong_method_on_known_path_returns_405() {
+    let server = test_server().await;
+
+    for (path, allowed) in [
+        ("/health", "GET"),
+        ("/v1/payments", "POST"),
+        ("/payments", "POST"),
+    ] {
+        let res = server.put(path).await;
+        res.assert_status(StatusCode::METHOD_NOT_ALLOWED);
+        let allow = res.header("allow");
+        let allow = allow.to_str().unwrap();
+        assert!(
+            allow.contains(allowed),
+            "PUT {path} 405 must advertise {allowed} in Allow; got: {allow}"
+        );
+        assert_ne!(
+            res.text(),
+            json!({ "error": "not found", "code": "not_found" }).to_string(),
+            "PUT {path} must not fall through to the 404 fallback"
+        );
+        assert_security_headers(&res, path);
+    }
+}
+
+/// The same parameterised endpoint must resolve under both mounts, with only
+/// the legacy one tagged as deprecated and linked to its exact successor —
+/// guarding the `nest("/v1", …)` + `merge(… mark_deprecated)` pair across the
+/// axum 0.8 path-syntax change (#636).
+#[tokio::test]
+async fn test_same_endpoint_under_v1_and_legacy_mounts() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+
+    let id = server
+        .post("/v1/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "1", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let v1 = server.get(&format!("/v1/payments/{id}")).await;
+    v1.assert_status_ok();
+    assert!(
+        !v1.headers().contains_key("deprecation"),
+        "/v1 response must not carry Deprecation"
+    );
+    assert!(
+        !v1.headers().contains_key("link"),
+        "/v1 response must not carry a successor Link"
+    );
+
+    let legacy = server.get(&format!("/payments/{id}")).await;
+    legacy.assert_status_ok();
+    assert_eq!(legacy.header("deprecation"), "true");
+    assert_eq!(
+        legacy.header("link").to_str().unwrap(),
+        format!("</v1/payments/{id}>; rel=\"successor-version\""),
+        "legacy response must point at its exact /v1 successor"
+    );
+
+    assert_eq!(
+        v1.json::<Value>(),
+        legacy.json::<Value>(),
+        "both mounts must serve the same payload"
+    );
 }

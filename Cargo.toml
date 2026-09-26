@@ -1,8 +1,8 @@
 [package]
 name = "stellargate"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.88"
+edition = "2024"
+rust-version = "1.94"
 
 description = "A Rust toolkit for building on the Stellar blockchain"
 repository = "https://github.com/StellarGateLabs/StellarGate"
@@ -19,16 +19,19 @@ name = "stellargate"
 path = "src/main.rs"
 
 [dependencies]
-axum = "0.7"
+axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.7", features = ["cors", "trace", "limit", "request-id", "timeout", "set-header"] }
-governor = "0.7"
+governor = "0.10"
 moka = { version = "0.12", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "migrate"] }
+# sqlx 0.9 split the old `runtime-tokio-rustls` feature into `runtime-tokio`
+# plus a separate TLS feature. SQLite never opens a network connection, so no
+# TLS backend is enabled.
+sqlx = { version = "0.9", features = ["sqlite", "runtime-tokio", "migrate"] }
 uuid = { version = "1", features = ["v4"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 futures-util = "0.3"
 hmac = "0.13"
 sha2 = "0.11"
@@ -41,15 +44,15 @@ time = { version = "0.3", features = ["parsing"] }
 # API key generation. Uses the OS CSPRNG — a UUIDv4 is random but only carries
 # 122 bits and encodes a version/variant, so it is the wrong primitive for a
 # bearer credential.
-rand = "0.9"
+rand = "0.10"
 # CIDR parsing for TRUSTED_PROXY_CIDRS (X-Forwarded-For trust boundary).
 ipnet = "2"
 
 
 [dev-dependencies]
-axum-test = "15"
+axum-test = "21"
 tokio = { version = "1", features = ["full"] }
 time = { version = "0.3", features = ["parsing"] }
 wiremock = "0.6.5"
-proptest = "1.5"
+proptest = "1.11"
 tracing-test = { version = "0.2", features = ["no-env-filter"] }

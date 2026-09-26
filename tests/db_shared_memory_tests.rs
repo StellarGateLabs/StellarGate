@@ -13,8 +13,8 @@
 //! `min_connections(1)` everywhere this DSN is used — SQLite drops a
 //! shared-cache in-memory database once every connection to it closes).
 
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::Connection;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
 use stellargate::db;
 

@@ -22,6 +22,11 @@ VPS, home server, or Raspberry Pi.
 
 ## Before you deploy
 
+Builds should use the Rust version pinned in `rust-toolchain.toml`. The
+published release workflow and local source builds both rely on that pin; if it
+changes, update this deployment guide and the README in the same change so
+operators know whether host build prerequisites changed.
+
 ### 1. A Stellar account to watch
 
 The gateway watches one account for incoming payments. It **never holds the

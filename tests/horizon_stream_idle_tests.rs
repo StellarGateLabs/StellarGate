@@ -16,14 +16,15 @@
 //! `HorizonMetrics` and exported by `metrics::render`.
 
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use stellargate::{
+    AppState,
     config::{AcceptedAsset, Config, ListenerMode},
-    db, horizon, AppState,
+    db, horizon,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;

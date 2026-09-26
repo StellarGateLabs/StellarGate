@@ -1,7 +1,40 @@
 use anyhow::Result;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Pool, Row, Sqlite};
+use std::str::FromStr;
+use std::time::Duration;
 
 pub type Db = Pool<Sqlite>;
+
+/// Connection options the service runs with in production: WAL so a single
+/// writer and many readers proceed concurrently, `synchronous = NORMAL` (safe
+/// under WAL), and a busy timeout so contending writers wait rather than fail
+/// with `SQLITE_BUSY`.
+///
+/// Kept in the library rather than `main.rs` so tests can assert the PRAGMAs
+/// each pooled connection actually ends up with (issue #642): builder methods
+/// on `SqliteConnectOptions` have been renamed or re-defaulted across sqlx
+/// majors before, and a silent change here would only show up as lock
+/// contention in production.
+pub fn connect_options(database_url: &str, busy_timeout: Duration) -> Result<SqliteConnectOptions> {
+    Ok(SqliteConnectOptions::from_str(database_url)?
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(busy_timeout))
+}
+
+/// Open the SQLite pool with [`connect_options`].
+pub async fn open_pool(
+    database_url: &str,
+    max_connections: u32,
+    busy_timeout: Duration,
+) -> Result<Db> {
+    Ok(SqlitePoolOptions::new()
+        .max_connections(max_connections)
+        .connect_with(connect_options(database_url, busy_timeout)?)
+        .await?)
+}
 
 /// Normalize a raw SQLite timestamp to strict RFC 3339 UTC with a Z suffix.
 ///
@@ -255,6 +288,25 @@ pub async fn migrate(pool: &Db) -> Result<()> {
         .execute(&mut *tx)
         .await?;
 
+    /* Defense-in-depth for issue #621: `revoke_api_key` already refuses to
+    revoke a merchant's last active key atomically, but this trigger enforces
+    the same invariant in the database itself, so any other code path (or a
+    future regression) that tombstones the final active key is rejected
+    within the same statement/transaction. */
+    sqlx::query(
+        "CREATE TRIGGER IF NOT EXISTS trg_api_keys_keep_one_active
+         BEFORE UPDATE OF revoked_at ON api_keys
+         WHEN OLD.revoked_at IS NULL
+          AND NEW.revoked_at IS NOT NULL
+          AND (SELECT COUNT(*) FROM api_keys
+                WHERE merchant_id = OLD.merchant_id AND revoked_at IS NULL) <= 1
+         BEGIN
+             SELECT RAISE(ABORT, 'last_active_key');
+         END",
+    )
+    .execute(&mut *tx)
+    .await?;
+
     /* Carry pre-existing single-key merchants across. Their raw key is not
     recoverable, but the hash is all authentication needs, so keys issued
     before this table existed keep working. The prefix is unknown for those
@@ -324,12 +376,15 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     an intent is the SUM of `amount_stroops` over its rows, so re-seeing a
     transaction (on a later poll cycle, over the stream, or from a concurrent
     reconciler) is an idempotent no-op instead of a double-credit.
-    `operation_index` tracks which operation within the transaction was
-    credited — a Stellar transaction can contain multiple payment operations
-    that all share the same `transaction_hash`; without this index the
-    second operation would be silently dropped as "already seen", causing the
-    intent to be under-credited (issues #614, #615).
-    `amount_stroops` is the integer stroop value so SUM is exact. */
+    `amount_stroops` is the integer stroop value so SUM is exact.
+
+    `operation_index` distinguishes multiple payment operations that share the
+    same transaction hash (e.g. a wallet that splits one payment into two ops
+    in one Stellar transaction). Without it the second operation would hit a
+    PRIMARY KEY conflict and be silently dropped, leaving the intent
+    under-credited (issue #613). It is derived from the Horizon operation's
+    own paging token, which encodes a per-operation sequence number; existing
+    rows default to 0 via migration (issue #616). */
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS processed_transactions (
             payment_id TEXT NOT NULL,
@@ -338,12 +393,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             but the first (issue #224). Reject it in the schema as well as at
             the write path. */
             tx_hash TEXT NOT NULL CHECK (tx_hash <> ''),
-            /* Zero-based index of this operation within its transaction.
-            Combined with tx_hash to form a unique key per operation so that
-            multiple operations in one transaction are each credited
-            independently (issues #614, #615). Defaults to 0 for
-            single-operation transactions and for rows backfilled from legacy
-            data that predate this column. */
+            /* Index of this operation within its transaction (0-based). Used
+            together with tx_hash to uniquely identify a single payment
+            operation so that a multi-op transaction credits each op
+            independently (issue #613). Defaults to 0 for rows added before
+            this column existed (issue #616). */
             operation_index INTEGER NOT NULL DEFAULT 0,
             amount_stroops INTEGER NOT NULL,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
@@ -353,56 +407,21 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .execute(&mut *tx)
     .await?;
 
-    /* Bring pre-existing processed_transactions tables up to schema.
-    `operation_index` is new as of issues #614/#615/#616: a Stellar transaction
-    can include multiple payment operations that all share the same
-    `transaction_hash`; the old PK of (payment_id, tx_hash) collapsed them
-    onto one row so every operation after the first was silently discarded.
-    The new PK is (payment_id, tx_hash, operation_index).
-    Existing rows (which predate this column) default to 0, which is correct:
-    they were written for single-operation transactions, and operation 0 is the
-    right identity for any single-op record. */
-    let has_operation_index: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM pragma_table_info('processed_transactions') WHERE name = 'operation_index'",
+    /* Migration: add `operation_index` to existing databases that were created
+    before issue #613 was fixed. SQLite forbids a non-constant DEFAULT on
+    ALTER TABLE ADD COLUMN, but 0 is a constant and correct: every row written
+    by the old code represented the sole (or first) payment operation in its
+    transaction, so index 0 is accurate and preserves the received-amount
+    ledger without requiring a data backfill (issue #616). */
+    let has_op_index: bool = sqlx::query_scalar(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('processed_transactions')
+         WHERE name = 'operation_index'",
     )
     .fetch_one(&mut *tx)
     .await?;
-    if has_operation_index == 0 {
-        /* SQLite does not allow adding a column that is part of a PRIMARY KEY
-        via ALTER TABLE, so we recreate the table with the new schema and
-        migrate existing rows across, defaulting operation_index to 0. This is
-        safe because (payment_id, tx_hash, 0) is the correct identity for any
-        single-operation record that existed before this column was introduced,
-        and because re-processing an already-migrated record is idempotent via
-        ON CONFLICT DO NOTHING. */
+    if !has_op_index {
         sqlx::query(
-            "CREATE TABLE IF NOT EXISTS processed_transactions_new (
-                payment_id TEXT NOT NULL,
-                tx_hash TEXT NOT NULL CHECK (tx_hash <> ''),
-                operation_index INTEGER NOT NULL DEFAULT 0,
-                amount_stroops INTEGER NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-                PRIMARY KEY (payment_id, tx_hash, operation_index)
-            )",
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            "INSERT OR IGNORE INTO processed_transactions_new
-                 (payment_id, tx_hash, operation_index, amount_stroops, created_at)
-             SELECT payment_id, tx_hash, 0, amount_stroops, created_at
-               FROM processed_transactions",
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query("DROP TABLE processed_transactions")
-            .execute(&mut *tx)
-            .await?;
-
-        sqlx::query(
-            "ALTER TABLE processed_transactions_new RENAME TO processed_transactions",
+            "ALTER TABLE processed_transactions ADD COLUMN operation_index INTEGER NOT NULL DEFAULT 0",
         )
         .execute(&mut *tx)
         .await?;
@@ -467,7 +486,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             tbl_col.0,
             col = tbl_col.1
         );
-        sqlx::query(&sql).execute(&mut *tx).await?;
+        // Table and column names come from the fixed list above, never from
+        // input, so interpolating them is safe.
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&mut *tx)
+            .await?;
     }
 
     tx.commit().await?;
@@ -630,50 +653,49 @@ pub async fn list_payments(
     pool: &Db,
     merchant_id: &str,
     status: Option<&str>,
+    created_after: Option<&str>,
+    created_before: Option<&str>,
     limit: i64,
     offset: i64,
 ) -> Result<(Vec<Payment>, i64)> {
-    let (rows, total) = if let Some(s) = status {
-        let rows = sqlx::query(
-            "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
-                    webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-             FROM payments WHERE merchant_id = ? AND status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-        )
-        .bind(merchant_id)
-        .bind(s)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
+                webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
+         FROM payments
+         WHERE merchant_id = ?
+           AND (? IS NULL OR status = ?)
+           AND (? IS NULL OR created_at >= ?)
+           AND (? IS NULL OR created_at <= ?)
+         ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+    )
+    .bind(merchant_id)
+    .bind(status)
+    .bind(status)
+    .bind(created_after)
+    .bind(created_after)
+    .bind(created_before)
+    .bind(created_before)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
 
-        let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM payments WHERE merchant_id = ? AND status = ?",
-        )
-        .bind(merchant_id)
-        .bind(s)
-        .fetch_one(pool)
-        .await?;
-
-        (rows, total)
-    } else {
-        let rows = sqlx::query(
-            "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
-                    webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-             FROM payments WHERE merchant_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-        )
-        .bind(merchant_id)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?;
-
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE merchant_id = ?")
-            .bind(merchant_id)
-            .fetch_one(pool)
-            .await?;
-
-        (rows, total)
-    };
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM payments
+         WHERE merchant_id = ?
+           AND (? IS NULL OR status = ?)
+           AND (? IS NULL OR created_at >= ?)
+           AND (? IS NULL OR created_at <= ?)",
+    )
+    .bind(merchant_id)
+    .bind(status)
+    .bind(status)
+    .bind(created_after)
+    .bind(created_after)
+    .bind(created_before)
+    .bind(created_before)
+    .fetch_one(pool)
+    .await?;
 
     Ok((rows.iter().map(row_to_payment).collect(), total))
 }
@@ -682,72 +704,50 @@ pub async fn list_payments_keyset(
     pool: &Db,
     merchant_id: &str,
     status: Option<&str>,
+    created_after: Option<&str>,
+    created_before: Option<&str>,
     limit: i64,
     cursor: Option<(&str, &str)>,
 ) -> Result<Vec<Payment>> {
-    let rows = match (status, cursor) {
-        (None, None) => {
-            sqlx::query(
-                "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
-                    webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-             FROM payments WHERE merchant_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
-            )
-            .bind(merchant_id)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
-        }
-
-        (None, Some((ts, cid))) => {
-            sqlx::query(
-                "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
-                    webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-             FROM payments
-             WHERE merchant_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
-             ORDER BY created_at DESC, id DESC LIMIT ?",
-            )
-            .bind(merchant_id)
-            .bind(ts)
-            .bind(ts)
-            .bind(cid)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
-        }
-
-        (Some(s), None) => {
-            sqlx::query(
-                "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
-                    webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-             FROM payments WHERE merchant_id = ? AND status = ? ORDER BY created_at DESC, id DESC LIMIT ?",
-            )
-            .bind(merchant_id)
-            .bind(s)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
-        }
-
-        (Some(s), Some((ts, cid))) => {
-            sqlx::query(
-                "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
-                    webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-             FROM payments
-             WHERE merchant_id = ? AND status = ? AND (created_at < ? OR (created_at = ? AND id < ?))
-             ORDER BY created_at DESC, id DESC LIMIT ?",
-            )
-            .bind(merchant_id)
-            .bind(s)
-            .bind(ts)
-            .bind(ts)
-            .bind(cid)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
-        }
-    };
+    let (cursor_ts, cursor_id) = cursor.unwrap_or(("9999-12-31T23:59:59Z", ""));
+    let rows = sqlx::query(
+        "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
+                webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
+         FROM payments
+         WHERE merchant_id = ?
+           AND (? IS NULL OR status = ?)
+           AND (? IS NULL OR created_at >= ?)
+           AND (? IS NULL OR created_at <= ?)
+           AND (? = '' OR created_at < ? OR (created_at = ? AND id < ?))
+         ORDER BY created_at DESC, id DESC LIMIT ?",
+    )
+    .bind(merchant_id)
+    .bind(status)
+    .bind(status)
+    .bind(created_after)
+    .bind(created_after)
+    .bind(created_before)
+    .bind(created_before)
+    .bind(cursor_id)
+    .bind(cursor_ts)
+    .bind(cursor_ts)
+    .bind(cursor_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
 
     Ok(rows.iter().map(row_to_payment).collect())
+}
+
+pub async fn payments_summary(pool: &Db, merchant_id: &str) -> Result<Vec<(String, i64)>> {
+    let rows = sqlx::query_as::<_, (String, i64)>(
+        "SELECT status, COUNT(*) FROM payments WHERE merchant_id = ? GROUP BY status ORDER BY status",
+    )
+    .bind(merchant_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
 }
 
 /// All payments still awaiting confirmation or top-up, oldest first. Rows whose
@@ -1379,7 +1379,7 @@ const KEY_PREFIX_LEN: usize = 12;
 ///
 /// Returns `(raw_key, prefix)`. The raw key is shown once and never stored.
 pub fn generate_api_key() -> (String, String) {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     let raw = format!("sg_{}", hex::encode(bytes));
@@ -1657,6 +1657,21 @@ mod tests {
         assert!(keys[0].revoked_at.is_none());
     }
 
+    /// Pins the key format across `rand` upgrades: `sg_` + 64 lowercase hex
+    /// chars (256 bits), with a `KEY_PREFIX_LEN`-char display prefix.
+    #[test]
+    fn generated_api_key_has_stable_length_and_alphabet() {
+        let (raw, prefix) = generate_api_key();
+        let body = raw.strip_prefix("sg_").expect("key starts with sg_");
+        assert_eq!(body.len(), 64);
+        assert!(body
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+        assert_eq!(prefix.len(), KEY_PREFIX_LEN);
+        assert!(raw.starts_with(&prefix));
+        assert_ne!(raw, generate_api_key().0);
+    }
+
     /// Revoking a key must take effect immediately for authentication.
     ///
     /// A second key is issued first so the guard against revoking a
@@ -1773,10 +1788,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(find_pending_by_memo(&pool, "MEMOX")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            find_pending_by_memo(&pool, "MEMOX")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let expired = expire_overdue(&pool).await.unwrap();
         assert_eq!(expired.len(), 1);
@@ -1876,43 +1893,45 @@ mod tests {
             .unwrap();
 
         // First time a transaction is seen it is recorded and counted.
-        assert!(record_processed_tx(&pool, "p", "TX_A", 0, 40_000_000)
-            .await
-            .unwrap());
+        assert!(
+            record_processed_tx(&pool, "p", "TX_A", 0, 40_000_000)
+                .await
+                .unwrap()
+        );
         assert_eq!(sum_processed_stroops(&pool, "p").await.unwrap(), 40_000_000);
 
-        // Re-seeing the same transaction (same tx_hash, same operation_index)
-        // is a no-op — no double credit.
-        assert!(!record_processed_tx(&pool, "p", "TX_A", 0, 40_000_000)
-            .await
-            .unwrap());
+        // Re-seeing the same transaction + operation index is a no-op — no double credit.
+        assert!(
+            !record_processed_tx(&pool, "p", "TX_A", 0, 40_000_000)
+                .await
+                .unwrap()
+        );
         assert_eq!(sum_processed_stroops(&pool, "p").await.unwrap(), 40_000_000);
 
-        // A distinct transaction (different tx_hash) adds to the running total.
-        assert!(record_processed_tx(&pool, "p", "TX_B", 0, 30_000_000)
-            .await
-            .unwrap());
+        // A distinct transaction adds to the running total.
+        assert!(
+            record_processed_tx(&pool, "p", "TX_B", 0, 30_000_000)
+                .await
+                .unwrap()
+        );
         assert_eq!(sum_processed_stroops(&pool, "p").await.unwrap(), 70_000_000);
 
         // Re-seeing an *earlier* transaction after a later one is still a no-op,
         // regardless of order (issue #119).
-        assert!(!record_processed_tx(&pool, "p", "TX_A", 0, 40_000_000)
-            .await
-            .unwrap());
+        assert!(
+            !record_processed_tx(&pool, "p", "TX_A", 0, 40_000_000)
+                .await
+                .unwrap()
+        );
         assert_eq!(sum_processed_stroops(&pool, "p").await.unwrap(), 70_000_000);
 
-        // Two operations within the same transaction (same tx_hash, different
-        // operation_index) are each credited independently (issues #614, #615).
-        assert!(record_processed_tx(&pool, "p", "TX_A", 1, 10_000_000)
-            .await
-            .unwrap());
-        assert_eq!(sum_processed_stroops(&pool, "p").await.unwrap(), 80_000_000);
-
-        // Re-seeing that second operation is still a no-op.
-        assert!(!record_processed_tx(&pool, "p", "TX_A", 1, 10_000_000)
-            .await
-            .unwrap());
-        assert_eq!(sum_processed_stroops(&pool, "p").await.unwrap(), 80_000_000);
+        // A second operation within TX_A (different operation_index) IS a new credit (issue #613).
+        assert!(
+            record_processed_tx(&pool, "p", "TX_A", 1, 20_000_000)
+                .await
+                .unwrap()
+        );
+        assert_eq!(sum_processed_stroops(&pool, "p").await.unwrap(), 90_000_000);
 
         // Rows are scoped per intent.
         assert_eq!(sum_processed_stroops(&pool, "other").await.unwrap(), 0);
@@ -1957,10 +1976,12 @@ mod tests {
             .unwrap();
 
         // Freshly inserted, so a large grace window makes it ineligible...
-        assert!(list_redrivable_deliveries(&pool, 8, 3600, 0, 0)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            list_redrivable_deliveries(&pool, 8, 3600, 0, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         // ...while a zero grace window makes it immediately eligible.
         assert_eq!(
             list_redrivable_deliveries(&pool, 8, 0, 0, 0)

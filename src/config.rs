@@ -557,7 +557,7 @@ impl Config {
             Err(_) => {
                 return Err(anyhow::anyhow!(
                     "WEBHOOK_SECRET environment variable is missing"
-                ))
+                ));
             }
         };
 
@@ -606,11 +606,8 @@ impl Config {
     /// because `require_admin_secret` guards merchant provisioning and the
     /// whole API-key lifecycle.
     fn validate_admin_secret(raw_secret: Result<String, std::env::VarError>) -> Result<String> {
-        let secret = match raw_secret {
-            Ok(s) => s,
-            // Absent is treated the same as empty: provisioning disabled.
-            Err(_) => String::new(),
-        };
+        // Absent is treated the same as empty: provisioning disabled.
+        let secret = raw_secret.unwrap_or_default();
 
         if secret.is_empty() {
             tracing::info!(
@@ -635,9 +632,9 @@ impl Config {
         ];
         if ADMIN_PLACEHOLDERS.contains(&secret.as_str())
             || secret.starts_with("REPLACE_ME_")
-            || secret.to_ascii_lowercase() == "admin"
-            || secret.to_ascii_lowercase() == "secret"
-            || secret.to_ascii_lowercase() == "changeme"
+            || secret.eq_ignore_ascii_case("admin")
+            || secret.eq_ignore_ascii_case("secret")
+            || secret.eq_ignore_ascii_case("changeme")
         {
             return Err(anyhow::anyhow!(
                 "ADMIN_PROVISIONING_SECRET is set to a known placeholder value. \
@@ -663,11 +660,8 @@ impl Config {
     /// `401`) rather than falling back to the previously-open default
     /// (issue #250) — an operator must opt in to exposing the endpoint.
     fn validate_metrics_token(raw_token: Result<String, std::env::VarError>) -> Result<String> {
-        let token = match raw_token {
-            Ok(s) => s,
-            // Absent is treated the same as empty: scraping disabled.
-            Err(_) => String::new(),
-        };
+        // Absent is treated the same as empty: scraping disabled.
+        let token = raw_token.unwrap_or_default();
 
         if token.is_empty() {
             tracing::info!(
@@ -690,9 +684,9 @@ impl Config {
         ];
         if METRICS_PLACEHOLDERS.contains(&token.as_str())
             || token.starts_with("REPLACE_ME_")
-            || token.to_ascii_lowercase() == "metrics"
-            || token.to_ascii_lowercase() == "secret"
-            || token.to_ascii_lowercase() == "changeme"
+            || token.eq_ignore_ascii_case("metrics")
+            || token.eq_ignore_ascii_case("secret")
+            || token.eq_ignore_ascii_case("changeme")
         {
             return Err(anyhow::anyhow!(
                 "METRICS_TOKEN is set to a known placeholder value. \
@@ -777,10 +771,6 @@ impl std::fmt::Debug for Config {
             .field("trusted_proxy_cidrs", &self.trusted_proxy_cidrs)
             .finish()
     }
-}
-
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
 /// Parse `TRUSTED_PROXY_CIDRS`: a comma-separated list of CIDR blocks (IPv4 or
@@ -1062,9 +1052,11 @@ mod tests {
         // Set new values
         for &(key, val) in env_vars {
             if let Some(v) = val {
-                std::env::set_var(key, v);
+                // SAFETY: test-only; callers serialise env access behind a lock.
+                unsafe { std::env::set_var(key, v) };
             } else {
-                std::env::remove_var(key);
+                // SAFETY: test-only; callers serialise env access behind a lock.
+                unsafe { std::env::remove_var(key) };
             }
         }
 
@@ -1074,9 +1066,11 @@ mod tests {
         // Restore backups
         for (key, val) in backups {
             if let Some(v) = val {
-                std::env::set_var(key, v);
+                // SAFETY: test-only; callers serialise env access behind a lock.
+                unsafe { std::env::set_var(key, v) };
             } else {
-                std::env::remove_var(key);
+                // SAFETY: test-only; callers serialise env access behind a lock.
+                unsafe { std::env::remove_var(key) };
             }
         }
 
@@ -1493,7 +1487,11 @@ mod tests {
     #[test]
     fn admin_secret_empty_disables_provisioning() {
         let result = Config::validate_admin_secret(Err(std::env::VarError::NotPresent));
-        assert!(result.is_ok(), "absent secret should succeed; got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "absent secret should succeed; got: {:?}",
+            result
+        );
         assert_eq!(result.unwrap(), "");
     }
 
@@ -1501,7 +1499,11 @@ mod tests {
     #[test]
     fn admin_secret_explicit_empty_string_disables_provisioning() {
         let result = Config::validate_admin_secret(Ok(String::new()));
-        assert!(result.is_ok(), "empty string should succeed; got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "empty string should succeed; got: {:?}",
+            result
+        );
         assert_eq!(result.unwrap(), "");
     }
 
@@ -1585,9 +1587,10 @@ mod tests {
         run_with_env(
             &[
                 ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
-                ("ADMIN_PROVISIONING_SECRET", Some(
-                    "a3f8b2c1d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1",
-                )),
+                (
+                    "ADMIN_PROVISIONING_SECRET",
+                    Some("a3f8b2c1d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1"),
+                ),
             ],
             || {
                 let cfg = Config::from_env().unwrap();
@@ -1621,7 +1624,11 @@ mod tests {
     #[test]
     fn metrics_token_empty_disables_scraping() {
         let result = Config::validate_metrics_token(Err(std::env::VarError::NotPresent));
-        assert!(result.is_ok(), "absent token should succeed; got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "absent token should succeed; got: {:?}",
+            result
+        );
         assert_eq!(result.unwrap(), "");
     }
 
@@ -1629,7 +1636,11 @@ mod tests {
     #[test]
     fn metrics_token_explicit_empty_string_disables_scraping() {
         let result = Config::validate_metrics_token(Ok(String::new()));
-        assert!(result.is_ok(), "empty string should succeed; got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "empty string should succeed; got: {:?}",
+            result
+        );
         assert_eq!(result.unwrap(), "");
     }
 

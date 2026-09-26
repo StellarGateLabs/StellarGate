@@ -28,14 +28,14 @@ use std::sync::Arc;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
 use stellargate::{
+    AppState,
     config::{AcceptedAsset, Config, ListenerMode},
     db::{self, NewPayment},
-    horizon::{reconcile_payment, HorizonPayment, TransactionRef},
-    AppState,
+    horizon::{HorizonPayment, TransactionRef, reconcile_payment},
 };
 use wiremock::{
-    matchers::{method, path},
     Mock, MockServer, ResponseTemplate,
+    matchers::{method, path},
 };
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -481,4 +481,40 @@ async fn concurrent_last_key_revocations_leave_exactly_one_active() {
         active_after, 1,
         "exactly one active key must survive concurrent revocations; got {active_after}"
     );
+}
+
+// ── issue #621: DB-level trigger backs up the last-key guard ─────────────────
+
+#[tokio::test]
+async fn db_trigger_rejects_revoking_last_active_key_even_via_raw_sql() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    db::migrate(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO api_keys (id, merchant_id, key_hash, prefix) VALUES ('k1','m1','h1','p')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO api_keys (id, merchant_id, key_hash, prefix) VALUES ('k2','m1','h2','p')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let revoke = |id: &'static str| {
+        sqlx::query("UPDATE api_keys SET revoked_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+    };
+    revoke("k1")
+        .await
+        .expect("first of two keys may be revoked");
+    let err = revoke("k2")
+        .await
+        .expect_err("last active key must be protected");
+    assert!(err.to_string().contains("last_active_key"), "{err}");
 }

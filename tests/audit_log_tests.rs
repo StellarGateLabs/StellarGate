@@ -7,14 +7,14 @@
 
 use axum::http::StatusCode;
 use axum_test::TestServer;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
 use std::sync::Arc;
 use stellargate::{
-    api,
+    AppState, api,
     config::{Config, ListenerMode},
-    db, AppState,
+    db,
 };
 use tracing_test::traced_test;
 
@@ -86,7 +86,7 @@ async fn test_server() -> TestServer {
         task_health: stellargate::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
-    TestServer::new(router).unwrap()
+    TestServer::new(router)
 }
 
 /// Provisions a merchant and returns its API key.

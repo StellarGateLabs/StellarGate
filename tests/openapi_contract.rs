@@ -27,9 +27,9 @@ use std::collections::BTreeSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use stellargate::{
-    api,
+    AppState, api,
     config::{Config, ListenerMode},
-    db, AppState,
+    db,
 };
 
 const TEST_ADMIN_SECRET: &str = "test-admin-secret";
@@ -102,7 +102,7 @@ async fn test_server() -> TestServer {
         task_health: stellargate::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
-    TestServer::new(router).unwrap()
+    TestServer::new(router)
 }
 
 /// One documented operation, with concrete ids substituted so it can be probed
@@ -196,10 +196,10 @@ fn documented_paths(spec: &str) -> BTreeSet<String> {
         if let Some(rest) = line.strip_prefix("  ") {
             // Exactly two-space indent -> a path key. Deeper keys start with a
             // space here and are skipped; comments don't start with '/'.
-            if rest.starts_with('/') {
-                if let Some(key) = rest.strip_suffix(':') {
-                    out.insert(key.trim_end().to_string());
-                }
+            if rest.starts_with('/')
+                && let Some(key) = rest.strip_suffix(':')
+            {
+                out.insert(key.trim_end().to_string());
             }
         }
     }

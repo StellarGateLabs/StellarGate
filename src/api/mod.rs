@@ -1,17 +1,18 @@
 use crate::api::payments::{AppError, JsonBody};
-use crate::{db, AppState};
+use crate::{AppState, db};
 use axum::{
+    Json,
     extract::{ConnectInfo, Extension, Path, Request, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
-    Json,
 };
-use governor::clock::Clock;
+use governor::clock::{Clock, DefaultClock};
+use governor::middleware::StateInformationMiddleware;
 use ipnet::IpNet;
 use moka::sync::Cache;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -61,12 +62,16 @@ struct RateLimitState {
     ///   so limiter state for quiet IPs is automatically reclaimed.
     /// - moka uses internal sharding, eliminating the single global lock that
     ///   the old `Mutex` imposed.
-    limiters: Cache<String, Arc<governor::DefaultDirectRateLimiter>>,
+    limiters: Cache<String, Arc<governor::DefaultDirectRateLimiter<StateInformationMiddleware>>>,
     /// CIDR blocks trusted to supply `X-Forwarded-For` / `X-Real-IP`, copied
     /// from `Config` at startup so the middleware can attribute each request
     /// to the real client (issue #330).
     trusted_proxies: Vec<IpNet>,
 }
+
+const X_RATELIMIT_LIMIT: HeaderName = HeaderName::from_static("x-ratelimit-limit");
+const X_RATELIMIT_REMAINING: HeaderName = HeaderName::from_static("x-ratelimit-remaining");
+const X_RATELIMIT_RESET: HeaderName = HeaderName::from_static("x-ratelimit-reset");
 
 impl RateLimitState {
     fn new(requests_per_sec: u32, trusted_proxies: Vec<IpNet>) -> Self {
@@ -82,7 +87,7 @@ impl RateLimitState {
     }
 }
 
-/// Per-merchant limiter guarding `POST /payments/:id/webhooks/:delivery_id/redeliver`
+/// Per-merchant limiter guarding `POST /payments/{id}/webhooks/{delivery_id}/redeliver`
 /// (issue #468).
 ///
 /// The IP-keyed `"redeliver"` bucket in [`rate_limit_middleware`] already
@@ -118,6 +123,12 @@ impl MerchantRedeliverLimitState {
     }
 }
 
+/* Every `from_fn` / `from_fn_with_state` middleware in this module uses the
+`(State<_>?, extractors…, req: Request, next: Next) -> Response` shape, with
+the non-generic `Next` and `axum::extract::Request` (= `Request<Body>`). That
+is the form axum 0.8 requires, so none of them need changing for the upgrade
+(issue #634); keep new middleware to the same shape. */
+
 /// Rejects a redelivery request once the calling merchant has exceeded their
 /// share of `RATE_LIMIT_REQUESTS_PER_SEC` on this endpoint, independent of
 /// which address(es) the requests arrive from. Must run after
@@ -136,7 +147,7 @@ async fn merchant_redeliver_limit_middleware(
     });
 
     if let Err(not_until) = limiter.check() {
-        let wait = not_until.wait_time_from(governor::clock::QuantaClock::default().now());
+        let wait = not_until.wait_time_from(DefaultClock::default().now());
         let retry_after = retry_after_secs(wait);
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -192,6 +203,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/dashboard", get(dashboard_html))
         .route("/dashboard/app.css", get(dashboard_css))
         .route("/dashboard/app.js", get(dashboard_js))
+        .route("/dashboard/format.js", get(dashboard_format_js))
         /* The versioned API surface, mounted twice.
         `/v1` is canonical. The same routes stay mounted unprefixed so every
         existing integrator keeps working — shipping versioning by breaking all
@@ -222,7 +234,6 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         through referrers. Applied outermost so they also cover responses the
         inner layers generate (rate-limit 429s, timeout 408s, and the router's
         404/405 fallbacks).
-
         `nosniff` and `referrer-policy` override any inner value because a
         stricter setting elsewhere is never correct (payment ids travel in
         URLs). `cache-control` is `if_not_present` so a handler that
@@ -277,8 +288,8 @@ fn api_v1(
     minting or revoking a credential is an operator action. */
     let merchants = axum::Router::new()
         .route("/", post(provision_merchant))
-        .route("/:id/keys", post(issue_api_key).get(list_api_keys))
-        .route("/:id/keys/:key_id", axum::routing::delete(revoke_api_key))
+        .route("/{id}/keys", post(issue_api_key).get(list_api_keys))
+        .route("/{id}/keys/{key_id}", axum::routing::delete(revoke_api_key))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_admin_secret,
@@ -290,7 +301,7 @@ fn api_v1(
     `payments::get_by_id`. */
     let payments_authed = axum::Router::new()
         .route("/", post(payments::create).get(payments::list))
-        .route("/:id/webhooks", get(payments::list_webhooks))
+        .route("/{id}/webhooks", get(payments::list_webhooks))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -302,10 +313,12 @@ fn api_v1(
     middleware every other route here also gets, it additionally needs a
     limiter keyed on the caller's identity rather than their address —
     layered outside-in as auth (runs first, populates the merchant identity)
-    then the merchant limiter (runs second, reads it). */
+    then the merchant limiter (runs second, reads it). The last `route_layer`
+    added is the outermost, so auth must stay below the limiter here —
+    `test_redeliver_runs_auth_before_merchant_limiter` pins this order. */
     let redeliver = axum::Router::new()
         .route(
-            "/:id/webhooks/:delivery_id/redeliver",
+            "/{id}/webhooks/{delivery_id}/redeliver",
             post(payments::redeliver_webhook),
         )
         .route_layer(middleware::from_fn_with_state(
@@ -322,7 +335,8 @@ fn api_v1(
         axum::Router::new()
             .merge(payments_authed)
             .merge(redeliver)
-            .route("/:id", get(payments::get_by_id)),
+            .route("/summary", get(payments::summary))
+            .route("/{id}", get(payments::get_by_id)),
     )
 }
 
@@ -597,13 +611,13 @@ async fn issue_api_key(
     }
 
     let label = body.and_then(|JsonBody(b)| b.label);
-    if let Some(l) = &label {
-        if l.len() > 100 {
-            return Err(AppError::bad_request(
-                "invalid_label",
-                "label exceeds max length of 100 characters",
-            ));
-        }
+    if let Some(l) = &label
+        && l.len() > 100
+    {
+        return Err(AppError::bad_request(
+            "invalid_label",
+            "label exceeds max length of 100 characters",
+        ));
     }
 
     let (raw_key, prefix) = db::generate_api_key();
@@ -750,31 +764,41 @@ async fn rate_limit_middleware(
         guard, so nothing borrowed from the cache is held across the `.await`
         below. */
         let limiter = rate_limit.limiters.get_with(key, || {
-            Arc::new(governor::RateLimiter::direct(governor::Quota::per_second(
-                NonZeroU32::new(effective_rps)
-                    .expect("effective_rps is clamped to at least 1"),
-            )))
+            Arc::new(
+                governor::RateLimiter::direct(governor::Quota::per_second(
+                    NonZeroU32::new(effective_rps).expect("effective_rps is clamped to at least 1"),
+                ))
+                .with_middleware::<StateInformationMiddleware>(),
+            )
         });
 
-        if let Err(not_until) = limiter.check() {
-            use governor::clock::Clock as _;
-            let wait = not_until.wait_time_from(governor::clock::QuantaClock::default().now());
-            let retry_after = retry_after_secs(wait);
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [
-                    (
-                        header::RETRY_AFTER,
-                        HeaderValue::from_str(&retry_after.to_string())
-                            .unwrap_or_else(|_| HeaderValue::from_static("1")),
-                    ),
-                ],
-                Json(json!({
-                    "error": "rate limit exceeded",
-                    "code": "rate_limit_exceeded"
-                })),
-            )
-                .into_response();
+        match limiter.check() {
+            Ok(snapshot) => {
+                let remaining = snapshot.remaining_burst_capacity();
+                let reset = reset_secs(snapshot.quota(), remaining, Duration::ZERO);
+                let mut response = next.run(req).await;
+                set_rate_limit_headers(response.headers_mut(), effective_rps, remaining, reset);
+                return response;
+            }
+            Err(not_until) => {
+                let wait = not_until.wait_time_from(DefaultClock::default().now());
+                let retry_after = retry_after_secs(wait);
+                let reset = reset_secs(not_until.quota(), 0, wait);
+                let mut response = (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({
+                        "error": "rate limit exceeded",
+                        "code": "rate_limit_exceeded"
+                    })),
+                )
+                    .into_response();
+                let headers = response.headers_mut();
+                if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+                    headers.insert(header::RETRY_AFTER, value);
+                }
+                set_rate_limit_headers(headers, effective_rps, 0, reset);
+                return response;
+            }
         }
     }
 
@@ -803,10 +827,12 @@ pub(crate) fn retry_after_secs(wait: Duration) -> u64 {
 /// - `quota`     — the bucket's replenishment policy.
 /// - `remaining` — cells currently available (0 = drained).
 /// - `next_wait` — time until the next single cell is available (from governor's
-///                 `not_until.wait_time_from(...)`).
+///   `not_until.wait_time_from(...)`).
 ///
 /// Formula: `max(cells_missing × period_per_cell, next_wait)`, rounded up.
 /// Returns 0 when the bucket is already full (`remaining == burst`).
+// Only exercised by unit tests until the `X-RateLimit-Reset` header is wired up.
+#[allow(dead_code)]
 pub(crate) fn reset_secs(quota: governor::Quota, remaining: u32, next_wait: Duration) -> u64 {
     let missing = quota.burst_size().get().saturating_sub(remaining);
     let refill = quota.replenish_interval().saturating_mul(missing);
@@ -814,6 +840,18 @@ pub(crate) fn reset_secs(quota: governor::Quota, remaining: u32, next_wait: Dura
     // path, so it replaces one interval rather than adding to the total.
     let total = refill.max(next_wait);
     total.as_secs_f64().ceil() as u64
+}
+
+fn set_rate_limit_headers(headers: &mut HeaderMap, limit: u32, remaining: u32, reset: u64) {
+    for (name, value) in [
+        (X_RATELIMIT_LIMIT, limit as u64),
+        (X_RATELIMIT_REMAINING, remaining as u64),
+        (X_RATELIMIT_RESET, reset),
+    ] {
+        if let Ok(value) = HeaderValue::from_str(&value.to_string()) {
+            headers.insert(name, value);
+        }
+    }
 }
 
 /// Identifies which rate-limit bucket a request falls into, or `None` for
@@ -970,12 +1008,11 @@ pub(crate) fn client_ip_key_from_parts(
 
     // No X-Forwarded-For, or every hop was a trusted proxy: fall back to the
     // single-value X-Real-IP header, also gated on the trusted peer.
-    if let Some(value) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        if let Ok(ip) = value.trim().parse::<IpAddr>() {
-            if !trusted_proxies.iter().any(|net| net.contains(&ip)) {
-                return ip.to_string();
-            }
-        }
+    if let Some(value) = headers.get("x-real-ip").and_then(|v| v.to_str().ok())
+        && let Ok(ip) = value.trim().parse::<IpAddr>()
+        && !trusted_proxies.iter().any(|net| net.contains(&ip))
+    {
+        return ip.to_string();
     }
 
     peer_ip.to_string()
@@ -1058,6 +1095,10 @@ fn build_cors(cfg: &crate::config::Config) -> CorsLayer {
             HeaderName::from_static("x-request-id"),
             HeaderName::from_static("deprecation"),
             HeaderName::from_static("link"),
+            header::RETRY_AFTER,
+            X_RATELIMIT_LIMIT,
+            X_RATELIMIT_REMAINING,
+            X_RATELIMIT_RESET,
         ])
 }
 
@@ -1115,14 +1156,14 @@ async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 
     // 2. Horizon must respond (only when a gateway wallet is configured).
-    if state.config.gateway_configured() {
-        if let Err(reason) = check_horizon_ready(&state).await {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "status": "unavailable", "reason": reason })),
-            )
-                .into_response();
-        }
+    if state.config.gateway_configured()
+        && let Err(reason) = check_horizon_ready(&state).await
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "unavailable", "reason": reason })),
+        )
+            .into_response();
     }
 
     (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response()
@@ -1186,6 +1227,7 @@ for the two to drift apart. */
 const DASHBOARD_HTML: &str = include_str!("../../static/dashboard.html");
 const DASHBOARD_CSS: &str = include_str!("../../static/dashboard.css");
 const DASHBOARD_JS: &str = include_str!("../../static/dashboard.js");
+const DASHBOARD_FORMAT_JS: &str = include_str!("../../static/dashboard-format.js");
 
 /// Locks the dashboard to its own origin: no third-party script, style, frame
 /// or connection. The page ships no inline script or style, so this needs no
@@ -1229,6 +1271,10 @@ async fn dashboard_js() -> impl IntoResponse {
     dashboard_asset(DASHBOARD_JS, "text/javascript; charset=utf-8")
 }
 
+async fn dashboard_format_js() -> impl IntoResponse {
+    dashboard_asset(DASHBOARD_FORMAT_JS, "text/javascript; charset=utf-8")
+}
+
 async fn not_found() -> impl IntoResponse {
     (
         StatusCode::NOT_FOUND,
@@ -1262,7 +1308,7 @@ mod tests {
 
     #[tokio::test]
     async fn slow_handler_is_aborted_with_408() {
-        let server = TestServer::new(timeout_test_router(Duration::from_millis(20)))
+        let server = TestServer::try_new(timeout_test_router(Duration::from_millis(20)))
             .expect("timeout test router should build");
         let response = server.get("/slow").await;
         response.assert_status(StatusCode::REQUEST_TIMEOUT);
@@ -1270,7 +1316,7 @@ mod tests {
 
     #[tokio::test]
     async fn fast_handler_is_unaffected() {
-        let server = TestServer::new(timeout_test_router(Duration::from_millis(200))).unwrap();
+        let server = TestServer::new(timeout_test_router(Duration::from_millis(200)));
         let response = server.get("/fast").await;
         response.assert_status_ok();
     }
@@ -1613,7 +1659,7 @@ mod tests {
     #[tokio::test]
     async fn api_responses_carry_baseline_security_headers() {
         let state = header_test_state("testnet").await;
-        let server = TestServer::new(router(state)).unwrap();
+        let server = TestServer::new(router(state));
 
         // A representative API response: the 404 envelope is generated by the
         // router's own fallback, so it is a pure API response with no handler
@@ -1627,16 +1673,18 @@ mod tests {
 
     #[tokio::test]
     async fn hsts_is_emitted_only_on_public_network() {
-        let public = TestServer::new(router(header_test_state("public").await)).unwrap();
-        let testnet = TestServer::new(router(header_test_state("testnet").await)).unwrap();
+        let public = TestServer::new(router(header_test_state("public").await));
+        let testnet = TestServer::new(router(header_test_state("testnet").await));
 
         let public_ok = public.get("/health").await;
         public_ok.assert_status_ok();
-        assert!(public_ok
-            .header("strict-transport-security")
-            .to_str()
-            .unwrap_or("")
-            .contains("max-age="));
+        assert!(
+            public_ok
+                .header("strict-transport-security")
+                .to_str()
+                .unwrap_or("")
+                .contains("max-age=")
+        );
 
         let testnet_ok = testnet.get("/health").await;
         testnet_ok.assert_status_ok();
@@ -1646,7 +1694,7 @@ mod tests {
     #[tokio::test]
     async fn dashboard_csp_survives_the_global_header_layers() {
         let state = header_test_state("testnet").await;
-        let server = TestServer::new(router(state)).unwrap();
+        let server = TestServer::new(router(state));
 
         let res = server.get("/dashboard").await;
         res.assert_status_ok();
@@ -1666,7 +1714,7 @@ mod tests {
         let mut cfg = header_test_config("testnet");
         cfg.metrics_token = String::new();
         let state = header_test_state_with_config(cfg).await;
-        let server = TestServer::new(router(state)).unwrap();
+        let server = TestServer::new(router(state));
 
         let res = server.get("/metrics").await;
         res.assert_status(StatusCode::UNAUTHORIZED);
@@ -1685,7 +1733,7 @@ mod tests {
         let mut cfg = header_test_config("testnet");
         cfg.metrics_token = "a-strong-metrics-token-32-chars-long".into();
         let state = header_test_state_with_config(cfg).await;
-        let server = TestServer::new(router(state)).unwrap();
+        let server = TestServer::new(router(state));
 
         let res = server.get("/metrics").await;
         res.assert_status(StatusCode::UNAUTHORIZED);
@@ -1697,7 +1745,7 @@ mod tests {
         let mut cfg = header_test_config("testnet");
         cfg.metrics_token = "a-strong-metrics-token-32-chars-long".into();
         let state = header_test_state_with_config(cfg).await;
-        let server = TestServer::new(router(state)).unwrap();
+        let server = TestServer::new(router(state));
 
         let res = server
             .get("/metrics")
@@ -1713,7 +1761,7 @@ mod tests {
         let mut cfg = header_test_config("testnet");
         cfg.metrics_token = "a-strong-metrics-token-32-chars-long".into();
         let state = header_test_state_with_config(cfg).await;
-        let server = TestServer::new(router(state)).unwrap();
+        let server = TestServer::new(router(state));
 
         let res = server
             .get("/metrics")
@@ -1724,5 +1772,26 @@ mod tests {
             .await;
         res.assert_status_ok();
         assert!(res.text().contains("stellargate_auth_attempts_total"));
+    }
+
+    /// Builds the full production router (issue #629). axum 0.8 panics at
+    /// router build time on the old `/:param` capture syntax, so a bad path
+    /// fails here in CI rather than at startup. Also checks that a
+    /// parameterised route actually matches on both the `/v1` and legacy
+    /// mounts: an unauthenticated request reaching the auth middleware gets
+    /// 401, whereas an unmatched path would fall through to the 404 fallback.
+    #[tokio::test]
+    async fn full_router_builds_and_matches_path_params() {
+        let server = TestServer::new(router(header_test_state("testnet").await));
+
+        for path in [
+            "/v1/payments/some-id/webhooks",
+            "/payments/some-id/webhooks",
+        ] {
+            server
+                .get(path)
+                .await
+                .assert_status(StatusCode::UNAUTHORIZED);
+        }
     }
 }

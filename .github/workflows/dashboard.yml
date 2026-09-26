@@ -1,0 +1,26 @@
+name: Dashboard
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "static/**"
+      - "scripts/check-dashboard-a11y.mjs"
+      - ".github/workflows/dashboard.yml"
+
+jobs:
+  dashboard-static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: JavaScript syntax check
+        run: node --check static/dashboard.js
+
+      - name: Accessibility smoke check
+        run: node scripts/check-dashboard-a11y.mjs

@@ -204,8 +204,8 @@ where
 mod tests {
     use super::*;
     use crate::TaskHealth;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     fn fast_backoff() -> Backoff {
@@ -532,12 +532,9 @@ mod tests {
         health.require("probe");
         let (tx, rx) = watch::channel(false);
 
-        let handle = supervise(
-            health.clone(),
-            "probe",
-            rx,
-            move || async move { TaskExit::ShutdownRequested },
-        );
+        let handle = supervise(health.clone(), "probe", rx, move || async move {
+            TaskExit::ShutdownRequested
+        });
 
         tokio::time::timeout(Duration::from_secs(5), handle)
             .await

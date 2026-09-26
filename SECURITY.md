@@ -12,7 +12,7 @@ report them privately rather than through a public GitHub issue.
 StellarGate is pre-1.0 and does not yet maintain parallel release branches.
 Security fixes are made against the `main` branch only. Deployments should
 track `main` (or the latest tagged release, once releases exist) to receive
-fixes. The minimum supported Rust version is **1.88** (see `rust-toolchain.toml`).
+fixes. The minimum supported Rust version is **1.94** (see `rust-toolchain.toml`).
 
 | Version | Supported |
 |---|---|

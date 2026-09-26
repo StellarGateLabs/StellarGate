@@ -20,14 +20,14 @@
 //! small tolerance window. See the README "Verifying webhooks" section for the
 //! verification recipe and recommended window.
 
-use crate::{db, AppState};
+use crate::{AppState, db};
 // `KeyInit` provides `new_from_slice`; it moved off `Mac` in hmac 0.13.
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::json;
 use sha2::Sha256;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{Semaphore, watch};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -619,6 +619,10 @@ mod tests {
             assert!(
                 retry_delay(1, BASE, MAX) >= BASE / 2,
                 "every retry keeps a floor of half the configured base delay"
+            );
+            assert!(
+                retry_delay(1, BASE, MAX) <= BASE,
+                "jitter never pushes a retry past the un-jittered ceiling"
             );
         }
     }

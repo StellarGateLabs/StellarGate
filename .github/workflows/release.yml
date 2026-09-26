@@ -71,7 +71,7 @@ jobs:
           # Matches rust-toolchain.toml's MSRV pin, kept explicit here (as
           # ci.yml's test matrix does) since release artifacts must be
           # reproducible regardless of which toolchain a runner defaults to.
-          toolchain: "1.88"
+          toolchain: "1.94"
           targets: ${{ matrix.target }}
 
       - uses: actions/cache@v4

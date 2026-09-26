@@ -10,18 +10,24 @@
  * be a stored-XSS vector.
  */
 
+import { fmtTime, shortId } from "/dashboard/format.js";
+
 (function () {
   "use strict";
 
   var API_BASE = "/v1";
-  var PAGE_SIZE = 25;
   var KEY_NAME = "stellargate.apiKey";
+  var KEY_SAVED_AT = "stellargate.apiKeySavedAt";
 
   var state = {
     key: null,
     status: "",
+    pageSize: 25,
+    createdAfter: "",
+    createdBefore: "",
     cursor: null,
     loading: false,
+    loadedPayments: [],
   };
 
   // ── Tiny DOM helpers ──────────────────────────────────────────────────
@@ -57,16 +63,6 @@
   }
 
   // ── Formatting ────────────────────────────────────────────────────────
-
-  function fmtTime(iso) {
-    if (!iso) return "—";
-    var d = new Date(iso);
-    return isNaN(d.getTime()) ? iso : d.toLocaleString();
-  }
-
-  function shortId(id) {
-    return typeof id === "string" && id.length > 12 ? id.slice(0, 8) + "…" : id;
-  }
 
   /** Map a payment or delivery status onto a pill style. */
   function pillClass(status) {
@@ -138,6 +134,10 @@
         KEY_NAME,
         key
       );
+      (persist ? window.localStorage : window.sessionStorage).setItem(
+        KEY_SAVED_AT,
+        String(Date.now())
+      );
     } catch (e) {
       /* non-fatal: the key still works for this page load */
     }
@@ -174,14 +174,17 @@
 
   function signIn(key, persist) {
     state.key = key;
+    readHashState();
     // Validate by making the cheapest authenticated call available.
     return api("/payments?limit=1").then(function () {
       if (persist !== null) storeKey(key, persist);
       show($("gate"), false);
       show($("app"), true);
       setError($("gate-error"), null);
+      updateSessionExpiry();
       loadVersion();
       pollHealth();
+      loadSummary();
       reload();
     });
   }
@@ -190,6 +193,7 @@
 
   function reload() {
     state.cursor = null;
+    state.loadedPayments = [];
     clear($("rows"));
     loadPayments();
   }
@@ -199,18 +203,21 @@
     state.loading = true;
     setError($("list-error"), null);
 
-    var query = "/payments?limit=" + PAGE_SIZE;
+    var query = "/payments?limit=" + state.pageSize;
     if (state.status) query += "&status=" + encodeURIComponent(state.status);
+    if (state.createdAfter) query += "&created_after=" + encodeURIComponent(state.createdAfter + "T00:00:00Z");
+    if (state.createdBefore) query += "&created_before=" + encodeURIComponent(state.createdBefore + "T23:59:59Z");
     if (state.cursor) query += "&cursor=" + encodeURIComponent(state.cursor);
 
     api(query)
       .then(function (body) {
         var payments = body.payments || [];
+        state.loadedPayments = state.loadedPayments.concat(payments);
         payments.forEach(appendRow);
 
         // The offset-mode response returns a cursor even on the final page, so
         // a short page is what actually signals the end.
-        var more = payments.length === PAGE_SIZE && !!body.next_cursor;
+        var more = payments.length === state.pageSize && !!body.next_cursor;
         state.cursor = more ? body.next_cursor : null;
         show($("load-more"), more);
         show($("empty"), $("rows").childElementCount === 0);
@@ -223,15 +230,33 @@
       });
   }
 
+  function loadSummary() {
+    api("/payments/summary")
+      .then(function (body) {
+        var summary = $("summary");
+        clear(summary);
+        (body.summary || []).forEach(function (row) {
+          var card = el("div", "summary-card");
+          card.appendChild(el("span", "muted small", row[0]));
+          card.appendChild(el("strong", null, row[1]));
+          summary.appendChild(card);
+        });
+      })
+      .catch(function () {
+        clear($("summary"));
+      });
+  }
+
   function appendRow(p) {
     var tr = document.createElement("tr");
     tr.tabIndex = 0;
 
     var statusCell = document.createElement("td");
+    statusCell.setAttribute("data-label", "Status");
     statusCell.appendChild(el("span", pillClass(p.status), p.status));
     tr.appendChild(statusCell);
 
-    tr.appendChild(el("td", null, p.amount + " " + p.asset));
+    tr.appendChild(el("td", null, formatAmount(p.amount, p.asset)));
     tr.appendChild(el("td", "mono", p.memo));
     tr.appendChild(el("td", null, fmtTime(p.created_at)));
     tr.appendChild(el("td", "mono", shortId(p.id)));
@@ -265,22 +290,32 @@
       .then(function (p) {
         [
           ["Status", p.status],
-          ["Amount", p.amount + " " + p.asset],
-          ["Received", p.paid_amount ? p.paid_amount + " " + p.asset : "—"],
+          ["Amount", formatAmount(p.amount, p.asset)],
+          ["Received", p.paid_amount ? formatAmount(p.paid_amount, p.asset) : "—"],
           ["Memo", p.memo],
           ["Destination", p.destination_address],
           ["Transaction", p.tx_hash || "—"],
+          ["Network", "Stellar"],
+          ["Asset issuer", p.asset_issuer || "native"],
           ["Payment ID", p.id],
           ["Merchant", p.merchant_id],
           ["Created", fmtTime(p.created_at)],
           ["Updated", fmtTime(p.updated_at)],
-          ["Expires", fmtTime(p.expires_at)],
+          ["Expires", fmtTime(p.expires_at) + (p.status === "pending" ? " (" + countdown(p.expires_at) + " left)" : "")],
         ].forEach(function (pair) {
           fields.appendChild(el("dt", null, pair[0]));
           if (pair[0] === "Status") {
             var dd = document.createElement("dd");
             dd.appendChild(el("span", pillClass(p.status), p.status));
             fields.appendChild(dd);
+          } else if (pair[0] === "Transaction" && p.tx_hash) {
+            var tx = document.createElement("dd");
+            var link = el("a", "mono", shortId(p.tx_hash));
+            link.href = explorerTx(p.tx_hash);
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+            tx.appendChild(link);
+            fields.appendChild(tx);
           } else {
             fields.appendChild(el("dd", "mono", pair[1]));
           }
@@ -326,12 +361,23 @@
       el(
         "div",
         "delivery-meta",
-        "attempt " + d.attempts + " · last " + fmtTime(d.last_attempt)
+        "attempt " + d.attempts + " · manual " + (d.manual_attempts || 0)
       )
     );
+    li.appendChild(el("div", "delivery-meta", "last: " + relativeTime(d.last_attempt)));
+    li.lastChild.title = fmtTime(d.last_attempt);
+    li.appendChild(el("div", "delivery-meta", "created: " + relativeTime(d.created_at)));
+    li.lastChild.title = fmtTime(d.created_at);
+    if (d.status === "failed") {
+      li.appendChild(el("div", "error", "Last delivery failed; check receiver logs or redeliver."));
+    }
+    if (d.status !== "delivered") {
+      li.appendChild(el("div", "delivery-meta", "retry state: queued for redrive if attempts remain"));
+    }
 
     var button = el("button", "ghost", "Redeliver");
     button.addEventListener("click", function () {
+      if (!window.confirm("Redeliver this webhook now?")) return;
       button.disabled = true;
       button.textContent = "Sending…";
       api(
@@ -349,13 +395,29 @@
           button.disabled = false;
           button.textContent = "Redeliver";
           if (err.message !== "unauthorized") {
-            setError($("deliveries-error"), err.message);
+            setError($("deliveries-error"), err.message.indexOf("429") >= 0 ? "Rate limited. Try again shortly." : err.message);
           }
         });
     });
     li.appendChild(button);
 
     return li;
+  }
+
+  function exportCsv() {
+    var header = ["id", "status", "amount", "asset", "asset_issuer", "memo", "destination_address", "created_at", "expires_at"];
+    var lines = [header.join(",")].concat(state.loadedPayments.map(function (p) {
+      return header.map(function (key) {
+        return '"' + String(p[key] || "").replace(/"/g, '""') + '"';
+      }).join(",");
+    }));
+    var blob = new Blob([lines.join("\n")], { type: "text/csv" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = "stellargate-payments.csv";
+    a.click();
+    URL.revokeObjectURL(url);
   }
 
   function closeDetail() {
@@ -382,6 +444,18 @@
 
   // ── Health ────────────────────────────────────────────────────────────
 
+  function updateSessionExpiry() {
+    var saved = window.localStorage.getItem(KEY_SAVED_AT) || window.sessionStorage.getItem(KEY_SAVED_AT);
+    if (!saved) {
+      $("session-expiry").textContent = "";
+      return;
+    }
+    var savedAt = Number(saved);
+    var expiresAt = savedAt + 30 * 24 * 60 * 60 * 1000;
+    $("session-expiry").textContent = "session " + countdown(new Date(expiresAt).toISOString());
+    $("session-expiry").title = "Saved " + fmtTime(new Date(savedAt).toISOString());
+  }
+
   function pollHealth() {
     fetch("/ready", { headers: { Accept: "application/json" } })
       .then(function (res) {
@@ -393,15 +467,24 @@
         var pill = $("health");
         pill.className = r.ok ? "pill pill-ok" : "pill pill-err";
         pill.textContent = r.ok ? "healthy" : r.body.reason || "unavailable";
+        pill.title = JSON.stringify(r.body);
       })
       .catch(function () {
         var pill = $("health");
         pill.className = "pill pill-err";
         pill.textContent = "unreachable";
+        pill.title = "Readiness request failed";
       });
   }
 
   // ── Wiring ────────────────────────────────────────────────────────────
+
+  function syncFilterUi() {
+    Array.prototype.forEach.call(document.querySelectorAll(".chip"), function (chip) {
+      chip.className = (chip.getAttribute("data-status") || "") === state.status ? "chip chip-on" : "chip";
+    });
+    $("auto-refresh").checked = state.autoRefresh;
+  }
 
   function init() {
     $("gate-form").addEventListener("submit", function (ev) {
@@ -419,9 +502,26 @@
     });
 
     $("refresh").addEventListener("click", reload);
+    $("export-csv").addEventListener("click", exportCsv);
+    $("page-size").addEventListener("change", function () {
+      state.pageSize = Number($("page-size").value) || 25;
+      reload();
+    });
+    $("created-after").addEventListener("change", function () {
+      state.createdAfter = $("created-after").value;
+      reload();
+    });
+    $("created-before").addEventListener("change", function () {
+      state.createdBefore = $("created-before").value;
+      reload();
+    });
     $("load-more").addEventListener("click", loadPayments);
     $("detail-close").addEventListener("click", closeDetail);
     $("scrim").addEventListener("click", closeDetail);
+    $("auto-refresh").addEventListener("change", function () {
+      state.autoRefresh = $("auto-refresh").checked;
+      writeHashState();
+    });
 
     document.addEventListener("keydown", function (ev) {
       if (ev.key === "Escape") closeDetail();
@@ -439,6 +539,7 @@
           );
           chip.className = "chip chip-on";
           state.status = chip.getAttribute("data-status") || "";
+          writeHashState();
           reload();
         });
       }
@@ -447,6 +548,11 @@
     window.setInterval(function () {
       if (state.key) pollHealth();
     }, 30000);
+    window.setInterval(function () {
+      if (state.key && state.autoRefresh && (!state.status || state.status === "pending")) {
+        reload();
+      }
+    }, 15000);
 
     // Resume an existing session when a key is already stored.
     /* Resume an existing session when a key is already stored. The gate is

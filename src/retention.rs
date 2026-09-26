@@ -10,7 +10,7 @@
 //! This worker prunes both on an interval, in batches so no single statement
 //! holds the write lock long enough to stall payment traffic.
 
-use crate::{db, AppState};
+use crate::{AppState, db};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -359,7 +359,10 @@ mod tests {
         .unwrap();
 
         let (deliveries, keys) = prune_once(&state).await.unwrap();
-        assert_eq!(deliveries, 0, "deliveries must not be pruned when delivery_days==0");
+        assert_eq!(
+            deliveries, 0,
+            "deliveries must not be pruned when delivery_days==0"
+        );
         assert_eq!(keys, 1, "the aged idempotency key must be pruned");
 
         // The delivery row survives.
@@ -398,13 +401,19 @@ mod tests {
 
         let (deliveries, keys) = prune_once(&state).await.unwrap();
         assert_eq!(deliveries, 1, "the aged delivery must be pruned");
-        assert_eq!(keys, 0, "idempotency keys must not be pruned when idempotency_days==0");
+        assert_eq!(
+            keys, 0,
+            "idempotency keys must not be pruned when idempotency_days==0"
+        );
 
         // The idempotency key survives.
         let k_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM idempotency_keys")
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        assert_eq!(k_count, 1, "idempotency key must remain when idempotency_days==0");
+        assert_eq!(
+            k_count, 1,
+            "idempotency key must remain when idempotency_days==0"
+        );
     }
 }

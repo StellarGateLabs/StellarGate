@@ -9,7 +9,7 @@
 //! Expiry is purely time- and database-driven, so the sweeper runs even when no
 //! Stellar gateway is configured (unlike the Horizon poller).
 
-use crate::{db, webhook, AppState};
+use crate::{AppState, db, webhook};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -185,8 +185,8 @@ mod tests {
             EXPIRED_EVENT
         );
 
-        let body: serde_json::Value = serde_json::from_slice(&req.body)
-            .expect("expiry webhook body should be valid JSON");
+        let body: serde_json::Value =
+            serde_json::from_slice(&req.body).expect("expiry webhook body should be valid JSON");
         assert_eq!(body["event"], EXPIRED_EVENT);
         assert_eq!(body["payment_id"], payment.id);
         assert_eq!(body["status"], "expired");

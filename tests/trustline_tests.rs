@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use stellargate::{
+    AppState,
     config::{AcceptedAsset, Config, ListenerMode},
-    db, horizon, AppState,
+    db, horizon,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
