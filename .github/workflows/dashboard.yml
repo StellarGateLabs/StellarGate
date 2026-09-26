@@ -1,17 +1,32 @@
 name: Dashboard
 
+# The `e2e` suite is not only a dashboard test: it boots the real binary and
+# drives it through the router, the auth middleware, the payments API, webhook
+# redelivery and the migrations. So a change under `src/` can break it just as
+# easily as a change to `static/`, and the path filter has to include both or
+# the coverage is quietly narrower than it looks.
 on:
   pull_request:
     branches: [main]
     paths:
       - "static/**"
+      - "e2e/**"
+      - "src/**"
       - "scripts/check-dashboard-a11y.mjs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
       - ".github/workflows/dashboard.yml"
   push:
     branches: [main]
     paths:
       - "static/**"
+      - "e2e/**"
+      - "src/**"
       - "scripts/check-dashboard-a11y.mjs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
       - ".github/workflows/dashboard.yml"
 
 jobs:
@@ -56,21 +71,29 @@ jobs:
         run: node --test static/tests/*.test.js
 
   # End-to-end smoke test against a real server and a seeded database
-  # (issue #724), plus the credential-leak regression assertion (#726).
+  # (issue #724), plus the credential-leak regression assertion (#726) and
+  # keyboard-shortcut coverage (#721).
   #
-  # Pinned to a major so the runner resolves a current browser, and kept out of
-  # the `test` job: Playwright installs a browser and a Node package tree, which
-  # is far slower than `cargo test` and belongs in its own check.
+  # Kept out of the `test` job on purpose: Playwright downloads three browser
+  # engines and builds a Node package tree, which is far slower than
+  # `cargo test` and belongs in a check with its own timeout.
+  #
+  # On runtime: the suite runs 30 specs across 5 projects (Chromium, Firefox,
+  # WebKit, Pixel 7, iPhone 14) with `workers: 1`, because the specs share one
+  # seeded merchant and one webhook receiver. That is ~4 min here. If it grows,
+  # the cheap narrowing is to run one desktop project on every PR and the full
+  # matrix on a schedule — the projects are declared in
+  # `e2e/playwright.config.js`, so it is a one-line change, not a rewrite.
   dashboard-e2e:
     name: dashboard end-to-end (playwright)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.94"
+      # No `toolchain:` here on purpose: with no matrix, `rust-toolchain.toml`
+      # is the single source of truth for the version, so this job cannot drift
+      # from what CI's `test` job and the Dockerfile build against.
+      - uses: dtolnay/rust-toolchain@master
 
       - uses: actions/cache@v4
         with:
@@ -87,20 +110,25 @@ jobs:
         with:
           node-version: "22"
 
+      # The browsers are what make this job slow, and they are versioned by the
+      # Playwright release rather than by our lockfile alone, so the key folds
+      # in the resolved version too. Otherwise a Playwright bump would reuse a
+      # stale browser download and fail every test with a version mismatch.
       - name: Cache Playwright browsers
-        id: playwright-cache
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: ${{ runner.os }}-playwright-${{ hashFiles('e2e/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
 
-      # The seed provisions a merchant and its payments against a real
-      # SQLite file, then prints the API key the specs sign in with. It never
-      # reaches a log: the key is written to a git-ignored file the server and
-      # the specs both read, and `scripts/` output is not echoed (issue #726).
+      # `npm ci` needs the lockfile committed and in sync with package.json.
+      # The `||` fallback would paper over a real mismatch by silently
+      # resolving fresh versions, so it is deliberately not here: a lockfile
+      # that needs regenerating should fail the job, not the reproducibility.
       - name: Install Playwright
         working-directory: e2e
-        run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
       - name: Install Playwright browsers
         working-directory: e2e
@@ -109,10 +137,28 @@ jobs:
       - name: Build the gateway
         run: cargo build --locked
 
+      # The seed provisions the merchant against a throwaway database, and the
+      # webhook receiver listens on 127.0.0.1 inside this job. No credential
+      # comes from the environment, the repository, or a secret: the API key is
+      # minted by the seed and written to a git-ignored file, so there is
+      # nothing here for a log scrape to pick up (#726).
       - name: Run the end-to-end suite
         working-directory: e2e
-        env:
-          # A dedicated, throwaway database. The seed provisions the merchant;
-          # no credential is ever supplied through the environment.
-          DATABASE_URL: sqlite:e2e/playwright.db
         run: npx playwright test
+
+      # A failure's trace, screenshot and error context are what make a red run
+      # diagnosable; without this the artifacts are discarded with the job.
+      #
+      # `if-no-files-found: ignore` rather than `error`: on a green run Playwright
+      # writes no HTML report, and failing the upload step after a passing suite
+      # would report a red check for a green build.
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            e2e/playwright-report/
+            e2e/test-results/
+          retention-days: 7
+          if-no-files-found: ignore
