@@ -156,6 +156,7 @@ fn make_horizon_payment() -> HorizonPayment {
         }),
         paging_token: Some("1".into()),
         created_at: None,
+        operation_index: 0,
     }
 }
 
@@ -325,6 +326,7 @@ fn payment_with(tx_hash: &str, amount: &str) -> HorizonPayment {
         }),
         paging_token: Some("1".into()),
         created_at: None,
+        operation_index: 0,
     }
 }
 

@@ -64,6 +64,7 @@
       </header>
 
       <main>
+        <div id="live-region" class="sr-only" aria-live="polite" aria-atomic="true"></div>
         <section class="toolbar">
           <!-- aria-label overrides the visible <span> as the accessible name,
                so "Search" identifies one control rather than a label and an
@@ -89,11 +90,11 @@
             </button>
           </div>
           <div class="filters" role="group" aria-label="Filter by status">
-            <button class="chip chip-on" data-status="">All</button>
-            <button class="chip" data-status="pending">Pending</button>
-            <button class="chip" data-status="completed">Completed</button>
-            <button class="chip" data-status="underpaid">Underpaid</button>
-            <button class="chip" data-status="expired">Expired</button>
+            <button class="chip chip-on" data-status="" aria-pressed="true">All</button>
+            <button class="chip" data-status="pending" aria-pressed="false">Pending</button>
+            <button class="chip" data-status="completed" aria-pressed="false">Completed</button>
+            <button class="chip" data-status="underpaid" aria-pressed="false">Underpaid</button>
+            <button class="chip" data-status="expired" aria-pressed="false">Expired</button>
           </div>
           <div class="filters" role="group" aria-label="Filter by creation date">
             <label class="small" for="created-after">From</label>
@@ -112,6 +113,10 @@
             <option>50</option>
             <option>100</option>
           </select>
+          <label class="checkbox small">
+            <input id="auto-refresh" type="checkbox" />
+            <span>Auto-refresh</span>
+          </label>
           <button id="export-csv" class="ghost">Export CSV</button>
           <button id="refresh" class="ghost">Refresh</button>
           <button id="help-open" class="ghost" aria-haspopup="dialog">
