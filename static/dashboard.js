@@ -176,6 +176,45 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     }
   }
 
+  // ── Date range presets (#778) ──────────────────────────────────────────
+
+  /** Format a Date as a date input's YYYY-MM-DD value, in local time. */
+  function localDateValue(d) {
+    function pad(n) {
+      return (n < 10 ? "0" : "") + n;
+    }
+    return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
+  }
+
+  /**
+   * The start or end of a local calendar day as a UTC timestamp in the API's
+   * stored format (no milliseconds), so a day means the user's own day.
+   */
+  function localDayBound(value, endOfDay) {
+    var parts = value.split("-").map(Number);
+    var d = endOfDay
+      ? new Date(parts[0], parts[1] - 1, parts[2], 23, 59, 59)
+      : new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0);
+    return d.toISOString().replace(/\.\d{3}Z$/, "Z");
+  }
+
+  /** From/To input values covering the last `days` local days, today included. */
+  function presetRange(days) {
+    var today = new Date();
+    var from = new Date(today.getFullYear(), today.getMonth(), today.getDate() - (days - 1));
+    return { from: localDateValue(from), to: localDateValue(today) };
+  }
+
+  /** Highlight the preset whose range matches the current date inputs. */
+  function syncPresetUi() {
+    Array.prototype.forEach.call(document.querySelectorAll(".preset"), function (btn) {
+      var range = presetRange(Number(btn.getAttribute("data-days")));
+      var isActive = state.createdAfter === range.from && state.createdBefore === range.to;
+      btn.className = isActive ? "ghost preset preset-on" : "ghost preset";
+      btn.setAttribute("aria-pressed", isActive ? "true" : "false");
+    });
+  }
+
   // ── API ───────────────────────────────────────────────────────────────
 
   /**
@@ -456,8 +495,8 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     // Known limitation: a page can then hold fewer matching rows than the page
     // size (even none) while "Load more" still has further pages to fetch.
     if (state.statuses.length === 1) query += "&status=" + encodeURIComponent(state.statuses[0]);
-    if (state.createdAfter) query += "&created_after=" + encodeURIComponent(state.createdAfter + "T00:00:00Z");
-    if (state.createdBefore) query += "&created_before=" + encodeURIComponent(state.createdBefore + "T23:59:59Z");
+    if (state.createdAfter) query += "&created_after=" + encodeURIComponent(localDayBound(state.createdAfter, false));
+    if (state.createdBefore) query += "&created_before=" + encodeURIComponent(localDayBound(state.createdBefore, true));
     if (state.cursor) query += "&cursor=" + encodeURIComponent(state.cursor);
 
     // Show skeleton rows only on the first page load (no cursor yet), so the
@@ -941,13 +980,27 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     });
     $("created-after").addEventListener("change", function () {
       state.createdAfter = $("created-after").value;
+      syncPresetUi();
       clearSelection();
       reload();
     });
     $("created-before").addEventListener("change", function () {
       state.createdBefore = $("created-before").value;
+      syncPresetUi();
       clearSelection();
       reload();
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(".preset"), function (btn) {
+      btn.addEventListener("click", function () {
+        var range = presetRange(Number(btn.getAttribute("data-days")));
+        state.createdAfter = range.from;
+        state.createdBefore = range.to;
+        $("created-after").value = range.from;
+        $("created-before").value = range.to;
+        syncPresetUi();
+        clearSelection();
+        reload();
+      });
     });
     $("load-more").addEventListener("click", loadPayments);
     $("detail-close").addEventListener("click", closeDetail);
