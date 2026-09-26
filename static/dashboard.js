@@ -522,11 +522,33 @@ import { fmtTime, shortId } from "/dashboard/format.js";
           card.appendChild(el("strong", null, row[1]));
           summary.appendChild(card);
         });
+        renderChipCounts(body.summary || []);
       })
       .catch(function (err) {
         clear($("summary"));
         announce("Error loading summary: " + err.message);
       });
+  }
+
+  /**
+   * Show each status's count inside its filter chip, e.g. "Pending (4)". The
+   * accessible name is set explicitly so screen readers hear "Pending, 4
+   * payments" rather than the literal parentheses.
+   */
+  function renderChipCounts(rows) {
+    var counts = {};
+    var total = 0;
+    rows.forEach(function (row) {
+      counts[row[0]] = row[1];
+      total += row[1];
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(".chip"), function (chip) {
+      var status = chip.getAttribute("data-status") || "";
+      var label = chip.getAttribute("data-label");
+      var count = status ? counts[status] || 0 : total;
+      chip.textContent = label + " (" + count + ")";
+      chip.setAttribute("aria-label", label + ", " + count + (count === 1 ? " payment" : " payments"));
+    });
   }
 
   function appendRow(p) {
@@ -875,7 +897,10 @@ import { fmtTime, shortId } from "/dashboard/format.js";
       signOut(null);
     });
 
-    $("refresh").addEventListener("click", reload);
+    $("refresh").addEventListener("click", function () {
+      loadSummary();
+      reload();
+    });
     $("export-csv").addEventListener("click", function () {
       exportCsv(state.loadedPayments, "stellargate-payments.csv");
     });
@@ -939,6 +964,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     }, 30000);
     window.setInterval(function () {
       if (state.key && state.autoRefresh && (!state.status || state.status === "pending")) {
+        loadSummary();
         reload();
       }
     }, 15000);
