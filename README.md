@@ -216,6 +216,12 @@ and in the top bar overrides it. The choice is remembered in `localStorage`
 under `stellargate.theme` and applied before the first paint, so it never
 flashes; with nothing stored, the page keeps following the OS.
 
+**Accessibility.** The detail panel is a real modal `<dialog>` with a focus
+trap and a focus ring of its own, and the light and dark palettes are both held
+to WCAG 2.1 AA. `scripts/check-dashboard-contrast.mjs` re-checks every colour
+pair in CI, reading the real stylesheet, so a token cannot drift out of the
+standard unnoticed.
+
 **How it's built.** The page is plain HTML, CSS, and dependency-free
 JavaScript, compiled into the binary with `include_str!`. There is no npm, no
 bundler, and no `node_modules`: the deployable artifact stays a single Rust

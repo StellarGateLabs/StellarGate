@@ -89,6 +89,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The bootstrap reads and writes only that one preference — it is deliberately
   not a second reader of the API key, which lives in the same origin's storage.
 
+- **Every dashboard colour pair audited against WCAG 2.1 AA, in both themes
+  (issue #718).** Four real failures, all of them the kind that survives review
+  because they look fine to the person looking:
+
+  - **There was no focus ring.** Nothing in the stylesheet styled
+    `:focus`/`:focus-visible`, so keyboard focus was whatever hairline the
+    browser drew, in a colour this stylesheet never chose and no audit covered —
+    2.4.7 Focus Visible, in the AA range. There is now a real ring in a
+    `--focus` token per theme, drawn with `outline` (which follows
+    `border-radius` and is not clipped by an ancestor's `overflow`) at a 2px
+    `outline-offset`, with an inset variant for table rows because Safari draws
+    row outlines inconsistently.
+
+  - **Control boundaries were at 1.25:1.** One `--border` token did two jobs: a
+    decorative separator *and* the edge of every button and input. WCAG 1.4.11
+    requires 3:1 for the boundary of a user-interface component, so the two are
+    now separate tokens — `--border` still draws table rules and card edges,
+    where a 3:1 line would put a heavy rule through every row of the payments
+    table, and the new `--control-border` draws what the user has to be able to
+    see to click. Worth naming which failure this was: it is invisible to
+    someone with normal vision on a good monitor, which is precisely why it
+    needs a number rather than an opinion.
+
+  - **The date filters and the page-size `<select>` had no rule at all.** They
+    were drawn entirely by the user agent, so their borders were in a colour
+    this stylesheet never picked, followed neither theme, and were never
+    audited. They are the controls most likely to be on screen at once.
+
+  - **Two status pills missed 4.5:1, by 0.02 and 0.03.** `--ok` on `--ok-bg`
+    was 4.48:1 and `--warn` on `--warn-bg` 4.47:1. Both are darkened
+    (`#17803d` → `#146c34`, `#9a6700` → `#946100`), which is also the
+    direction that helps: on a tinted background a darker foreground can only
+    get better.
+
+  The audit is a file rather than a claim:
+  `scripts/check-dashboard-contrast.mjs` implements the WCAG sRGB → linear →
+  relative-luminance → contrast maths dependency-free, reads the real
+  `static/dashboard.css` block by block, and checks 96 pairs across all four
+  theme blocks. It self-tests its own maths against the published WCAG worked
+  examples, because a contrast checker that computes the wrong ratio is worse
+  than no checker — it reports a green tick on colours nobody can read. It runs
+  in the dashboard CI job. Every theme must declare the same tokens, so a
+  colour edited in one palette and not the other fails rather than silently
+  resolving to another theme's value — which is also what catches a new token
+  like #719's `--skeleton-*` being added to `:root` and forgotten in the dark
+  blocks.
+
 - **The payment detail drawer traps keyboard focus and gives it back (issue
   #714).** Opening a payment moved nothing: focus stayed on the row behind the
   panel, so a keyboard user tabbed straight back out into the payment table

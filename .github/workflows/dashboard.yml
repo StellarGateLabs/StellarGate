@@ -6,6 +6,7 @@ on:
     paths:
       - "static/**"
       - "scripts/check-dashboard-a11y.mjs"
+      - "scripts/check-dashboard-contrast.mjs"
       - ".github/workflows/dashboard.yml"
 
 jobs:
@@ -24,3 +25,6 @@ jobs:
 
       - name: Accessibility smoke check
         run: node scripts/check-dashboard-a11y.mjs
+
+      - name: Colour contrast audit (WCAG 2.1 AA)
+        run: node scripts/check-dashboard-contrast.mjs

@@ -21,6 +21,17 @@
  * explicit light override; the dark palette appears in the media query and in
  * the explicit dark override, because both are selectors something can target.
  *
+ * Two border tokens, because they answer different questions. `--border` draws
+ * a decorative separator — a table row rule, a delivery card's edge, the top
+ * bar's hairline — and WCAG 2.1 AA does not ask for those to be
+ * distinguishable: nothing about a control is identified by them, and a 3:1
+ * line between every row would wreck the table. `--control-border` draws the
+ * boundary of something interactive, which is the case 1.4.11 is actually about
+ * — if the edge is all that tells you where to click, it has to be visible.
+ * Before this audit a single `--border` at 1.25:1 did both jobs, which is how
+ * the date inputs and the page-size <select> ended up with a border in a colour
+ * this stylesheet never chose at all.
+ *
  * Every colour pair here is checked against WCAG 2.1 AA by
  * `scripts/check-dashboard-contrast.mjs`, in both themes — see that script for
  * the thresholds, the pairs and what counts as a non-text one. */
@@ -30,13 +41,15 @@
   --bg: #f6f7f9;
   --surface: #ffffff;
   --border: #e3e6ea;
+  --control-border: #7d828c;
+  --focus: #0b1220;
   --text: #1a1d21;
   --muted: #6b7280;
   --accent: #3b5bdb;
   --accent-text: #ffffff;
-  --ok: #17803d;
+  --ok: #146c34;
   --ok-bg: #e7f6ec;
-  --warn: #9a6700;
+  --warn: #946100;
   --warn-bg: #fff4e0;
   --err: #b42318;
   --err-bg: #fdeceb;
@@ -52,6 +65,8 @@
     --bg: #14161a;
     --surface: #1c1f24;
     --border: #2c313a;
+    --control-border: #6b7280;
+    --focus: #a8c5ff;
     --text: #e8eaed;
     --muted: #9aa3af;
     --accent: #7c93f5;
@@ -75,13 +90,15 @@ html[data-theme="light"] {
   --bg: #f6f7f9;
   --surface: #ffffff;
   --border: #e3e6ea;
+  --control-border: #7d828c;
+  --focus: #0b1220;
   --text: #1a1d21;
   --muted: #6b7280;
   --accent: #3b5bdb;
   --accent-text: #ffffff;
-  --ok: #17803d;
+  --ok: #146c34;
   --ok-bg: #e7f6ec;
-  --warn: #9a6700;
+  --warn: #946100;
   --warn-bg: #fff4e0;
   --err: #b42318;
   --err-bg: #fdeceb;
@@ -97,6 +114,8 @@ html[data-theme="dark"] {
   --bg: #14161a;
   --surface: #1c1f24;
   --border: #2c313a;
+  --control-border: #6b7280;
+  --focus: #a8c5ff;
   --text: #e8eaed;
   --muted: #9aa3af;
   --accent: #7c93f5;
@@ -111,6 +130,38 @@ html[data-theme="dark"] {
   --idle-bg: #262a31;
   --skeleton-base: #2c313a;
   --skeleton-shine: #363c47;
+}
+
+/* ── Focus ───────────────────────────────────────────────────────────────────
+ *
+ * Until this existed, focus was whatever the user agent drew: a hairline in a
+ * colour chosen by the browser, not by this stylesheet, and not checked against
+ * either theme. A keyboard user tabbing this page had no way to know where they
+ * were, which is 2.4.7 (Focus Visible) in the WCAG 2.1 AA range.
+ *
+ * `:focus-visible` rather than `:focus` so a mouse click does not leave a ring
+ * behind — every current browser already suppresses that for `:focus-visible`,
+ * and the one that matters (keyboard) keeps it.
+ *
+ * `outline` rather than `box-shadow` because an outline follows a border-radius
+ * in current browsers and is not clipped by an ancestor's `overflow`. The
+ * offset is 2px and is load-bearing, not cosmetic: it puts a gap of the
+ * surrounding background between the control's own fill and the ring, so a ring
+ * on an accent-filled button can never be read as part of that button. The
+ * contrast audit relies on that — which is why it checks the ring against the
+ * page and card backgrounds rather than against `--accent` — and why
+ * `tests/dashboard_asset_tests.rs` pins the offset in place. */
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* Keyboard focus on a <tr> is the same colour and token, but a table row has no
+   border-radius to follow and Safari draws row outlines inconsistently, so it
+   gets an inset box-shadow instead of an outline. */
+.payments tbody tr:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--focus);
 }
 
 * {
@@ -253,13 +304,44 @@ h3 {
   font-size: 1.05rem;
 }
 
+/* ── Form controls ──────────────────────────────────────────────────────────
+ *
+ * Every control that takes a value gets its border from `--control-border`,
+ * not `--border`.
+ *
+ * The date filters and the page-size <select> previously had no rule at all, so
+ * they were drawn entirely by the user agent: a border in a colour this
+ * stylesheet never chose, unaudited and not following the theme. They are the
+ * controls most likely to be on screen at once — a filter nobody can see the
+ * edge of is a filter nobody finds.
+ *
+ * `:where()` rather than a list of `[type="…"]` selectors so an input with no
+ * `type` attribute is covered too, and so the whole rule sits at zero
+ * specificity: a component can still override the padding without needing
+ * `!important` or a heavier selector.
+ *
+ * `accent-color` themes the native checkbox, whose default is a hard-coded blue
+ * that matches neither palette's `--accent`. */
+:where(input:not([type="checkbox"]), select) {
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--control-border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+}
+
 .gate-card input[type="password"] {
   padding: 0.6rem 0.7rem;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
   background: var(--bg);
-  color: var(--text);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+input[type="date"] {
+  font-family: inherit;
+}
+
+input[type="checkbox"] {
+  accent-color: var(--accent);
 }
 
 .checkbox {
@@ -276,7 +358,8 @@ button {
   font: inherit;
   cursor: pointer;
   border-radius: var(--radius);
-  border: 1px solid var(--border);
+  /* A button is a control, so its edge is a control boundary: 1.4.11, 3:1. */
+  border: 1px solid var(--control-border);
   padding: 0.5rem 0.9rem;
   background: var(--surface);
   color: var(--text);
@@ -359,11 +442,6 @@ main {
 }
 .search input {
   min-width: 220px;
-  padding: 0.45rem 0.6rem;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--surface);
-  color: var(--text);
 }
 
 .summary {

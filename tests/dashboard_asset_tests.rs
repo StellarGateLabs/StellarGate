@@ -493,6 +493,82 @@ fn theme_toggle_is_a_toggle_button_on_both_panels() {
     );
 }
 
+/// Colour contrast is checked numerically by `scripts/check-dashboard-contrast.mjs`
+/// (issue #718) — this pins the structural preconditions that audit depends on,
+/// so a failure means "the audit is looking in the wrong place" rather than
+/// "the audit is broken".
+#[test]
+fn contrast_audit_can_find_every_theme_block() {
+    // One palette per block, and the same tokens in each. The audit compares
+    // block-by-block, so a token added to one and not another is exactly the
+    // drift that would make a colour unreadable in the theme nobody was
+    // looking at — and #719's `--skeleton-*` are the tokens most likely to
+    // land that way.
+    for selector in [
+        ":root",
+        ":root:not([data-theme])",
+        r#"html[data-theme="light"]"#,
+        r#"html[data-theme="dark"]"#,
+    ] {
+        assert!(
+            DASHBOARD_CSS.contains(selector),
+            "the contrast audit reads the `{selector}` block; it is missing"
+        );
+    }
+    assert_eq!(
+        DASHBOARD_CSS.matches("--control-border:").count(),
+        4,
+        "every theme block must define --control-border, or an interactive control \
+         falls back to a colour no audit looked at"
+    );
+    assert_eq!(
+        DASHBOARD_CSS.matches("--focus:").count(),
+        4,
+        "every theme block must define --focus; there was no focus colour at all \
+         before #718, and the audit needs one per theme"
+    );
+}
+
+/// The focus ring's `outline-offset` is load-bearing, not cosmetic.
+///
+/// `scripts/check-dashboard-contrast.mjs` deliberately does not pair the focus
+/// colour against `--accent`, because a 2px offset puts a gap of the page
+/// background between the ring and a filled control's own edge. Remove the
+/// offset and that reasoning stops holding while the audit still passes, so the
+/// invariant is asserted here.
+#[test]
+fn focus_ring_offset_is_preserved() {
+    assert!(
+        DASHBOARD_CSS.contains("outline-offset: 2px;"),
+        "the focus ring needs a 2px offset: without it the ring touches an \
+         accent-filled control and the contrast audit's reasoning about adjacent \
+         colours no longer holds"
+    );
+    assert!(
+        DASHBOARD_CSS.contains(":focus-visible {"),
+        "focus must be indicated through :focus-visible, which every current \
+         browser supports and which keeps a mouse click from leaving a ring"
+    );
+}
+
+/// Decorative separators and interactive control boundaries are different jobs
+/// and now have different tokens.
+#[test]
+fn control_boundaries_use_the_audited_token() {
+    assert!(
+        DASHBOARD_CSS.contains("border: 1px solid var(--control-border);"),
+        "buttons and inputs must draw their edge from --control-border, the token \
+         the contrast audit holds to 3:1"
+    );
+    for selector in ["input[type=\"date\"]", "select"] {
+        assert!(
+            DASHBOARD_CSS.contains(selector),
+            "{selector} needs a rule: it previously had none at all, so its border \
+             was drawn by the user agent in a colour this stylesheet never chose"
+        );
+    }
+}
+
 async fn test_server() -> TestServer {
     let cfg = make_config();
     let pool = SqlitePoolOptions::new()
