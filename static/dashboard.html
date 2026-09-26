@@ -117,11 +117,27 @@
         </section>
       </main>
 
-      <!-- Detail panel, opened by clicking a row. `tabindex="-1"` makes the
-           panel itself programmatically focusable so opening it can move focus
-           into the drawer and announce it; it is deliberately not in the Tab
-           ring. #715 converts this to a real <dialog>. -->
-      <aside id="detail" class="detail" tabindex="-1" hidden aria-label="Payment detail">
+      <!-- Detail panel, opened by clicking a row.
+
+           A real <dialog> rather than an <aside> (issue #715): `showModal()`
+           puts it in the top layer, which is what makes the rest of the page
+           genuinely unreachable rather than merely covered by a scrim, and
+           brings the ::backdrop, Escape handling and the UA's own focus
+           restoration with it.
+
+           `aria-modal` is the attribute assistive tech reads, and
+           `aria-labelledby` names the dialog from its heading, so a screen
+           reader announces "Payment, dialog" on entry instead of a bare
+           "dialog".
+
+           The explicit Tab trap from #714 stays: a modal dialog does not wrap
+           Tab at the ends in any current browser. -->
+      <dialog
+        id="detail"
+        class="detail"
+        aria-modal="true"
+        aria-labelledby="detail-title"
+      >
         <div class="detail-head">
           <h2 id="detail-title">Payment</h2>
           <button id="detail-close" class="ghost" aria-label="Close">&times;</button>
@@ -134,8 +150,7 @@
         </p>
         <p id="deliveries-error" class="error" hidden></p>
         <ul id="deliveries" class="deliveries"></ul>
-      </aside>
-      <div id="scrim" class="scrim" hidden></div>
+      </dialog>
     </div>
 
     <script type="module" src="/dashboard/app.js"></script>

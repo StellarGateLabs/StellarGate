@@ -662,8 +662,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     // next Tab restarts from the top of the document, so the table has to be
     // re-tabbed from the filters to reach the row they were on.
     state.detailTrigger = trigger || null;
-    show($("detail"), true);
-    show($("scrim"), true);
+    openModal();
     focusDetail();
 
     var fields = $("detail-fields");
@@ -836,19 +835,78 @@ import { fmtTime, shortId } from "/dashboard/format.js";
   /**
    * Hide the drawer and hand focus back to the row that opened it.
    *
-   * Guarded on `isConnected`: a refresh or a "Load more" re-render between
-   * open and close replaces the row element, and focusing a detached node
-   * silently drops focus back to <body> — the exact loss this is meant to
-   * prevent.
+   * `close()` rather than setting `hidden`, because `close()` is what fires the
+   * `close` event the focus restoration hangs off. It is a no-op when the dialog
+   * is already closed, so this needs no guard at the call sites — `showGate()`
+   * calls it on every sign-out, most of which happen with no drawer open.
    */
   function closeDetail() {
+    closeModal();
     var trigger = state.detailTrigger;
-    show($("detail"), false);
-    show($("scrim"), false);
     state.detailTrigger = null;
     if (trigger && trigger.isConnected) {
       trigger.focus();
     }
+  }
+
+  /**
+   * Show the drawer.
+   *
+   * `showModal()` rather than unhiding it, and that is the whole of #715: it
+   * moves the dialog into the top layer, which makes the rest of the page
+   * inert rather than merely covered, paints the `::backdrop` that stands in
+   * for the old `#scrim`, and registers the `close`/`cancel` handling the UA
+   * does for Escape. A hidden-but-plain `<dialog>` (or an `<aside>` under a
+   * scrim) is only visually on top — Tab, the address bar and the accessibility
+   * tree all still reach the page behind it.
+   */
+  function openModal() {
+    var detail = $("detail");
+    // Re-opening an already-open dialog throws `InvalidStateError`; clicking a
+    // second row while the drawer is up would otherwise be a console error and
+    // a stale panel.
+    if (detail.open) detail.close();
+    detail.showModal();
+  }
+
+  function closeModal() {
+    var detail = $("detail");
+    if (detail.open) detail.close();
+  }
+
+  /**
+   * Hand focus back to the row that opened the drawer.
+   *
+   * Bound to the dialog's `close` event rather than to `closeDetail`, so it
+   * also runs for the routes that bypass it: Escape (which the UA handles) and
+   * a re-open on another row. The UA restores focus too, but only to whatever
+   * was focused when `showModal()` ran, which is nothing reliable once the
+   * drawer has been through a cycle.
+   */
+  function onDetailClosed() {
+    var trigger = state.detailTrigger;
+    state.detailTrigger = null;
+    if (trigger && trigger.isConnected) {
+      trigger.focus();
+    }
+  }
+
+  /**
+   * Dismiss on a click outside the panel.
+   *
+   * The `::backdrop` is not an event target, so a click on it is retargeted to
+   * the dialog element itself — which means `ev.target === detail` is exactly
+   * "the user clicked the backdrop", and `ev.target` being a field or the close
+   * button is a click inside. Checking the coordinates as well covers the
+   * panel's own padding and border, which belong to the dialog element too.
+   */
+  function dismissOnBackdrop(ev) {
+    if (ev.target !== $("detail")) return;
+    var box = $("detail").getBoundingClientRect();
+    var outside =
+      ev.clientX < box.left || ev.clientX > box.right ||
+      ev.clientY < box.top || ev.clientY > box.bottom;
+    if (outside) closeDetail();
   }
 
   // ── Version ───────────────────────────────────────────────────────────
@@ -945,22 +1003,24 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     });
     $("load-more").addEventListener("click", loadPayments);
     $("detail-close").addEventListener("click", closeDetail);
-    $("scrim").addEventListener("click", closeDetail);
+    $("detail").addEventListener("click", dismissOnBackdrop);
+    $("detail").addEventListener("close", onDetailClosed);
     $("detail").addEventListener("keydown", trapDetailFocus);
     $("auto-refresh").addEventListener("change", function () {
       state.autoRefresh = $("auto-refresh").checked;
       writeHashState();
     });
 
-    document.addEventListener("keydown", function (ev) {
-      if (ev.key === "Escape") closeDetail();
-    });
+    /* No document-level Escape handler: a modal <dialog> closes itself on
+    Escape, firing `cancel` and then `close`, and the `close` listener above
+    restores focus. Adding one here would only ever be a second `close()` on a
+    dialog that had already closed. */
 
-    /* Only while the drawer is open: without that guard every focus change on
-    the page would be dragged into a hidden drawer. */
+    // Only while the drawer is open: without that guard every focus change on
+    // the page would be dragged into a hidden drawer.
     document.addEventListener("focusin", function (ev) {
       if ($("detail").contains(ev.target)) return;
-      if (!$("detail").hidden) keepFocusInDetail(ev);
+      if ($("detail").open) keepFocusInDetail(ev);
     });
 
     Array.prototype.forEach.call(

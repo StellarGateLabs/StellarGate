@@ -149,6 +149,11 @@ fn every_dashboard_helper_the_script_calls_is_defined() {
         "writeHashState",
         // UI plumbing.
         "syncFilterUi",
+        // Modal open/close for the detail drawer (#715).
+        "openModal",
+        "closeModal",
+        "dismissOnBackdrop",
+        "onDetailClosed",
         // Focus management in the detail drawer (#714).
         "focusDetail",
         "trapDetailFocus",
@@ -160,6 +165,84 @@ fn every_dashboard_helper_the_script_calls_is_defined() {
              site is a runtime ReferenceError, and a syntax check will not see it"
         );
     }
+}
+
+/// The detail drawer is a real modal dialog (issue #715).
+///
+/// An `<aside>` under a scrim is only *visually* on top: `Tab`, the address bar
+/// and the accessibility tree all still reach the page behind it, because
+/// nothing marks that content as inert. `showModal()` is what puts the dialog
+/// in the top layer and makes the rest of the page unreachable, so the element
+/// choice and the way it is opened have to stay in step — an un-hidden
+/// `<dialog>` is no better than the `<aside>` it replaced.
+#[test]
+fn detail_drawer_is_a_modal_dialog() {
+    assert!(
+        DASHBOARD_HTML.contains("<dialog"),
+        "the drawer must be a <dialog> element; an <aside> cannot be modal, so the \
+         page behind it stays reachable by Tab and to the accessibility tree"
+    );
+    assert!(
+        DASHBOARD_HTML.contains(r#"aria-modal="true""#),
+        "a modal dialog must declare aria-modal"
+    );
+    assert!(
+        DASHBOARD_HTML.contains(r#"aria-labelledby="detail-title""#)
+            && DASHBOARD_HTML.contains(r#"<h2 id="detail-title">"#),
+        "the dialog must be named by its heading, and that heading must exist — \
+         aria-labelledby pointing at nothing announces a bare \"dialog\""
+    );
+    assert!(
+        !DASHBOARD_HTML.contains(r#"id="scrim""#),
+        "a modal <dialog> paints its own ::backdrop; the #scrim div is dead weight \
+         and, as a sibling of the dialog, is not inert while the dialog is open"
+    );
+    assert!(
+        DASHBOARD_JS.contains("showModal()"),
+        "the drawer must be opened with showModal(), not by removing `hidden`"
+    );
+    assert!(
+        DASHBOARD_JS.contains("detail.close()"),
+        "the drawer must be closed with close(), which is what fires the `close` \
+         event the focus restoration hangs off"
+    );
+    assert!(
+        !DASHBOARD_JS.contains(r#"$("scrim")"#),
+        "nothing may still reference the removed #scrim element"
+    );
+    assert!(
+        DASHBOARD_CSS.contains(".detail::backdrop"),
+        "the backdrop that replaced #scrim has to be styled, or a modal dialog is \
+         an un dimmed panel over an undimmed page"
+    );
+    assert!(
+        !DASHBOARD_JS.contains(r#"ev.key === "Escape""#),
+        "a modal <dialog> handles Escape itself and fires `cancel`; a document-level \
+         Escape handler here would only ever be a second close() on a closed dialog"
+    );
+}
+
+/// A click inside the panel must not read as a click on the backdrop.
+///
+/// The `::backdrop` is not an event target, so a click on it is retargeted to
+/// the dialog element — the same target as its own padding and border. Keying
+/// dismissal off `ev.target` alone would close the drawer on every click inside
+/// it, so the coordinates are checked as well.
+#[test]
+fn backdrop_dismissal_distinguishes_a_click_inside_the_panel() {
+    assert!(
+        DASHBOARD_JS.contains(r#"if (ev.target !== $("detail")) return;"#),
+        "dismissal must ignore clicks that landed on a field or the close button"
+    );
+    assert!(
+        DASHBOARD_JS.contains("getBoundingClientRect()"),
+        "dismissal must check where the click actually was, not only which element \
+         received it"
+    );
+    assert!(
+        DASHBOARD_JS.contains(r#"$("detail").addEventListener("click", dismissOnBackdrop);"#),
+        "the dismissal handler must be bound to the dialog"
+    );
 }
 
 /// The detail drawer is a keyboard trap: a screen-reader or keyboard user who
@@ -175,13 +258,6 @@ fn every_dashboard_helper_the_script_calls_is_defined() {
 /// that silently leaks focus.
 #[test]
 fn detail_drawer_traps_focus_and_restores_it() {
-    assert!(
-        DASHBOARD_HTML.contains(r#"<aside id="detail" class="detail" tabindex="-1""#),
-        "the drawer must be programmatically focusable (tabindex=\"-1\") or focus \
-         cannot be moved into it — and it must not be a positive tabindex, which \
-         would add a phantom stop in front of the controls it contains"
-    );
-
     // Focus in, on open.
     assert!(
         DASHBOARD_JS.contains(r#"$("detail").addEventListener("keydown", trapDetailFocus);"#),
@@ -196,16 +272,22 @@ fn detail_drawer_traps_focus_and_restores_it() {
         "openDetail must call focusDetail, or focus stays on the row behind the drawer"
     );
 
-    // Focus back out, on close.
+    // Focus back out, on close — from the dialog's `close` event, so it covers
+    // the close button, the backdrop, Escape and a re-open alike.
+    assert!(
+        DASHBOARD_JS.contains(r#"$("detail").addEventListener("close", onDetailClosed);"#),
+        "focus restoration must hang off the dialog's `close` event, which every \
+         route out of a <dialog> fires"
+    );
     assert!(
         DASHBOARD_JS.contains("state.detailTrigger = trigger || null;"),
         "openDetail must remember the row that opened the drawer"
     );
     assert!(
         DASHBOARD_JS.contains("if (trigger && trigger.isConnected) {"),
-        "closeDetail must return focus to that row, guarded on isConnected — \
-         focusing a node detached by a re-render drops focus to <body>, which is \
-         the loss this exists to prevent"
+        "focus must go back to that row, guarded on isConnected — focusing a \
+         node detached by a re-render drops focus to <body>, which is the loss \
+         this exists to prevent"
     );
 
     // The trap has to cover both directions and both escape routes.

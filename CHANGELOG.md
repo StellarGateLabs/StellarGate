@@ -79,6 +79,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The payment detail drawer is a real modal `<dialog>` (issue #715).** It was
+  an `<aside>` under a separate `#scrim` div, which is only *visually* on top:
+  `Tab`, the address bar and the accessibility tree all still reach the page
+  behind it, because nothing marks that content as inert. `showModal()` puts the
+  dialog in the top layer, so the page behind is genuinely unreachable, and it
+  brings the `::backdrop` (replacing the hand-rolled scrim) plus Escape and
+  `cancel` handling from the user agent. `aria-modal="true"` and
+  `aria-labelledby` on the heading name it for assistive tech, so a screen
+  reader announces "Payment, dialog" on entry rather than a bare "dialog".
+
+  The explicit focus trap from #714 stays: a modal dialog does not wrap `Tab`
+  at the ends in any current browser. Focus is restored from the dialog's
+  `close` event rather than from `closeDetail`, so it also runs for the routes
+  that bypass it — Escape, and a re-open on another row — and the
+  document-level Escape handler is gone, since a modal dialog already handles
+  it and a second `close()` could only ever be a no-op.
+
+  #722's slide-in transition now keys off `:not([open])` instead of `[hidden]`,
+  because a `<dialog>` has no `hidden` attribute, and `display`/`overlay` are
+  transitioned discretely so the drawer stays in the top layer while it
+  animates out. A browser without `allow-discrete` support closes instantly,
+  which is what the reduced-motion path does anyway.
+
 - **Rust edition 2021 → 2024 (issue #662).** No `/v1` API change. `cargo fix
   --edition` only required wrapping the test-only `env::set_var`/`remove_var`
   calls in `unsafe` (they are unsafe in 2024). It also flagged `tokio::select!`

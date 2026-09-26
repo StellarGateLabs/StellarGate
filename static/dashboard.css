@@ -461,30 +461,74 @@ main {
 
 /* ── Detail panel ──────────────────────────────────────────────────────── */
 
+/* A real <dialog> (issue #715), so the user agent's own defaults are all wrong
+   for a right-hand drawer: it centres its box, sizes it to fit content, and
+   clamps it to `100% - 6px - 2em`. Every one of those is reset here before the
+   drawer geometry is stated. */
 .detail {
   position: fixed;
-  top: 0;
-  right: 0;
-  bottom: 0;
+  inset: 0 0 0 auto;
+  margin: 0;
   width: min(460px, 100%);
+  max-width: 100%;
+  height: 100%;
+  max-height: 100%;
   background: var(--surface);
+  color: var(--text);
+  border: none;
   border-left: 1px solid var(--border);
   padding: 1.25rem;
   overflow-y: auto;
   z-index: 5;
 }
 
-/* #722: slide-in transition wrapped in prefers-reduced-motion: no-preference
-   so the panel appears instantly for users who prefer reduced motion. */
+/* `showModal()` paints the ::backdrop itself, so the old `#scrim` div is gone.
+   The backdrop covers the whole viewport, which is also what makes a click on
+   it land on the dialog element (see `dismissOnBackdrop` in the script) rather
+   than on the page underneath. */
+.detail::backdrop {
+  background: rgba(0, 0, 0, 0.45);
+}
+
+/* The drawer container takes focus programmatically on open so a screen reader
+   announces it and its name (see `focusDetail`). It is not in the Tab ring, so
+   this focus is never something the user arrived at by tabbing — and a ring
+   around the whole panel would read as a rendering fault rather than as
+   "focus is here". Its controls are ordinary tab stops and ring normally. */
+.detail:focus,
+.detail:focus-visible {
+  outline: none;
+}
+
+/* #722: slide-in transition, wrapped in prefers-reduced-motion: no-preference
+   so the panel appears instantly for users who prefer reduced motion.
+
+   The closed state is `:not([open])` rather than `[hidden]`: a <dialog> has no
+   `hidden` attribute, and `display`/`overlay` are transitioned discretely so
+   the drawer stays in the top layer while it animates out. A browser without
+   `allow-discrete` support simply closes instantly, which is the same thing
+   the reduced-motion path does. */
 @media (prefers-reduced-motion: no-preference) {
   .detail {
-    transition: transform 0.25s ease;
+    transition:
+      transform 0.25s ease,
+      overlay 0.25s allow-discrete,
+      display 0.25s allow-discrete;
   }
 
-  .detail[hidden] {
-    display: block !important;
+  .detail:not([open]) {
     transform: translateX(100%);
-    pointer-events: none;
+  }
+
+  .detail::backdrop {
+    transition:
+      opacity 0.2s ease,
+      overlay 0.2s allow-discrete,
+      display 0.2s allow-discrete;
+  }
+
+  .detail:not([open])::backdrop {
+    opacity: 0;
   }
 }
 
@@ -492,26 +536,6 @@ main {
   display: flex;
   align-items: center;
   justify-content: space-between;
-}
-
-.scrim {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.35);
-  z-index: 4;
-}
-
-/* #722: scrim fade-in wrapped in prefers-reduced-motion: no-preference. */
-@media (prefers-reduced-motion: no-preference) {
-  .scrim {
-    transition: opacity 0.2s ease;
-  }
-
-  .scrim[hidden] {
-    display: block !important;
-    opacity: 0;
-    pointer-events: none;
-  }
 }
 
 .fields {
