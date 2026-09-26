@@ -103,6 +103,29 @@ pub struct HorizonPayment {
     /// measure how far behind the poller/stream cursor is running.
     #[serde(default)]
     pub created_at: Option<String>,
+    /// Zero-based index of this operation within its transaction.
+    ///
+    /// A Stellar transaction can contain multiple payment operations that all
+    /// share the same `transaction_hash`. Without this index the dedup key in
+    /// `processed_transactions` collapses every operation in the same
+    /// transaction onto one row: the first operation is recorded and every
+    /// subsequent one is silently discarded as "already seen", causing the
+    /// intent to be under-credited (issues #614, #615).
+    ///
+    /// Horizon includes this field as `"source_account_sequence"` is not
+    /// what we want; Horizon's payments endpoint returns each operation with
+    /// its own numeric `id` (the operation ID) and a `transaction_successful`
+    /// flag. The operation index within the transaction is encoded in the
+    /// paging token but is also available directly as the `operation_index`
+    /// field. We read it here and thread it through to
+    /// `record_processed_tx` so the PK becomes
+    /// `(payment_id, tx_hash, operation_index)`.
+    ///
+    /// Absent from older Horizon builds (pre-protocol-10 responses, mocked
+    /// data) — defaults to `0`, which preserves the old behaviour for any
+    /// single-op transaction.
+    #[serde(default)]
+    pub operation_index: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1722,6 +1745,7 @@ mod tests {
             }),
             paging_token: Some("1".into()),
             created_at: None,
+            operation_index: 0,
         }
     }
 
@@ -1912,6 +1936,7 @@ mod tests {
             }),
             paging_token: Some("1".into()),
             created_at: None,
+            operation_index: 0,
         };
         assert!(matches!(
             verify(&p, &hp, &test_assets(), 0),
@@ -1937,6 +1962,7 @@ mod tests {
             }),
             paging_token: Some("1".into()),
             created_at: None,
+            operation_index: 0,
         };
         assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
         // Sanity: with the right issuer it would have matched.
