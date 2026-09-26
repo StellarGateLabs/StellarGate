@@ -62,6 +62,12 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     }
   }
 
+  /** Announce a message to screen readers via the live region. */
+  function announce(message) {
+    var live = $("live-region");
+    if (live) live.textContent = message;
+  }
+
   // ── Formatting ────────────────────────────────────────────────────────
 
   /** Map a payment or delivery status onto a pill style. */
@@ -202,6 +208,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     if (state.loading) return;
     state.loading = true;
     setError($("list-error"), null);
+    announce("Loading payments");
 
     var query = "/payments?limit=" + state.pageSize;
     if (state.status) query += "&status=" + encodeURIComponent(state.status);
@@ -221,9 +228,13 @@ import { fmtTime, shortId } from "/dashboard/format.js";
         state.cursor = more ? body.next_cursor : null;
         show($("load-more"), more);
         show($("empty"), $("rows").childElementCount === 0);
+        announce("Loaded " + state.loadedPayments.length + " payments");
       })
       .catch(function (err) {
-        if (err.message !== "unauthorized") setError($("list-error"), err.message);
+        if (err.message !== "unauthorized") {
+          setError($("list-error"), err.message);
+          announce("Error: " + err.message);
+        }
       })
       .then(function () {
         state.loading = false;
@@ -242,8 +253,9 @@ import { fmtTime, shortId } from "/dashboard/format.js";
           summary.appendChild(card);
         });
       })
-      .catch(function () {
+      .catch(function (err) {
         clear($("summary"));
+        announce("Error loading summary: " + err.message);
       });
   }
 
@@ -344,6 +356,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
       .catch(function (err) {
         if (err.message !== "unauthorized") {
           setError($("deliveries-error"), err.message);
+          announce("Error loading webhook deliveries: " + err.message);
         }
       });
   }
@@ -481,7 +494,9 @@ import { fmtTime, shortId } from "/dashboard/format.js";
 
   function syncFilterUi() {
     Array.prototype.forEach.call(document.querySelectorAll(".chip"), function (chip) {
-      chip.className = (chip.getAttribute("data-status") || "") === state.status ? "chip chip-on" : "chip";
+      var isActive = (chip.getAttribute("data-status") || "") === state.status;
+      chip.className = isActive ? "chip chip-on" : "chip";
+      chip.setAttribute("aria-pressed", isActive ? "true" : "false");
     });
     $("auto-refresh").checked = state.autoRefresh;
   }
