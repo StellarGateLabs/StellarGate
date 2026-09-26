@@ -443,6 +443,35 @@ main {
 .search input {
   min-width: 220px;
 }
+.search button {
+  padding: 0.3rem 0.55rem;
+  line-height: 1;
+  font-size: 1rem;
+}
+
+/* Focus is the primary affordance for a keyboard-first list, so it gets a ring
+   that survives both colour schemes rather than the browser default that
+   disappears against the dark surface. */
+.search input:focus-visible,
+.payments tbody tr:focus-visible,
+.row-active {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+kbd {
+  display: inline-block;
+  min-width: 1.4em;
+  padding: 0.1rem 0.35rem;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8em;
+  text-align: center;
+}
 
 .summary {
   display: grid;
@@ -500,6 +529,11 @@ main {
 }
 .payments tbody tr:hover {
   background: var(--bg);
+}
+/* The j/k highlight. Tinted rather than outlined so it stays distinguishable
+   from the focus ring when a row is both highlighted and focused. */
+.payments tbody tr.row-active {
+  background: var(--idle-bg);
 }
 .payments tbody tr:last-child td {
   border-bottom: none;
@@ -788,6 +822,43 @@ main {
   margin-top: 0.5rem;
   padding: 0.3rem 0.7rem;
   font-size: 0.85rem;
+}
+
+/* ── Shortcut help overlay (#721) ──────────────────────────────────────── */
+
+.help {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 1.5rem;
+  z-index: 6;
+}
+
+.help-panel {
+  width: 100%;
+  max-width: 420px;
+  padding: 1.25rem;
+  max-height: 85vh;
+  overflow-y: auto;
+}
+
+.help-list {
+  list-style: none;
+  margin: 1rem 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.help-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+}
+.help-row kbd {
+  flex: 0 0 3rem;
 }
 
 @media (max-width: 720px) {

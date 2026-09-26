@@ -108,8 +108,10 @@ fn header(res: &axum_test::TestResponse, name: &str) -> u64 {
 #[tokio::test]
 async fn rate_limit_headers_track_quota_before_and_after_exhaustion() {
     let (server, _pool) = server_with_config(make_config(2)).await;
-    // Provisioning spends from the `merchants` bucket, not `payments`, so the
-    // payments quota below still starts full.
+    /* The key is minted per-test by `provision_merchant`, so nothing secret is
+    ever written down here — but the *real* value must still be sent, or every
+    request 401s before the limiter is ever consulted and the test asserts
+    nothing about rate limiting at all. */
     let key = provision_merchant(&server).await;
     let auth = format!("Bearer {key}");
     let body = json!({ "amount": "1", "asset": "XLM" });

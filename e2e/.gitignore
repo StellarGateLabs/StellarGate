@@ -1,0 +1,16 @@
+# End-to-end test artefacts (issue #724). Dev-only: nothing here ships.
+# Paths are relative to this directory, so no `/e2e/` prefix is needed.
+node_modules/
+test-results/
+playwright-report/
+
+# The seeded merchant's API key. Written by fixtures/seed.mjs, mode 0600, and
+# deliberately never committed: it is a bearer credential, and committing one
+# even for a throwaway test database is the habit this repo is trying to avoid.
+.seed.json
+
+# The seeded SQLite database and its WAL side files.
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
