@@ -264,11 +264,13 @@ main {
   line-height: 1.1;
 }
 
-.chip {
+.chip,
+.preset {
   padding: 0.35rem 0.75rem;
   font-size: 0.88rem;
 }
-.chip-on {
+.chip-on,
+.preset-on {
   background: var(--accent);
   border-color: var(--accent);
   color: var(--accent-text);
@@ -305,6 +307,9 @@ main {
 }
 .payments tbody tr:last-child td {
   border-bottom: none;
+}
+.payments .select-col {
+  width: 1%;
 }
 
 /* ── Empty state ──────────────────────────────────────────────────────── */
@@ -426,6 +431,7 @@ main {
 .skeleton-row .sk-memo    { width: 7rem; }
 .skeleton-row .sk-date    { width: 9rem; }
 .skeleton-row .sk-id      { width: 8rem; }
+.skeleton-row .sk-select  { width: 1rem; }
 
 /* Detail panel skeleton blocks */
 .skeleton-field {

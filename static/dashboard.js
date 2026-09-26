@@ -18,16 +18,21 @@ import { fmtTime, shortId } from "/dashboard/format.js";
   var API_BASE = "/v1";
   var KEY_NAME = "stellargate.apiKey";
   var KEY_SAVED_AT = "stellargate.apiKeySavedAt";
+  var STATUSES = ["pending", "completed", "underpaid", "expired"];
 
   var state = {
     key: null,
-    status: "",
+    // Pressed status chips, in STATUSES order. Empty means "All".
+    statuses: [],
     pageSize: 25,
     createdAfter: "",
     createdBefore: "",
     cursor: null,
     loading: false,
     loadedPayments: [],
+    // Selected payments keyed by id, holding the row's payment record so the
+    // selection can be exported without re-fetching.
+    selected: {},
     autoRefresh: false,
   };
 
@@ -145,7 +150,11 @@ import { fmtTime, shortId } from "/dashboard/format.js";
         if (kv.length !== 2) return;
         var key = decodeURIComponent(kv[0]);
         var value = decodeURIComponent(kv[1]);
-        if (key === "status") state.status = value;
+        if (key === "status") {
+          state.statuses = STATUSES.filter(function (s) {
+            return value.split(",").indexOf(s) >= 0;
+          });
+        }
         if (key === "autoRefresh") state.autoRefresh = value === "1";
       });
     } catch (e) {
@@ -156,13 +165,54 @@ import { fmtTime, shortId } from "/dashboard/format.js";
   function writeHashState() {
     try {
       var parts = [];
-      if (state.status) parts.push("status=" + encodeURIComponent(state.status));
+      if (state.statuses.length) {
+        parts.push("status=" + state.statuses.map(encodeURIComponent).join(","));
+      }
       if (state.autoRefresh) parts.push("autoRefresh=1");
       var hash = parts.length ? "#" + parts.join("&") : "";
       window.history.replaceState(null, "", window.location.pathname + window.location.search + hash);
     } catch (e) {
       /* non-fatal */
     }
+  }
+
+  // ── Date range presets (#778) ──────────────────────────────────────────
+
+  /** Format a Date as a date input's YYYY-MM-DD value, in local time. */
+  function localDateValue(d) {
+    function pad(n) {
+      return (n < 10 ? "0" : "") + n;
+    }
+    return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
+  }
+
+  /**
+   * The start or end of a local calendar day as a UTC timestamp in the API's
+   * stored format (no milliseconds), so a day means the user's own day.
+   */
+  function localDayBound(value, endOfDay) {
+    var parts = value.split("-").map(Number);
+    var d = endOfDay
+      ? new Date(parts[0], parts[1] - 1, parts[2], 23, 59, 59)
+      : new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0);
+    return d.toISOString().replace(/\.\d{3}Z$/, "Z");
+  }
+
+  /** From/To input values covering the last `days` local days, today included. */
+  function presetRange(days) {
+    var today = new Date();
+    var from = new Date(today.getFullYear(), today.getMonth(), today.getDate() - (days - 1));
+    return { from: localDateValue(from), to: localDateValue(today) };
+  }
+
+  /** Highlight the preset whose range matches the current date inputs. */
+  function syncPresetUi() {
+    Array.prototype.forEach.call(document.querySelectorAll(".preset"), function (btn) {
+      var range = presetRange(Number(btn.getAttribute("data-days")));
+      var isActive = state.createdAfter === range.from && state.createdBefore === range.to;
+      btn.className = isActive ? "ghost preset preset-on" : "ghost preset";
+      btn.setAttribute("aria-pressed", isActive ? "true" : "false");
+    });
   }
 
   // ── API ───────────────────────────────────────────────────────────────
@@ -258,7 +308,9 @@ import { fmtTime, shortId } from "/dashboard/format.js";
 
   function signIn(key, persist) {
     state.key = key;
+    state.selected = {};
     readHashState();
+    syncFilterUi();
     // Validate by making the cheapest authenticated call available.
     return api("/payments?limit=1").then(function () {
       if (persist !== null) storeKey(key, persist);
@@ -288,6 +340,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
       tr.setAttribute("aria-hidden", "true");
 
       var cols = [
+        { label: "Select",     cls: "sk-select" },
         { label: "Status",     cls: "sk-status" },
         { label: "Amount",     cls: "sk-amount" },
         { label: "Memo",       cls: "sk-memo" },
@@ -437,9 +490,13 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     announce("Loading payments");
 
     var query = "/payments?limit=" + state.pageSize;
-    if (state.status) query += "&status=" + encodeURIComponent(state.status);
-    if (state.createdAfter) query += "&created_after=" + encodeURIComponent(state.createdAfter + "T00:00:00Z");
-    if (state.createdBefore) query += "&created_before=" + encodeURIComponent(state.createdBefore + "T23:59:59Z");
+    // The list API accepts a single `status`. With one chip pressed the server
+    // filters; with several, unfiltered pages are fetched and filtered below.
+    // Known limitation: a page can then hold fewer matching rows than the page
+    // size (even none) while "Load more" still has further pages to fetch.
+    if (state.statuses.length === 1) query += "&status=" + encodeURIComponent(state.statuses[0]);
+    if (state.createdAfter) query += "&created_after=" + encodeURIComponent(localDayBound(state.createdAfter, false));
+    if (state.createdBefore) query += "&created_before=" + encodeURIComponent(localDayBound(state.createdBefore, true));
     if (state.cursor) query += "&cursor=" + encodeURIComponent(state.cursor);
 
     // Show skeleton rows only on the first page load (no cursor yet), so the
@@ -452,8 +509,14 @@ import { fmtTime, shortId } from "/dashboard/format.js";
         clearSkeletonRows();
 
         var payments = body.payments || [];
-        state.loadedPayments = state.loadedPayments.concat(payments);
-        payments.forEach(appendRow);
+        var shown = state.statuses.length > 1
+          ? payments.filter(function (p) {
+              return state.statuses.indexOf(p.status) >= 0;
+            })
+          : payments;
+        state.loadedPayments = state.loadedPayments.concat(shown);
+        shown.forEach(appendRow);
+        syncSelectionUi();
 
         // Remove any previous inline state nodes before rendering new ones.
         var prev = $("list-state");
@@ -466,11 +529,13 @@ import { fmtTime, shortId } from "/dashboard/format.js";
         show($("load-more"), more);
 
         // #720: show filter-tailored empty state when the list is empty.
-        if ($("rows").childElementCount === 0) {
+        if ($("rows").childElementCount === 0 && !more) {
           var emptyNode = buildEmptyState(
             "📭",
             "No payments found",
-            emptyMessageForFilter(state.status),
+            state.statuses.length > 1
+              ? "No payments match the selected statuses."
+              : emptyMessageForFilter(state.statuses[0] || ""),
             null
           );
           emptyNode.id = "list-state";
@@ -516,6 +581,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
           card.appendChild(el("strong", null, row[1]));
           summary.appendChild(card);
         });
+        renderChipCounts(body.summary || []);
       })
       .catch(function (err) {
         clear($("summary"));
@@ -523,9 +589,56 @@ import { fmtTime, shortId } from "/dashboard/format.js";
       });
   }
 
+  /**
+   * Show each status's count inside its filter chip, e.g. "Pending (4)". The
+   * accessible name is set explicitly so screen readers hear "Pending, 4
+   * payments" rather than the literal parentheses.
+   */
+  function renderChipCounts(rows) {
+    var counts = {};
+    var total = 0;
+    rows.forEach(function (row) {
+      counts[row[0]] = row[1];
+      total += row[1];
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(".chip"), function (chip) {
+      var status = chip.getAttribute("data-status") || "";
+      var label = chip.getAttribute("data-label");
+      var count = status ? counts[status] || 0 : total;
+      chip.textContent = label + " (" + count + ")";
+      chip.setAttribute("aria-label", label + ", " + count + (count === 1 ? " payment" : " payments"));
+    });
+  }
+
   function appendRow(p) {
     var tr = document.createElement("tr");
     tr.tabIndex = 0;
+
+    // Keep the stored record fresh when a selected row is reloaded.
+    if (state.selected[p.id]) state.selected[p.id] = p;
+
+    var selectCell = document.createElement("td");
+    selectCell.setAttribute("data-label", "Select");
+    var box = document.createElement("input");
+    box.type = "checkbox";
+    box.className = "row-select";
+    box.setAttribute("data-id", p.id);
+    box.setAttribute("aria-label", "Select payment " + p.id);
+    box.checked = !!state.selected[p.id];
+    // Stop the row's click and Enter/Space handlers from opening the detail
+    // panel when the checkbox is toggled.
+    box.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+    });
+    box.addEventListener("keydown", function (ev) {
+      ev.stopPropagation();
+    });
+    box.addEventListener("change", function () {
+      setSelected(p, box.checked);
+      syncSelectionUi();
+    });
+    selectCell.appendChild(box);
+    tr.appendChild(selectCell);
 
     var statusCell = document.createElement("td");
     statusCell.setAttribute("data-label", "Status");
@@ -707,9 +820,46 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     return li;
   }
 
-  function exportCsv() {
+  // ── Selection (#775) ──────────────────────────────────────────────────
+
+  function setSelected(p, on) {
+    if (on) state.selected[p.id] = p;
+    else delete state.selected[p.id];
+  }
+
+  function selectedPayments() {
+    return Object.keys(state.selected).map(function (id) {
+      return state.selected[id];
+    });
+  }
+
+  /** Sync the row checkboxes, the select-all box, the count and the action. */
+  function syncSelectionUi() {
+    var count = Object.keys(state.selected).length;
+    Array.prototype.forEach.call(document.querySelectorAll(".row-select"), function (box) {
+      box.checked = !!state.selected[box.getAttribute("data-id")];
+    });
+
+    var loadedSelected = state.loadedPayments.filter(function (p) {
+      return !!state.selected[p.id];
+    }).length;
+    var all = $("select-all");
+    all.checked = state.loadedPayments.length > 0 && loadedSelected === state.loadedPayments.length;
+    all.indeterminate = loadedSelected > 0 && !all.checked;
+
+    $("selection-count").textContent = count + " selected";
+    show($("selection-count"), count > 0);
+    show($("export-selected"), count > 0);
+  }
+
+  function clearSelection() {
+    state.selected = {};
+    syncSelectionUi();
+  }
+
+  function exportCsv(payments, filename) {
     var header = ["id", "status", "amount", "asset", "asset_issuer", "memo", "destination_address", "created_at", "expires_at"];
-    var lines = [header.join(",")].concat(state.loadedPayments.map(function (p) {
+    var lines = [header.join(",")].concat(payments.map(function (p) {
       return header.map(function (key) {
         return '"' + String(p[key] || "").replace(/"/g, '""') + '"';
       }).join(",");
@@ -718,7 +868,7 @@ import { fmtTime, shortId } from "/dashboard/format.js";
     var url = URL.createObjectURL(blob);
     var a = document.createElement("a");
     a.href = url;
-    a.download = "stellargate-payments.csv";
+    a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -784,7 +934,8 @@ import { fmtTime, shortId } from "/dashboard/format.js";
 
   function syncFilterUi() {
     Array.prototype.forEach.call(document.querySelectorAll(".chip"), function (chip) {
-      var isActive = (chip.getAttribute("data-status") || "") === state.status;
+      var status = chip.getAttribute("data-status") || "";
+      var isActive = status ? state.statuses.indexOf(status) >= 0 : state.statuses.length === 0;
       chip.className = isActive ? "chip chip-on" : "chip";
       chip.setAttribute("aria-pressed", isActive ? "true" : "false");
     });
@@ -806,19 +957,50 @@ import { fmtTime, shortId } from "/dashboard/format.js";
       signOut(null);
     });
 
-    $("refresh").addEventListener("click", reload);
-    $("export-csv").addEventListener("click", exportCsv);
+    $("refresh").addEventListener("click", function () {
+      loadSummary();
+      reload();
+    });
+    $("export-csv").addEventListener("click", function () {
+      exportCsv(state.loadedPayments, "stellargate-payments.csv");
+    });
+    $("export-selected").addEventListener("click", function () {
+      exportCsv(selectedPayments(), "stellargate-payments-selected.csv");
+    });
+    $("select-all").addEventListener("change", function () {
+      var on = $("select-all").checked;
+      state.loadedPayments.forEach(function (p) {
+        setSelected(p, on);
+      });
+      syncSelectionUi();
+    });
     $("page-size").addEventListener("change", function () {
       state.pageSize = Number($("page-size").value) || 25;
       reload();
     });
     $("created-after").addEventListener("change", function () {
       state.createdAfter = $("created-after").value;
+      syncPresetUi();
+      clearSelection();
       reload();
     });
     $("created-before").addEventListener("change", function () {
       state.createdBefore = $("created-before").value;
+      syncPresetUi();
+      clearSelection();
       reload();
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(".preset"), function (btn) {
+      btn.addEventListener("click", function () {
+        var range = presetRange(Number(btn.getAttribute("data-days")));
+        state.createdAfter = range.from;
+        state.createdBefore = range.to;
+        $("created-after").value = range.from;
+        $("created-before").value = range.to;
+        syncPresetUi();
+        clearSelection();
+        reload();
+      });
     });
     $("load-more").addEventListener("click", loadPayments);
     $("detail-close").addEventListener("click", closeDetail);
@@ -836,15 +1018,17 @@ import { fmtTime, shortId } from "/dashboard/format.js";
       document.querySelectorAll(".chip"),
       function (chip) {
         chip.addEventListener("click", function () {
-          Array.prototype.forEach.call(
-            document.querySelectorAll(".chip"),
-            function (c) {
-              c.className = "chip";
-            }
-          );
-          chip.className = "chip chip-on";
-          state.status = chip.getAttribute("data-status") || "";
+          var status = chip.getAttribute("data-status") || "";
+          var pressed = state.statuses;
+          // "All" clears the selection; any other chip toggles itself.
+          state.statuses = status
+            ? STATUSES.filter(function (s) {
+                return (s === status) !== (pressed.indexOf(s) >= 0);
+              })
+            : [];
+          syncFilterUi();
           writeHashState();
+          clearSelection();
           reload();
         });
       }
@@ -854,7 +1038,8 @@ import { fmtTime, shortId } from "/dashboard/format.js";
       if (state.key) pollHealth();
     }, 30000);
     window.setInterval(function () {
-      if (state.key && state.autoRefresh && (!state.status || state.status === "pending")) {
+      if (state.key && state.autoRefresh && (state.statuses.length === 0 || state.statuses.indexOf("pending") >= 0)) {
+        loadSummary();
         reload();
       }
     }, 15000);
