@@ -258,6 +258,63 @@ export function createStore(seed) {
   };
 }
 
+/* ── Request cancellation (#681) ──────────────────────────────────────────
+ * Changing a filter quickly can let an older response overwrite newer results,
+ * and closing the detail drawer can leave its fetch running. Both are fixed by
+ * aborting the in-flight request when the thing that started it is superseded.
+ *
+ * `AbortController` is used directly: it is available in current Chrome,
+ * Firefox and Safari (and their mobile builds), and the controller is created
+ * per request so a stale abort can never cancel a newer one. The API key is
+ * passed as a header by the caller, never appended to the URL, so nothing here
+ * can leak it into a URL, a log line or the console. */
+
+/**
+ * Track one in-flight request per key and abort the previous one when a new
+ * request for the same key starts.
+ *
+ * `key` is "list" for the payments list and "detail" for the drawer, so a
+ * filter change aborts only the list request and closing the drawer aborts only
+ * the detail request. Returns a handle whose `signal` is passed to `fetch` and
+ * whose `done()` releases the slot once the response has been consumed.
+ */
+export function createRequestTracker() {
+  var inflight = {};
+
+  /**
+   * Start a request under `key`, aborting any request already running for it.
+   * The returned signal is aborted if a later call reuses the same key.
+   */
+  function begin(key) {
+    abort(key);
+    var controller = new AbortController();
+    inflight[key] = controller;
+    return {
+      signal: controller.signal,
+      done: function () {
+        // Only clear the slot if this request is still the current one; a
+        // newer request may already have replaced it.
+        if (inflight[key] === controller) delete inflight[key];
+      },
+    };
+  }
+
+  /** Abort the in-flight request for `key`, if any. Safe to call repeatedly. */
+  function abort(key) {
+    var controller = inflight[key];
+    if (!controller) return;
+    delete inflight[key];
+    controller.abort();
+  }
+
+  /** Abort every in-flight request (used when the page is torn down). */
+  function abortAll() {
+    Object.keys(inflight).forEach(abort);
+  }
+
+  return { begin: begin, abort: abort, abortAll: abortAll };
+}
+
 /* ── URL-hash serialisation (#696) ────────────────────────────────────────
  * Filters live in the hash, never the query string. That is not a style
  * preference: anything in `location.search` is sent to the server, logged by
