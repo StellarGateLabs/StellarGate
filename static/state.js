@@ -198,6 +198,51 @@ export function createStore(seed) {
     return update({ cursor: null, activeRow: -1 });
   }
 
+  /**
+   * The payment whose detail drawer is open, or null.
+   *
+   * Selection is stored as an id rather than as a row object so that a refresh
+   * which replaces `loadedPayments` does not leave the drawer pointing at a
+   * stale copy of the row. Resolving the id here keeps that rule in one place.
+   */
+  function selectedPayment() {
+    if (state.selectedPaymentId === null) return null;
+    var rows = state.loadedPayments || [];
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i] && rows[i].id === state.selectedPaymentId) return rows[i];
+    }
+    return null;
+  }
+
+  /** Open the drawer for a payment id, or close it when passed null. */
+  function selectPayment(id) {
+    return update({ selectedPaymentId: id === undefined ? null : id });
+  }
+
+  /**
+   * Append a page of rows and advance the cursor.
+   *
+   * `nextCursor` is whatever the API returned; a null cursor means the last
+   * page has been loaded, which the renderer uses to hide "load more".
+   */
+  function appendPage(rows, nextCursor) {
+    return update({
+      loadedPayments: (state.loadedPayments || []).concat(rows || []),
+      cursor: nextCursor === undefined ? null : nextCursor,
+      loading: false,
+    });
+  }
+
+  /** Replace the loaded rows, e.g. after a filter change or a manual refresh. */
+  function setPayments(rows) {
+    return update({
+      loadedPayments: rows || [],
+      cursor: null,
+      activeRow: -1,
+      loading: false,
+    });
+  }
+
   return {
     get: get,
     update: update,
@@ -206,6 +251,10 @@ export function createStore(seed) {
     visiblePayments: visiblePayments,
     clampActiveRow: clampActiveRow,
     resetPaging: resetPaging,
+    selectedPayment: selectedPayment,
+    selectPayment: selectPayment,
+    appendPage: appendPage,
+    setPayments: setPayments,
   };
 }
 

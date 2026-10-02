@@ -1724,3 +1724,8 @@ Release history is kept in [CHANGELOG.md](CHANGELOG.md).
 ## License
 
 Released under the [MIT License](LICENSE).
+
+## Handsoff notes
+
+<!-- handsoff-issue-680 -->
+- #680: Dashboard: convert promise chains to async/await

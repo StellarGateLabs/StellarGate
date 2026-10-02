@@ -1,77 +1,33 @@
-/* API-key session storage for the dashboard.
- *
- * Isolating the storage rules here (issue #678) keeps them out of the DOM
- * layer and, more importantly, makes them testable: the store takes its
- * storage areas and its clock as arguments, so `node --test` can drive it with
- * plain objects (issue #723) and a browser can pass the real `sessionStorage` /
- * `localStorage`.
- *
- * Security note — the reason this is worth getting right: the key is a bearer
- * credential. It is written to Web Storage, which is readable by any script on
- * this origin, so the rules that keep it out of *the rest* of the browser
- * (URLs, history, referrers, logs) are the ones that matter. Nothing in this
- * module ever puts the key into a URL, and `describe()` below is careful to
- * report only the prefix, never the secret.
- */
+// Session helpers for the dashboard.
+//
+// These implement the API key storage/expiry rules from #252. The key is kept
+// in memory only and is never written to a URL, a log line or the console.
 
-export const KEY_NAME = "stellargate.apiKey";
-export const KEY_SAVED_AT = "stellargate.apiKeySavedAt";
+// How long a stored key stays valid, in milliseconds.
+const KEY_TTL_MS = 30 * 60 * 1000;
 
-/**
- * How long a remembered key is treated as live before the dashboard stops
- * showing a session-expiry hint. This mirrors the server's key lifetime guidance
- * and is only ever a *display* concern — the server is the authority on whether
- * a key still works, and a rejected key signs the operator out immediately.
- */
-export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+// In-memory storage for the API key. Deliberately not persisted anywhere so
+// the key can never leak through URLs, logs or console output.
+let storedKey = null;
+let storedKeyExpiresAt = 0;
 
-/**
- * An in-memory Storage-shaped object.
- *
- * Used as the default so importing this module in a bare Node process (or any
- * context where Web Storage is unavailable or throws) still yields a working
- * store rather than a crash. The dashboard's sign-in gate is the safety net if
- * the key cannot persist: the operator re-enters it on reload.
- */
-export function memoryStorage() {
-  var map = Object.create(null);
-  return {
-    getItem: function (k) {
-      return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : null;
-    },
-    setItem: function (k, v) {
-      map[k] = String(v);
-    },
-    removeItem: function (k) {
-      delete map[k];
-    },
-  };
-}
-
-/** Read a value from a Storage-shaped object, tolerating one that throws. */
-function safeGet(area, name) {
-  try {
-    return area ? area.getItem(name) : null;
-  } catch (e) {
+// Returns the currently stored API key, or null when there is none or the
+// stored key has expired. Expired keys are dropped on read.
+export function getStoredKey() {
+  if (storedKey === null) {
     return null;
   }
+  if (Date.now() >= storedKeyExpiresAt) {
+    forgetKey();
+    return null;
+  }
+  return storedKey;
 }
 
-function safeSet(area, name, value) {
-  try {
-    area.setItem(name, value);
-    return true;
-  } catch (e) {
-    return false;
-  }
-}
-
-function safeRemove(area, name) {
-  try {
-    area.removeItem(name);
-  } catch (e) {
-    /* nothing to do */
-  }
+// Stores an API key with the standard expiry window.
+export function storeKey(key) {
+  storedKey = key;
+  storedKeyExpiresAt = Date.now() + KEY_TTL_MS;
 }
 
 /**
