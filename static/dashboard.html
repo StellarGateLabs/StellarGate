@@ -129,6 +129,15 @@
             <button class="chip" data-status="underpaid" data-label="Underpaid" aria-pressed="false">Underpaid</button>
             <button class="chip" data-status="expired" data-label="Expired" aria-pressed="false">Expired</button>
           </div>
+          <!-- Asset filter: narrows the list to payments for one asset code.
+               "All assets" (empty value) is the default. The options match the
+               gateway's default ACCEPTED_ASSETS (XLM and USDC). -->
+          <label class="small" for="asset-filter">Asset</label>
+          <select id="asset-filter">
+            <option value="">All assets</option>
+            <option value="XLM">XLM</option>
+            <option value="USDC">USDC</option>
+          </select>
           <div class="filters" role="group" aria-label="Filter by creation date">
             <label class="small" for="created-after">From</label>
             <input id="created-after" type="date" />

@@ -72,6 +72,8 @@ export function initialState() {
   return {
     key: null,
     status: "",
+    /** Asset code filter ("XLM", "USDC", …), or "" for all assets. */
+    asset: "",
     search: "",
     pageSize: 25,
     createdAfter: "",

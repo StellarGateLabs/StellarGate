@@ -6,6 +6,51 @@
 // How long a stored key stays valid, in milliseconds.
 const KEY_TTL_MS = 30 * 60 * 1000;
 
+/** The localStorage/sessionStorage key under which the API key is stored. */
+export var KEY_NAME = "stellargate.apiKey";
+
+/** The localStorage/sessionStorage key under which the save timestamp is stored. */
+export var KEY_SAVED_AT = "stellargate.apiKeySavedAt";
+
+/** How long the session-expiry hint window lasts, in milliseconds (30 min). */
+export var SESSION_TTL_MS = KEY_TTL_MS;
+
+/**
+ * A minimal in-memory Storage-like object for environments where the real
+ * Web Storage API is unavailable (Node.js tests, Safari private mode fallback).
+ */
+export function memoryStorage() {
+  var map = Object.create(null);
+  return {
+    getItem: function (k) {
+      return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : null;
+    },
+    setItem: function (k, v) {
+      map[k] = String(v);
+    },
+    removeItem: function (k) {
+      delete map[k];
+    },
+  };
+}
+
+// ── Safe wrappers around Web Storage ─────────────────────────────────────────
+// Safari private mode throws on any access; these keep the rest of the module
+// throw-free. A return of null means "storage unavailable or key absent".
+
+function safeGet(area, key) {
+  try { return area ? area.getItem(key) : null; } catch (e) { return null; }
+}
+
+function safeSet(area, key, value) {
+  try { if (area) { area.setItem(key, value); return true; } return false; }
+  catch (e) { return false; }
+}
+
+function safeRemove(area, key) {
+  try { if (area) area.removeItem(key); } catch (e) { /* non-fatal */ }
+}
+
 // In-memory storage for the API key. Deliberately not persisted anywhere so
 // the key can never leak through URLs, logs or console output.
 let storedKey = null;
@@ -28,6 +73,11 @@ export function getStoredKey() {
 export function storeKey(key) {
   storedKey = key;
   storedKeyExpiresAt = Date.now() + KEY_TTL_MS;
+}
+
+function forgetKey() {
+  storedKey = null;
+  storedKeyExpiresAt = 0;
 }
 
 /**

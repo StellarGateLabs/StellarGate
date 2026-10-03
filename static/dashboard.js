@@ -245,7 +245,7 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     var key = store.get().key;
     if (key) headers.Authorization = "Bearer " + key;
 
-    return fetch(API_BASE + path, { method: opts.method || "GET", headers: headers, body: opts.body || undefined }).then(
+    return fetch(API_BASE + path, { method: opts.method || "GET", headers: headers, body: opts.body || null }).then(
       function (res) {
         if (res.status === 401) {
           signOut("That API key was rejected. Please sign in again.");
@@ -1131,6 +1131,9 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     var auto = $("auto-refresh");
     if (auto) auto.checked = state.autoRefresh;
 
+    var assetEl = $("asset-filter");
+    if (assetEl && assetEl.value !== (state.asset || "")) assetEl.value = state.asset || "";
+
     syncPresetUi();
   }
 
@@ -1286,6 +1289,14 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
       store.update({ autoRefresh: $("auto-refresh").checked });
       onFilterChange();
     });
+
+    var assetFilter = $("asset-filter");
+    if (assetFilter) {
+      assetFilter.addEventListener("change", function () {
+        store.update({ asset: assetFilter.value });
+        onFilterChange();
+      });
+    }
 
     Array.prototype.forEach.call(document.querySelectorAll(".preset"), function (btn) {
       btn.addEventListener("click", function () {
