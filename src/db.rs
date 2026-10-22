@@ -1996,14 +1996,21 @@ mod tests {
             .await
             .expect("update_payment_status should succeed");
         // The join table is empty until a backfill runs.
-        assert_eq!(sum_processed_stroops(&pool, "legacy").await.unwrap(), 0);
+        assert_eq!(
+            sum_processed_stroops(&pool, "legacy")
+                .await
+                .expect("sum_processed_stroops should succeed before backfilling legacy rows"),
+            0
+        );
 
         // A subsequent migrate() (as on the next startup) backfills the ledger.
         migrate(&pool)
             .await
             .expect("migrations should apply cleanly on re-run");
         assert_eq!(
-            sum_processed_stroops(&pool, "legacy").await.unwrap(),
+            sum_processed_stroops(&pool, "legacy")
+                .await
+                .expect("sum_processed_stroops should succeed after backfilling legacy rows"),
             30_000_000
         );
         // And it is idempotent across restarts.
@@ -2011,7 +2018,9 @@ mod tests {
             .await
             .expect("migrations should apply cleanly on re-run");
         assert_eq!(
-            sum_processed_stroops(&pool, "legacy").await.unwrap(),
+            sum_processed_stroops(&pool, "legacy")
+                .await
+                .expect("sum_processed_stroops should succeed after repeated backfill"),
             30_000_000
         );
     }
@@ -2021,7 +2030,7 @@ mod tests {
         let pool = memory_db().await;
         create_payment(&pool, new_payment("p1", "MEMOR2", 3600))
             .await
-            .unwrap();
+            .expect("create_payment should succeed");
         save_webhook_delivery(&pool, "fresh", "p1", "http://x", "{}", "payment.completed")
             .await
             .expect("save_webhook_delivery should succeed");

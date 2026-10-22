@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Legacy processed-stroop tests now include descriptive failure context (#550-#553).**
+  Replaced bare `unwrap()` calls with `expect()` messages describing the
+  expected operation.
+
 - **`main` did not compile, and its newest tests did not pass.** This is not a
   behaviour change; it is the minimum needed to get to a green baseline. None
   of it is mine — every item below landed on `main` in the last few merges.
