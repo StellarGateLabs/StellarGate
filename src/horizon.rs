@@ -1915,7 +1915,10 @@ mod tests {
     fn missing_memo_type_is_ignored() {
         let p = pending("XLM", "10");
         let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
-        hp.transaction.as_mut().unwrap().memo_type = None;
+        hp.transaction
+            .as_mut()
+            .expect("native payment should include a transaction")
+            .memo_type = None;
         assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
     }
 
