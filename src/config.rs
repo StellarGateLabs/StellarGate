@@ -1028,7 +1028,8 @@ mod tests {
     #[test]
     fn validate_webhook_secret_valid() {
         let secret = "a-very-long-and-secure-webhook-signing-secret-32-chars";
-        let res = Config::validate_webhook_secret(Ok(secret.into())).unwrap();
+        let res = Config::validate_webhook_secret(Ok(secret.into()))
+            .expect("valid webhook secret should be accepted");
         assert_eq!(res, secret);
     }
 
