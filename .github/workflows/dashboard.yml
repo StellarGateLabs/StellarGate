@@ -143,7 +143,7 @@ jobs:
           node-version: "22"
 
       - name: Cache Playwright browsers
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/ms-playwright
           key: ${{ runner.os }}-playwright-smoke-${{ hashFiles('e2e/package-lock.json') }}
@@ -201,7 +201,7 @@ jobs:
       # from what CI's `test` job and the Dockerfile build against.
       - uses: dtolnay/rust-toolchain@master
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -221,7 +221,7 @@ jobs:
       # in the resolved version too. Otherwise a Playwright bump would reuse a
       # stale browser download and fail every test with a version mismatch.
       - name: Cache Playwright browsers
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/ms-playwright
           key: ${{ runner.os }}-playwright-${{ hashFiles('e2e/package-lock.json') }}
