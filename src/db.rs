@@ -885,6 +885,81 @@ pub async fn update_payment_status(
     Ok(result.rows_affected() == 1)
 }
 
+/// Whether any on-chain transaction has been credited to `payment_id`.
+///
+/// Used by the cancel path to refuse cancelling an intent that has already
+/// received (partial) payment: the money is real, so the intent must be
+/// settled or left to expire rather than silently voided.
+pub async fn has_processed_transactions(pool: &Db, payment_id: &str) -> Result<bool> {
+    let n: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM processed_transactions WHERE payment_id = ?")
+            .bind(payment_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(n > 0)
+}
+
+/// Outcome of an atomic cancel attempt.
+#[derive(Debug)]
+pub enum CancelOutcome {
+    /// The intent was transitioned `pending` → `cancelled`; carries the row.
+    Cancelled(Payment),
+    /// No intent with that id exists for this merchant.
+    NotFound,
+    /// The intent exists but is not `pending` (already settled, expired, or
+    /// already cancelled).
+    NotPending,
+    /// The intent has at least one credited transaction, so it cannot be
+    /// cancelled without losing track of received funds.
+    HasProcessedTransactions,
+}
+
+/// Cancel a pending payment intent, scoped to its owning merchant.
+///
+/// The status transition uses the same `WHERE … AND status = 'pending'` guard
+/// as [`update_payment_status`], so a concurrent settlement wins the race:
+/// exactly one of the two UPDATEs matches the row, and the loser sees
+/// `rows_affected() == 0`.
+///
+/// An intent with any credited transaction is refused up front — cancelling it
+/// would leave received funds unaccounted for. The check is a read followed by
+/// a guarded write; a transaction credited between the two would still be
+/// recorded against the (now cancelled) intent by the reconciler, which is the
+/// safe outcome: the money is never lost, only the status is closed.
+pub async fn cancel_payment(pool: &Db, id: &str, merchant_id: &str) -> Result<CancelOutcome> {
+    if has_processed_transactions(pool, id).await? {
+        return Ok(CancelOutcome::HasProcessedTransactions);
+    }
+
+    let affected = sqlx::query(
+        "UPDATE payments
+            SET status = 'cancelled',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+          WHERE id = ?
+            AND merchant_id = ?
+            AND status = 'pending'",
+    )
+    .bind(id)
+    .bind(merchant_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    if affected == 0 {
+        // Distinguish "no such intent for this merchant" from "exists but not
+        // pending" with a read-only lookup.
+        return Ok(match get_payment(pool, id).await? {
+            Some(p) if p.merchant_id == merchant_id => CancelOutcome::NotPending,
+            _ => CancelOutcome::NotFound,
+        });
+    }
+
+    let payment = get_payment(pool, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Payment not found after cancel"))?;
+    Ok(CancelOutcome::Cancelled(payment))
+}
+
 /// Record that transaction `tx_hash` operation `operation_index`, worth
 /// `amount_stroops`, has been credited to intent `payment_id`. Returns `true`
 /// when this is the first time the operation was recorded for the intent, and
