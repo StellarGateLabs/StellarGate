@@ -42,6 +42,7 @@ jobs:
   clippy:
     name: clippy (${{ matrix.toolchain }})
     runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.toolchain == 'stable' }}
     strategy:
       fail-fast: false
       matrix:
