@@ -5,13 +5,15 @@
 -- To regenerate: run the schema_snapshot_test and copy the printed statements.
 -- Every statement ends with a lone `;` line as a separator.
 
-CREATE INDEX idx_api_keys_hash ON api_keys(key_hash)
-;
 CREATE INDEX idx_api_keys_merchant ON api_keys(merchant_id)
+;
+CREATE INDEX idx_idempotency_keys_created_at
+         ON idempotency_keys(created_at)
 ;
 CREATE INDEX idx_payments_created_id ON payments(created_at DESC, id DESC)
 ;
-CREATE INDEX idx_payments_memo ON payments(memo)
+CREATE INDEX idx_payments_merchant_created
+         ON payments(merchant_id, created_at DESC, id DESC)
 ;
 CREATE INDEX idx_payments_status ON payments(status)
 ;
@@ -24,6 +26,9 @@ CREATE INDEX idx_webhook_deliveries_payment
 CREATE INDEX idx_webhook_deliveries_redrive
          ON webhook_deliveries(status, attempts, last_attempt, created_at)
          WHERE status IN ('pending', 'failed')
+;
+CREATE INDEX idx_webhook_deliveries_status_activity
+         ON webhook_deliveries(status, last_attempt, created_at)
 ;
 CREATE TABLE api_keys (
             id TEXT PRIMARY KEY,
