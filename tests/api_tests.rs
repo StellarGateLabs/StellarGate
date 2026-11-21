@@ -1770,7 +1770,7 @@ async fn test_cannot_revoke_the_last_active_key() {
         .delete(&format!("/merchants/{merchant_id}/keys/{key_id}"))
         .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
         .await;
-    res.assert_status(StatusCode::BAD_REQUEST);
+    res.assert_status(StatusCode::CONFLICT);
     assert_eq!(res.json::<Value>()["code"], "last_active_key");
 
     // And it really is still usable.

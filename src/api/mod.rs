@@ -785,7 +785,7 @@ async fn revoke_api_key(
                 Json(json!({ "key_id": key_id, "revoked": true })),
             ))
         }
-        db::RevokeKeyOutcome::LastActiveKey => Err(AppError::bad_request(
+        db::RevokeKeyOutcome::LastActiveKey => Err(AppError::conflict(
             "last_active_key",
             "cannot revoke a merchant's only active key — issue a replacement first",
         )),

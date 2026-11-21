@@ -600,8 +600,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RevokeApiKeyResponse"
-        "400":
-          description: This is the merchant's only active key
+        "409":
+          description: This is the merchant's only active key (conflict with current resource state)
           content:
             application/json:
               schema:
@@ -664,8 +664,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RevokeApiKeyResponse"
-        "400":
-          description: This is the merchant's only active key
+        "409":
+          description: This is the merchant's only active key (conflict with current resource state)
           content:
             application/json:
               schema:
@@ -869,13 +869,21 @@ paths:
           schema:
             type: string
             format: date-time
-          description: Inclusive lower bound on payment created_at (UTC).
+          description: >-
+            Inclusive lower bound on `created_at` (RFC 3339, e.g.
+            `2024-01-01T00:00:00Z`). UTC offsets are accepted and converted.
+            Non-RFC-3339 values return `400 invalid_query`. A value later than
+            `created_before` returns `400 invalid_range`.
         - name: created_before
           in: query
           schema:
             type: string
             format: date-time
-          description: Inclusive upper bound on payment created_at (UTC).
+          description: >-
+            Inclusive upper bound on `created_at` (RFC 3339, e.g.
+            `2024-12-31T23:59:59Z`). UTC offsets are accepted and converted.
+            Non-RFC-3339 values return `400 invalid_query`. A value earlier than
+            `created_after` returns `400 invalid_range`.
         - name: include_total
           in: query
           schema:
@@ -930,6 +938,16 @@ paths:
                   value:
                     error: "limit must be between 1 and 100 (got 5000)"
                     code: invalid_limit
+                invalid_query:
+                  summary: Unparseable date filter
+                  value:
+                    error: "created_after must be an RFC 3339 timestamp (e.g. 2024-01-01T00:00:00Z)"
+                    code: invalid_query
+                invalid_range:
+                  summary: created_after later than created_before
+                  value:
+                    error: "created_after must not be later than created_before"
+                    code: invalid_range
                 unknown_parameter:
                   summary: Unrecognised query parameter
                   value:

@@ -156,8 +156,9 @@ async fn offset_pagination_returns_each_row_exactly_once_within_one_second() {
 }
 
 /// API keys must never be persisted in a recoverable form (issue #462): the
-/// only representation stored in either `merchants.api_key_hash` (legacy) or
-/// `api_keys.key_hash` (current) is a SHA-256 digest of the raw key.
+/// only representation stored in `api_keys.key_hash` (current) is a SHA-256
+/// digest of the raw key.  New merchants leave `merchants.api_key_hash` as
+/// NULL (issue #1004); authentication goes exclusively through `api_keys`.
 #[tokio::test]
 async fn api_keys_are_stored_hashed_not_plaintext() {
     let pool = SqlitePoolOptions::new()
@@ -182,16 +183,16 @@ async fn api_keys_are_stored_hashed_not_plaintext() {
         hex::encode(Sha256::digest(raw_key.as_bytes()))
     };
 
-    let merchant_hash: String =
+    // New merchants must leave merchants.api_key_hash as NULL (issue #1004).
+    let merchant_hash: Option<String> =
         sqlx::query_scalar("SELECT api_key_hash FROM merchants WHERE id = 'm1'")
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_ne!(
-        merchant_hash, raw_key,
-        "merchants.api_key_hash must not store the raw key"
+    assert!(
+        merchant_hash.is_none(),
+        "merchants.api_key_hash must be NULL for new merchants (got {merchant_hash:?})"
     );
-    assert_eq!(merchant_hash, expected_digest);
 
     let key_hash: String =
         sqlx::query_scalar("SELECT key_hash FROM api_keys WHERE merchant_id = 'm1'")

@@ -1204,6 +1204,48 @@ pub async fn list_webhook_deliveries(pool: &Db, payment_id: &str) -> Result<Vec<
     Ok(rows.iter().map(row_to_webhook_delivery).collect())
 }
 
+/// Return the latest delivery status for each payment in `payment_ids`,
+/// fetching only `payment_id` and `status` (not the full payload blobs).
+/// Payments with no delivery rows are absent from the result.
+pub async fn latest_webhook_status_for_payments(
+    pool: &Db,
+    payment_ids: &[&str],
+) -> Result<std::collections::HashMap<String, String>> {
+    if payment_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    // Build a single query with an IN-list.  SQLite has a default
+    // SQLITE_LIMIT_VARIABLE_NUMBER of 999; a page is capped at 100 rows so
+    // this is always safe.
+    let placeholders = payment_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT payment_id, status
+           FROM webhook_deliveries AS wd
+          WHERE payment_id IN ({placeholders})
+            AND created_at = (
+                  SELECT MAX(created_at) FROM webhook_deliveries
+                   WHERE payment_id = wd.payment_id
+                )"
+    );
+    let mut q = sqlx::query(&sql);
+    for id in payment_ids {
+        q = q.bind(id);
+    }
+    let rows = q.fetch_all(pool).await?;
+    let mut map = std::collections::HashMap::with_capacity(rows.len());
+    for row in &rows {
+        use sqlx::Row;
+        let pid: String = row.get("payment_id");
+        let status: String = row.get("status");
+        map.insert(pid, status);
+    }
+    Ok(map)
+}
+
 /// Get a specific webhook delivery by id.
 pub async fn get_webhook_delivery(pool: &Db, id: &str) -> Result<Option<WebhookDelivery>> {
     let row = sqlx::query(
@@ -1275,16 +1317,14 @@ fn hash_api_key(raw: &str) -> String {
 ///
 /// The raw key must be shown to the caller once; it is not recoverable.
 ///
-/// `merchants.api_key_hash` is written for backward compatibility with
-/// databases created before `api_keys` existed; the column is nullable and
-/// nothing reads it any more — authentication goes through `api_keys` so that
-/// rotation and revocation work — and it is not maintained as keys change.
+/// `merchants.api_key_hash` exists only for backward compatibility with
+/// databases created before `api_keys` became the source of truth.  New
+/// merchants leave it NULL; authentication goes exclusively through `api_keys`.
 pub async fn create_merchant(pool: &Db, id: &str, raw_key: &str, prefix: &str) -> Result<String> {
     let mut tx = pool.begin().await?;
 
-    sqlx::query("INSERT INTO merchants (id, api_key_hash) VALUES (?, ?)")
+    sqlx::query("INSERT INTO merchants (id) VALUES (?)")
         .bind(id)
-        .bind(hash_api_key(raw_key))
         .execute(&mut *tx)
         .await?;
 
