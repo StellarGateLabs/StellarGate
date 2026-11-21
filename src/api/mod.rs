@@ -20,13 +20,45 @@ use std::time::Duration;
 use tower_http::{
     cors::CorsLayer,
     limit::RequestBodyLimitLayer,
-    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    request_id::{MakeRequestId, MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     set_header::SetResponseHeaderLayer,
     timeout::TimeoutLayer,
     trace::TraceLayer,
 };
 
 mod payments;
+
+/// Maximum byte length of a caller-supplied `X-Request-Id` we will trust.
+/// Values longer than this are replaced with a generated UUID (issue #1009).
+const REQUEST_ID_MAX_LEN: usize = 64;
+
+/// A `MakeRequestId` that validates an incoming `X-Request-Id` before
+/// keeping it. A well-formed value (≤ 64 characters of `[A-Za-z0-9._-]`) is
+/// preserved as-is. Any other value — overlong, containing disallowed
+/// characters, or absent — is replaced with a fresh UUID so audit log lines
+/// are never flooded with attacker-controlled data (issue #1009).
+#[derive(Clone, Default)]
+struct MakeValidatedRequestId;
+
+impl MakeRequestId for MakeValidatedRequestId {
+    fn make_request_id<B>(&mut self, req: &axum::http::Request<B>) -> Option<tower_http::request_id::RequestId> {
+        // Check whether the caller supplied a value that passes validation.
+        if let Some(existing) = req.headers().get("x-request-id") {
+            if let Ok(s) = existing.to_str() {
+                if s.len() <= REQUEST_ID_MAX_LEN
+                    && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+                {
+                    // Well-formed: keep it. Return None so SetRequestIdLayer
+                    // leaves the existing header value in place.
+                    return None;
+                }
+            }
+            // Malformed or overlong: fall through to generate a fresh UUID.
+        }
+        // No value, or invalid value: generate a UUID.
+        MakeRequestUuid.make_request_id(req)
+    }
+}
 
 /// Reject request bodies larger than this (256 KiB) before they hit a handler.
 const MAX_BODY_BYTES: usize = 256 * 1024;
@@ -215,17 +247,17 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .fallback(not_found)
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(TraceLayer::new_for_http())
-        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+        .layer(SetRequestIdLayer::x_request_id(MakeValidatedRequestId))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(
             rate_limit,
             rate_limit_middleware,
         ))
-        .layer(cors)
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             request_timeout,
         ))
+        .layer(cors)
         /* Baseline security headers on every response, not just the static
         dashboard assets. Every JSON response — a payment record, a freshly
         minted API key, a webhook URL — was previously sent with no headers
@@ -379,19 +411,21 @@ fn api_v1(
         auth_middleware,
     ));
 
-    axum::Router::new().nest("/merchants", merchants).nest(
-        "/payments",
-        axum::Router::new()
-            .merge(payments_authed)
-            .merge(redeliver)
-            .route("/summary", summary)
-            /* `get_by_id` handles its own credential check, because it serves
-            both authenticated and anonymous callers — a payer confirming their
-              own payment has no API key. See `payments::get_by_id`. */
-            .route("/{id}", get(payments::get_by_id)),
-    )
+    axum::Router::new()
+        .nest("/merchants", merchants)
+        .route("/assets", get(list_assets))
+        .nest(
+            "/payments",
+            axum::Router::new()
+                .merge(payments_authed)
+                .merge(redeliver)
+                .route("/summary", summary)
+                /* `get_by_id` handles its own credential check, because it serves
+                both authenticated and anonymous callers — a payer confirming their
+                  own payment has no API key. See `payments::get_by_id`. */
+                .route("/{id}", get(payments::get_by_id)),
+        )
 }
-
 /// Tag a response served from an unversioned path as deprecated.
 ///
 /// `Deprecation` and `Link: rel="successor-version"` are the RFC 8594 /
@@ -1363,6 +1397,26 @@ async fn network_info(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({ "network": state.config.network }))
 }
 
+/// `GET /v1/assets` — list the asset codes and issuers this gateway accepts.
+///
+/// Unauthenticated, like `/network`, because it exposes nothing
+/// merchant-specific. Integrators need this to build SEP-7 URIs and populate
+/// checkout forms without hard-coding asset codes (issue #1011).
+async fn list_assets(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let assets: Vec<Value> = state
+        .config
+        .accepted_assets
+        .iter()
+        .map(|a| {
+            json!({
+                "code": a.code,
+                "issuer": a.issuer,
+            })
+        })
+        .collect();
+    Json(json!(assets))
+}
+
 async fn dashboard_i18n(headers: HeaderMap) -> Response {
     dashboard_asset(DASHBOARD_I18N_JS, "text/javascript; charset=utf-8", &headers)
 }
@@ -1925,6 +1979,141 @@ mod tests {
                 .await
                 .assert_status(StatusCode::UNAUTHORIZED);
         }
+    }
+
+    // ── MakeValidatedRequestId (issue #1009) ────────────────────────────────
+
+    #[test]
+    fn valid_request_id_is_preserved() {
+        // A well-formed id stays; MakeValidatedRequestId returns None to leave
+        // the existing header in place.
+        let mut maker = MakeValidatedRequestId;
+        let req = Request::builder()
+            .header("x-request-id", "abc-123_ok.id")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        // Well-formed → no replacement generated (returns None).
+        assert!(
+            maker.make_request_id(&req).is_none(),
+            "a valid x-request-id must not be replaced"
+        );
+    }
+
+    #[test]
+    fn oversized_request_id_is_replaced() {
+        let mut maker = MakeValidatedRequestId;
+        let long_id = "a".repeat(REQUEST_ID_MAX_LEN + 1);
+        let req = Request::builder()
+            .header("x-request-id", &long_id)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        // Oversized → a fresh UUID is returned.
+        assert!(
+            maker.make_request_id(&req).is_some(),
+            "an oversized x-request-id must be replaced with a generated UUID"
+        );
+    }
+
+    #[test]
+    fn malformed_request_id_is_replaced() {
+        let mut maker = MakeValidatedRequestId;
+        // Contains a space and angle brackets — invalid characters.
+        let req = Request::builder()
+            .header("x-request-id", "<injected log line>")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(
+            maker.make_request_id(&req).is_some(),
+            "a malformed x-request-id must be replaced with a generated UUID"
+        );
+    }
+
+    #[test]
+    fn missing_request_id_generates_new_uuid() {
+        let mut maker = MakeValidatedRequestId;
+        let req = Request::builder()
+            .body(axum::body::Body::empty())
+            .unwrap();
+        // No header present → a fresh UUID is returned.
+        assert!(
+            maker.make_request_id(&req).is_some(),
+            "a missing x-request-id must result in a generated UUID"
+        );
+    }
+
+    // ── GET /v1/assets (issue #1011) ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn assets_endpoint_returns_configured_allow_list() {
+        use crate::config::AcceptedAsset;
+
+        let mut cfg = header_test_config("testnet");
+        cfg.accepted_assets = vec![
+            AcceptedAsset {
+                code: "XLM".into(),
+                issuer: None,
+            },
+            AcceptedAsset {
+                code: "USDC".into(),
+                issuer: Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into()),
+            },
+        ];
+        let state = header_test_state_with_config(cfg).await;
+        let server = TestServer::new(router(state));
+
+        let res = server.get("/v1/assets").await;
+        res.assert_status_ok();
+
+        let body: serde_json::Value = res.json();
+        let arr = body.as_array().expect("/v1/assets must return a JSON array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["code"], "XLM");
+        assert!(arr[0]["issuer"].is_null());
+        assert_eq!(arr[1]["code"], "USDC");
+        assert_eq!(
+            arr[1]["issuer"],
+            "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+        );
+    }
+
+    // ── Timeout inside CORS (issue #1008) ───────────────────────────────────
+
+    /// A timed-out request from an allowed origin must carry CORS headers
+    /// so a browser can read the 408 instead of seeing an opaque network error.
+    #[tokio::test]
+    async fn timeout_response_carries_cors_headers() {
+        use tower_http::cors::CorsLayer;
+
+        // Build a minimal router that mirrors the layer order in `router()`:
+        // TimeoutLayer sits *inside* CorsLayer.
+        let test_router = axum::Router::new()
+            .route(
+                "/slow",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    "done"
+                }),
+            )
+            .layer(TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                Duration::from_millis(20),
+            ))
+            .layer(CorsLayer::permissive());
+
+        let server = TestServer::new(test_router);
+        let res = server
+            .get("/slow")
+            .add_header(
+                axum::http::header::ORIGIN,
+                "https://dashboard.example.com",
+            )
+            .await;
+        res.assert_status(StatusCode::REQUEST_TIMEOUT);
+        // CorsLayer must have added the ACAO header because it wraps TimeoutLayer.
+        assert!(
+            res.contains_header(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            "408 from a timed-out request must include Access-Control-Allow-Origin"
+        );
     }
 }
 
