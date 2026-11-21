@@ -1315,6 +1315,42 @@ paths:
                     type: string
                     example: testnet
 
+  /assets:
+    get:
+      operationId: listAssets
+      summary: List accepted assets
+      description: >-
+        Returns the asset codes and issuers this gateway is configured to accept.
+        Unauthenticated. Use this to populate checkout forms and build SEP-7 URIs
+        without hard-coding asset codes.
+      responses:
+        "200":
+          description: Array of accepted assets
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  required: [code, issuer]
+                  properties:
+                    code:
+                      type: string
+                      description: Asset code (e.g. XLM, USDC)
+                      example: USDC
+                    issuer:
+                      type: string
+                      nullable: true
+                      description: >-
+                        Stellar account ID of the asset issuer, or null for XLM
+                        (which has no issuer).
+                      example: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+              example:
+                - code: XLM
+                  issuer: null
+                - code: USDC
+                  issuer: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+
 
 components:
   headers:

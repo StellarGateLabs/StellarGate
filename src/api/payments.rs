@@ -373,6 +373,7 @@ pub async fn create(
 /// previously leaked which merchant an id belonged to and how much it was for.
 pub async fn get_by_id(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
@@ -384,20 +385,42 @@ pub async fn get_by_id(
         return Ok(Json(public_view(&payment)));
     };
 
+    let source_ip =
+        super::client_ip_key_from_parts(Some(peer), &headers, &state.config.trusted_proxy_cidrs);
+
     /* A credential was offered, so honour it rather than silently falling back
     to the public view — a typo'd or revoked key should say so, not quietly
-    return less data and leave the caller wondering why fields are missing. */
+    return less data and leave the caller wondering why fields are missing.
+    Auth outcomes are logged and counted the same way auth_middleware does it
+    so probing keys on this route is visible in logs/metrics (issue #1010). */
     match db::find_merchant_by_key(&state.pool, &key).await? {
-        Some(merchant_id) if merchant_id == payment.merchant_id => Ok(Json(to_json(&payment))),
-        Some(_) => Err(AppError::not_found(
-            "payment_not_found",
-            "payment not found",
-        )),
-        None => Err(AppError::new(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "missing or invalid Authorization header",
-        )),
+        Some(merchant_id) if merchant_id == payment.merchant_id => {
+            tracing::debug!(%source_ip, %merchant_id, "auth succeeded");
+            state.auth_metrics.record_success();
+            Ok(Json(to_json(&payment)))
+        }
+        Some(_) => {
+            tracing::warn!(
+                %source_ip,
+                reason = "invalid_key",
+                "auth denied: API key did not match any merchant"
+            );
+            state.auth_metrics.record_failure_invalid_key();
+            Err(AppError::not_found("payment_not_found", "payment not found"))
+        }
+        None => {
+            tracing::warn!(
+                %source_ip,
+                reason = "invalid_key",
+                "auth denied: API key did not match any merchant"
+            );
+            state.auth_metrics.record_failure_invalid_key();
+            Err(AppError::new(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "missing or invalid Authorization header",
+            ))
+        }
     }
 }
 
