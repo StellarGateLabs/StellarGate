@@ -648,7 +648,7 @@ paths:
                 invalid_status:
                   summary: Invalid status filter
                   value:
-                    error: "invalid status 'foo'; valid: pending, completed, underpaid, expired"
+                    error: "invalid status 'foo'; valid: pending, completed, underpaid, expired, cancelled"
                     code: invalid_status
                 invalid_cursor:
                   summary: Invalid cursor
@@ -873,6 +873,83 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/payments/{id}/cancel:
+    post:
+      operationId: cancelPayment
+      summary: Cancel a pending payment intent
+      description: >-
+        Transitions a `pending` intent to `cancelled`, so its address+memo pair
+        stops being payable before the TTL elapses — for an abandoned checkout,
+        a duplicate intent, or a fraud-flagged order. Scoped to the owning
+        merchant: another merchant's key gets `404`, the same answer an unknown
+        id gets.
+
+
+        The transition is guarded on `status = 'pending'`, so a concurrent
+        settlement wins the race: if the intent was paid (or expired) between
+        the read and the update, this returns `409 payment_not_pending` rather
+        than cancelling a paid intent.
+
+
+        An intent with any `processed_transactions` rows — a partial payment —
+        is refused with `409 payment_has_processed_transactions`. Money has
+        already arrived, so it is not silently discarded; let it settle or
+        expire on its own.
+
+
+        A successful cancellation emits a `payment.cancelled` webhook.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+      responses:
+        "200":
+          description: Payment cancelled
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Payment"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: >-
+            No such payment, or it belongs to another merchant — the two are
+            deliberately indistinguishable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                payment_not_found:
+                  summary: Payment not found
+                  value:
+                    error: payment not found
+                    code: payment_not_found
+        "409":
+          description: >-
+            The intent is not in a cancellable state, or it has already
+            received funds.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                payment_not_pending:
+                  summary: Intent already settled or expired
+                  value:
+                    error: "payment is not pending (status: completed)"
+                    code: payment_not_pending
+                payment_has_processed_transactions:
+                  summary: Intent has received a partial payment
+                  value:
+                    error: >-
+                      payment has processed transactions and cannot be
+                      cancelled
+                    code: payment_has_processed_transactions
 
   /v1/payments/{id}/webhooks:
     get:
@@ -1167,6 +1244,61 @@ paths:
                 $ref: "#/components/schemas/Payment"
         "404":
           $ref: "#/components/responses/DeprecatedNotFound"
+
+  /payments/{id}/cancel:
+    post:
+      operationId: cancelPaymentLegacy
+      summary: Cancel a pending payment intent (deprecated)
+      description: Deprecated alias of `POST /v1/payments/{id}/cancel`.
+      deprecated: true
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+      responses:
+        "200":
+          description: Payment cancelled
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            Deprecation:
+              $ref: "#/components/headers/Deprecation"
+            Link:
+              $ref: "#/components/headers/Link"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Payment"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/DeprecatedNotFound"
+        "409":
+          description: >-
+            The intent is not in a cancellable state, or it has already
+            received funds.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            Deprecation:
+              $ref: "#/components/headers/Deprecation"
+            Link:
+              $ref: "#/components/headers/Link"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                payment_not_pending:
+                  summary: Intent already settled or expired
+                  value:
+                    error: "payment is not pending (status: completed)"
+                    code: payment_not_pending
+                payment_has_processed_transactions:
+                  summary: Intent has received a partial payment
+                  value:
+                    error: >-
+                      payment has processed transactions and cannot be
+                      cancelled
+                    code: payment_has_processed_transactions
 
   /payments/{id}/webhooks:
     get:
@@ -1696,7 +1828,7 @@ components:
 
     PaymentStatus:
       type: string
-      enum: [pending, completed, underpaid, expired]
+      enum: [pending, completed, underpaid, expired, cancelled]
 
     Payment:
       type: object
@@ -2002,6 +2134,7 @@ components:
             conflicting_pagination, payment_not_found,
             delivery_not_found, rate_limit_exceeded, not_found, webhook_target_blocked,
             webhook_delivery_failed, idempotency_conflict, merchant_not_found,
-            invalid_label, last_active_key, trustline_missing, and
+            invalid_label, last_active_key, trustline_missing,
+            payment_not_pending, payment_has_processed_transactions, and
             key_not_found.
           example: invalid_amount

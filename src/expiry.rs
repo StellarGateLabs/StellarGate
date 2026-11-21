@@ -8,6 +8,12 @@
 //!
 //! Expiry is purely time- and database-driven, so the sweeper runs even when no
 //! Stellar gateway is configured (unlike the Horizon poller).
+//!
+//! `cancelled` is another terminal state (see `POST /v1/payments/:id/cancel`).
+//! A cancelled intent is no longer `pending`, so `db::expire_overdue` — which
+//! only selects rows with `status = 'pending'` — never touches it: the sweeper
+//! must not re-expire a cancelled intent or fire a spurious `payment.expired`.
+=======
 
 use crate::supervise::TaskExit;
 use crate::{AppState, db, webhook};

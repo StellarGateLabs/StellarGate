@@ -41,6 +41,10 @@ impl AppError {
     pub fn not_found(code: &'static str, message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, code, message)
     }
+
+    pub fn conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, code, message)
+    }
 }
 
 impl IntoResponse for AppError {
@@ -436,10 +440,17 @@ const DEFAULT_LIMIT: i64 = 20;
 const MAX_LIMIT: i64 = 100;
 /// Statuses a payment can actually hold, and therefore the only ones worth
 /// filtering on: `pending` at creation, `completed`/`underpaid` from
-/// settlement (`horizon::settle`), and `expired` from the TTL sweeper
-/// (`db::expire_overdue`). Nothing writes any other value, so anything else is
-/// a guaranteed-empty filter and is rejected as invalid.
-const VALID_STATUSES: [&str; 4] = ["pending", "completed", "underpaid", "expired"];
+/// settlement (`horizon::settle`), `expired` from the TTL sweeper
+/// (`db::expire_overdue`), and `cancelled` from the merchant-initiated cancel
+/// endpoint (`cancel` below). Nothing writes any other value, so anything else
+/// is a guaranteed-empty filter and is rejected as invalid.
+const VALID_STATUSES: [&str; 5] = [
+    "pending",
+    "completed",
+    "underpaid",
+    "expired",
+    "cancelled",
+];
 
 pub async fn list(
     State(state): State<Arc<AppState>>,
@@ -519,6 +530,46 @@ pub async fn list(
             "next_cursor": next_cursor,
         })))
     }
+}
+
+/// `POST /payments/:id/cancel` — merchant-initiated cancellation of a pending
+/// intent.
+///
+/// A live intent is a funded, watched address+memo pair: money can still
+/// arrive against it, so an abandoned checkout, a duplicate, or a
+/// fraud-flagged order must be closable before the TTL elapses. The
+/// transition is guarded in the database (`WHERE ... AND status = 'pending'`),
+/// so a concurrent settlement wins the race and this returns `409` rather than
+/// overwriting a paid intent. An intent that already has any
+/// `processed_transactions` rows — i.e. a partial payment has landed — is
+/// likewise refused, so funds are never silently stranded.
+pub async fn cancel(
+    State(state): State<Arc<AppState>>,
+    Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let payment = match db::cancel_payment(&state.pool, &id, &merchant_id).await? {
+        db::CancelOutcome::Cancelled(payment) => payment,
+        db::CancelOutcome::NotFound => {
+            return Err(AppError::not_found("payment_not_found", "payment not found"));
+        }
+        db::CancelOutcome::NotPending => {
+            return Err(AppError::conflict(
+                "payment_not_pending",
+                "payment is not pending and cannot be cancelled",
+            ));
+        }
+        db::CancelOutcome::HasProcessedTransactions => {
+            return Err(AppError::conflict(
+                "payment_has_processed_transactions",
+                "payment has received a partial payment and cannot be cancelled",
+            ));
+        }
+    };
+
+    crate::webhook::dispatch(&state, &payment, "payment.cancelled", None).await;
+
+    Ok(Json(to_json(&payment)))
 }
 
 pub async fn summary(

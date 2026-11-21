@@ -76,6 +76,7 @@ A payment is matched on three independent attributes — **memo**, **destination
 | Payment verification | ✅ | Memo + destination + asset + exact stroop amount |
 | Over/underpayment handling | ✅ | Distinct statuses and events; underpaid intents accept a top-up |
 | Intent expiry | ✅ | Configurable TTL with a `payment.expired` event |
+| Intent cancellation | ✅ | `POST /payments/:id/cancel` closes a pending intent with a `payment.cancelled` event |
 | Signed webhooks | ✅ | Timestamped HMAC-SHA256, replay-resistant |
 | Webhook redrive | ✅ | Background worker recovers deliveries lost to a crash |
 | Delivery inspection | ✅ | List attempts and manually redeliver |
@@ -565,7 +566,7 @@ client's payment quota, or vice versa. The client IP is resolved per
 
 | Bucket | Routes | Quota |
 |---|---|---|
-| `payments` | `POST /payments` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
+| `payments` | `POST /payments`, `POST /payments/:id/cancel` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
 | `merchants` | `POST /merchants` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
 | `redeliver` | `POST /payments/:id/webhooks/:delivery_id/redeliver` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
 | `default` | everything else, including all other `GET` routes | `RATE_LIMIT_REQUESTS_PER_SEC` × 5 |
@@ -771,6 +772,8 @@ later would silently change the behaviour of requests that appeared to work.
 | `conflicting_pagination` | `400` | `cursor` and `offset` were sent together |
 | `invalid_limit` | `400` | `limit` is outside `1..=PAGINATION_MAX_LIMIT` |
 | `payment_not_found` | `404` | No such payment, or it belongs to another merchant |
+| `payment_not_pending` | `409` | Cancel refused: the intent is not `pending` (already settled, expired, or cancelled) |
+| `payment_has_processed_transactions` | `409` | Cancel refused: the intent has processed on-chain transactions (e.g. a partial payment) |
 | `merchant_not_found` | `404` | No merchant with that id |
 | `key_not_found` | `404` | No active key with that id for this merchant |
 | `last_active_key` | `400` | Refused: would revoke a merchant's only usable key |
@@ -1032,6 +1035,52 @@ browser history, so treat anything on that response as effectively public.
 | `completed` | Fully paid (includes overpayment) |
 | `underpaid` | Partially paid; still watched for a top-up |
 | `expired` | TTL elapsed before payment arrived; no longer watched |
+| `cancelled` | Cancelled by the merchant before any payment was processed; no longer watched |
+
+---
+
+### `POST /payments/:id/cancel`
+
+Cancel a `pending` payment intent. Requires the owning merchant's API key.
+
+A live intent is not inert — it is a funded, watched address and memo pair. Until
+it is cancelled or expires, a payer who returns to a stale tab or a saved QR code
+can still pay it, and the memo stays reserved. Cancelling closes the door
+immediately instead of waiting out `PAYMENT_TTL_SECS`.
+
+```bash
+curl -X POST http://localhost:3000/v1/payments/$ID/cancel \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+**`200 OK`**
+
+```json
+{
+  "id": "a1b2c3d4-...",
+  "status": "cancelled",
+  "updated_at": "2026-04-29T15:05:00Z"
+}
+```
+
+A `payment.cancelled` webhook is emitted to the intent's `webhook_url`.
+
+| Outcome | Response |
+|---|---|
+| Cancelled | `200` — status is now `cancelled` |
+| No such payment, or another merchant's | `404 payment_not_found` |
+| Intent is not `pending` (already `completed`, `underpaid`, `expired`, or `cancelled`) | `409 payment_not_pending` |
+| Intent has any processed on-chain transaction (e.g. a partial payment) | `409 payment_has_processed_transactions` |
+
+> **Races are safe.** The transition is a single guarded
+> `UPDATE ... WHERE id = ? AND status = 'pending'`, so a settlement that lands
+> concurrently wins and the cancel returns `409 payment_not_pending` rather than
+> overwriting a paid intent.
+>
+> **A partially paid intent cannot be cancelled silently.** If any
+> `processed_transactions` row exists for the intent, cancellation is refused
+> with `409 payment_has_processed_transactions` — the merchant must reconcile the
+> received funds first.
 
 ---
 
@@ -1042,7 +1091,7 @@ List the authenticated merchant's payments, newest first. Supports **cursor**
 
 | Param | Description | Default |
 |---|---|---|
-| `status` | Filter by `pending`, `completed`, `underpaid`, or `expired` | all |
+| `status` | Filter by `pending`, `completed`, `underpaid`, `expired`, or `cancelled` | all |
 | `limit` | Page size, 1–100. Outside that range: `400 invalid_limit`. | `20` |
 | `cursor` | Keyset cursor from a previous `next_cursor`. Mutually exclusive with `offset`. | — |
 | `offset` | Rows to skip (legacy; prefer `cursor`). Capped at `10000` — above that, `400 invalid_offset`. Mutually exclusive with `cursor`. | `0` |
@@ -1365,9 +1414,16 @@ Every on-chain payment matched by memo, destination, and asset resolves as follo
 | Top-up reaching exactly the total | `completed` | `payment.completed` | — |
 | Top-up exceeding the total | `completed` | `payment.overpaid` | cumulative excess |
 | TTL elapsed, unpaid | `expired` | `payment.expired` | — |
+| Cancelled by the merchant via `POST /payments/:id/cancel` | `cancelled` | `payment.cancelled` | — |
 | Paid **on time**, but the TTL passed before the sweeper ran | as paid (`completed`, or `underpaid` for a partial payment) | as paid | as paid |
 | Paid **after** the TTL, before the sweeper ran | unchanged (`pending`/`underpaid`); the sweeper then sets `expired` | `payment.unexpected` (then `payment.expired` on the sweep) | unexpected amount to refund |
-| Payment after `completed` or `expired` | unchanged | `payment.unexpected` | unexpected amount to refund |
+| Payment after `completed`, `expired`, or `cancelled` | unchanged | `payment.unexpected` | unexpected amount to refund |
+
+`cancelled` is a **terminal** state reachable only through the cancel endpoint —
+never through settlement or expiry. An intent with any processed transaction
+cannot be cancelled (`409 payment_has_processed_transactions`), so a partially
+paid intent always resolves as `underpaid`/`completed` rather than being closed
+under funds already received.
 
 **Overpayment** fulfils the intent. The `delta` field carries the excess; refunding it is the merchant's responsibility — the gateway cannot send funds.
 
@@ -1392,7 +1448,8 @@ When a payment reaches a terminal state, StellarGate POSTs a signed JSON event t
 | `payment.overpaid` | Cumulative received exceeds it (`delta` = excess, `full` detail only) |
 | `payment.underpaid` | Payment received but short (`delta` = shortfall, `full` detail only) |
 | `payment.expired` | TTL elapsed with no payment |
-| `payment.unexpected` | Payment received after intent is already `completed` or `expired` (`delta` = the unexpected amount the merchant must refund) |
+| `payment.cancelled` | Merchant cancelled the intent via `POST /payments/:id/cancel` |
+| `payment.unexpected` | Payment received after intent is already `completed`, `expired`, or `cancelled` (`delta` = the unexpected amount the merchant must refund) |
 
 ### Payload detail
 
@@ -1489,6 +1546,7 @@ function handleWebhook(rawBody, headers, secret) {
     case "payment.overpaid":  /* fulfil, then refund `delta` */ break;
     case "payment.underpaid": /* await top-up of `delta` */ break;
     case "payment.expired":   /* release the cart */ break;
+    case "payment.cancelled": /* stop watching; do not fulfil */ break;
   }
 }
 ```
@@ -1569,7 +1627,7 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 | `stellargate_horizon_cursor_age_seconds` | gauge | Age of the most recently processed Horizon payment record — the sharpest signal of payment-detection lag |
 | `stellargate_http_requests_total` | counter | HTTP requests, labelled by `method`, matched `route` (never the raw path — bounded cardinality), and `status` |
 | `stellargate_http_request_duration_seconds` | histogram | HTTP request latency, labelled by `method` and matched `route` |
-| `stellargate_payments_total` | counter | Payments labelled by lifecycle `status` (`created`, `completed`, `overpaid`, `underpaid`, `expired`) |
+| `stellargate_payments_total` | counter | Payments labelled by lifecycle `status` (`created`, `completed`, `overpaid`, `underpaid`, `expired`, `cancelled`) |
 | `stellargate_payment_settlement_latency_seconds` | histogram | Time from payment creation to a settlement outcome |
 | `stellargate_db_pool_connections` | gauge | SQLite connection pool size, labelled by `state` (`idle`, `in_use`) |
 | `stellargate_db_pool_max_connections` | gauge | Configured maximum pool size |
@@ -1625,6 +1683,7 @@ Plus an id for whatever the event is about (`payment_id`, `delivery_id`, `key_id
 | `action` | Emitted from | Notes |
 |---|---|---|
 | `payment.create` | `POST /payments` | Also carries `amount` and `asset`. |
+| `payment.cancel` | `POST /payments/:id/cancel` | `outcome` is `cancelled`. |
 | `webhook.redeliver` | `POST /payments/:id/webhooks/:delivery_id/redeliver` | `outcome` is the delivery result (`delivered`/`failed`), not whether the redelivery request itself was accepted. |
 | `webhook.redeliver_bulk` | `POST /payments/webhooks/redeliver` | Carries `requeued`, the count of deliveries reset to `pending`. |
 | `merchant.provision` | `POST /merchants` | Previously logged only on failure — the single most privileged operation (it mints a credential) now leaves a trace on success too. |

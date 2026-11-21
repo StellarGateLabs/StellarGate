@@ -535,6 +535,62 @@ async fn redrive_skips_deliveries_still_within_grace_window() {
     assert_eq!(delivery.attempts, 0);
 }
 
+/// Issue #261: cancelling a pending intent emits a `payment.cancelled`
+/// webhook. This drives the same sequence the cancel endpoint uses —
+/// `db::cancel_payment` followed by `webhook::dispatch` — and asserts the
+/// merchant's endpoint receives exactly one POST carrying the new event.
+#[tokio::test]
+async fn cancel_emits_payment_cancelled_webhook() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let cfg = make_config("test-secret", 3);
+    let state = setup_state(cfg).await;
+    let payment = create_test_payment(&state, &format!("{}/hook", server.uri())).await;
+
+    let cancelled = db::cancel_payment(&state.pool, &payment.id, "merchant1")
+        .await
+        .unwrap()
+        .expect("a pending intent must be cancellable");
+    assert_eq!(cancelled.status, "cancelled");
+
+    webhook::dispatch(&state, &cancelled, "payment.cancelled", None).await;
+
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(
+        received.len(),
+        1,
+        "cancelling must emit exactly one webhook"
+    );
+    let req = &received[0];
+    assert_eq!(
+        req.headers
+            .get("X-StellarGate-Event")
+            .expect("event header must be present")
+            .to_str()
+            .unwrap(),
+        "payment.cancelled"
+    );
+
+    let body: serde_json::Value =
+        serde_json::from_slice(&req.body).expect("body must be valid JSON");
+    assert_eq!(body["event"], "payment.cancelled");
+    assert_eq!(body["payment_id"], payment.id);
+    assert_eq!(body["status"], "cancelled");
+
+    let deliveries = db::list_webhook_deliveries(&state.pool, &payment.id)
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].status, "delivered");
+    assert_eq!(deliveries[0].event, "payment.cancelled");
+}
+
 /// Once a delivery reaches the redrive attempt cap it is left `failed`
 /// permanently rather than retried forever.
 #[tokio::test]

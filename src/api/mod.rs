@@ -349,6 +349,7 @@ fn api_v1(
 
     let payments_authed = axum::Router::new()
         .route("/", authed(post(payments::create).get(payments::list)))
+        .route("/{id}/cancel", authed(post(payments::cancel)))
         .route("/{id}/webhooks", authed(get(payments::list_webhooks)));
 
     /* Redelivery gets its own sub-router so `merchant_redeliver_limit_middleware`
