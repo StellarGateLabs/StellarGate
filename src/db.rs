@@ -128,7 +128,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             .await?;
     }
 
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_memo ON payments(memo)")
+    /* idx_payments_memo duplicates the automatic unique index SQLite creates for
+    the UNIQUE constraint on payments.memo (issue #1002). Drop it so every
+    insert/update no longer maintains two identical index entries. The unique
+    constraint index still satisfies any lookup by memo. */
+    sqlx::query("DROP INDEX IF EXISTS idx_payments_memo")
         .execute(&mut *tx)
         .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)")
@@ -136,6 +140,17 @@ pub async fn migrate(pool: &Db) -> Result<()> {
         .await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_payments_created_id ON payments(created_at DESC, id DESC)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    /* Composite index for merchant-scoped list, count and summary queries
+    (issue #1001). Every merchant-facing query filters on merchant_id first;
+    without a leading merchant_id index those queries walk the global
+    created_at index and discard other merchants' rows. This index serves
+    list_payments (offset), list_payments_keyset and payments_summary. */
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_payments_merchant_created
+         ON payments(merchant_id, created_at DESC, id DESC)",
     )
     .execute(&mut *tx)
     .await?;
@@ -285,9 +300,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .execute(&mut *tx)
     .await?;
 
-    /* Authentication looks a key up by hash on every request, so this index is
-    load-bearing rather than an optimisation. */
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash)")
+    /* idx_api_keys_hash duplicates the automatic unique index SQLite creates for
+    the UNIQUE constraint on api_keys.key_hash (issue #1002). The constraint
+    index already serves every hash lookup, so the explicit index only wastes
+    a write on every insert/update. Drop it; the constraint index remains. */
+    sqlx::query("DROP INDEX IF EXISTS idx_api_keys_hash")
         .execute(&mut *tx)
         .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_merchant ON api_keys(merchant_id)")
@@ -361,6 +378,20 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .execute(&mut *tx)
     .await?;
 
+    /* prune_webhook_deliveries filters on COALESCE(last_attempt, created_at)
+    for status IN ('delivered', 'failed'). The redrive partial index above
+    covers only 'pending'/'failed', so 'delivered' rows — the vast majority
+    at steady state — were previously unindexed, forcing a full table scan
+    on every retention batch while holding the write lock (issue #1000).
+    This non-partial index on (status, last_attempt, created_at) covers
+    both the status filter and the date range for every terminal status. */
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status_activity
+         ON webhook_deliveries(status, last_attempt, created_at)",
+    )
+    .execute(&mut *tx)
+    .await?;
+
     /* Idempotency keys for payment creation. A key is unique per merchant and
     maps to the payment id minted for the first request that used it, so a
     client retrying after a network blip gets the original payment back
@@ -373,6 +404,15 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
             PRIMARY KEY (merchant_id, idempotency_key)
         )",
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    /* prune_idempotency_keys filters on created_at; without this index every
+    batch scans the whole table while holding the write lock (issue #1000). */
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_idempotency_keys_created_at
+         ON idempotency_keys(created_at)",
     )
     .execute(&mut *tx)
     .await?;
@@ -1493,7 +1533,11 @@ pub async fn find_merchant_by_key(pool: &Db, raw_key: &str) -> Result<Option<Str
         return Ok(None);
     };
 
-    sqlx::query(
+    /* The last_used_at write is a best-effort activity marker (at most once a
+    minute). If it fails — SQLITE_BUSY under write contention, a momentarily
+    full disk — we log and carry on rather than turning a valid authenticated
+    request into a 500 (issue #1003). */
+    if let Err(e) = sqlx::query(
         "UPDATE api_keys
             SET last_used_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
           WHERE id = ?
@@ -1502,7 +1546,10 @@ pub async fn find_merchant_by_key(pool: &Db, raw_key: &str) -> Result<Option<Str
     )
     .bind(&key_id)
     .execute(pool)
-    .await?;
+    .await
+    {
+        tracing::warn!(key_id = %key_id, error = %e, "failed to update last_used_at; ignoring");
+    }
 
     Ok(Some(merchant_id))
 }
