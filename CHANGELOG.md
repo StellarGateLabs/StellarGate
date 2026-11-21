@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`create_merchant` no longer writes `merchants.api_key_hash` (#1004).**
+  New merchants are inserted with `api_key_hash = NULL`. The column exists
+  only for compatibility with pre-`api_keys` rows; the legacy migration that
+  backfills `api_keys` from it is unaffected because it already skips rows
+  where the column is NULL.
+
+- **`GET /v1/payments` runs a constant number of queries regardless of page
+  size (#1005).** `attach_webhook_status` previously fetched every delivery
+  row (including full payload blobs) for each payment individually. It now
+  issues a single `SELECT payment_id, status … WHERE payment_id IN (…)`
+  covering the whole page, returning only the two columns needed.
+
+- **`created_after` / `created_before` on `GET /v1/payments` are validated
+  (#1006).** Both parameters are now parsed as RFC 3339 timestamps. UTC
+  offsets are accepted and normalised to the stored UTC form before binding.
+  An unparseable value returns `400 invalid_query`; `created_after` later
+  than `created_before` returns `400 invalid_range`.
+
+- **Revoking a merchant's last active key returns `409 Conflict` instead of
+  `400` (#1007).** The request is well-formed; it conflicts with the resource
+  state. The error code (`last_active_key`) and message are unchanged.
+  OpenAPI updated accordingly.
+
 - **Poller and expiry sweeper run once at startup (#984).** Payments that
   landed, and intents that expired, while the process was down are now
   reconciled immediately instead of after `POLL_INTERVAL_SECS`.

@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 /// An error with an HTTP status, a stable machine-readable code, and a human message.
@@ -32,6 +33,10 @@ impl AppError {
 
     pub fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, code, message)
+    }
+
+    pub fn conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, code, message)
     }
 
     pub fn unsupported_media_type(code: &'static str, message: impl Into<String>) -> Self {
@@ -459,6 +464,42 @@ pub async fn list(
         ));
     }
 
+    // Validate and normalise created_after / created_before.
+    // Both must be RFC 3339 timestamps; they are converted to the UTC form
+    // stored in the database (%Y-%m-%dT%H:%M:%SZ) before binding.
+    let created_after = q
+        .created_after
+        .as_deref()
+        .map(parse_utc_timestamp)
+        .transpose()
+        .map_err(|_| {
+            AppError::bad_request(
+                "invalid_query",
+                "created_after must be an RFC 3339 timestamp (e.g. 2024-01-01T00:00:00Z)",
+            )
+        })?;
+
+    let created_before = q
+        .created_before
+        .as_deref()
+        .map(parse_utc_timestamp)
+        .transpose()
+        .map_err(|_| {
+            AppError::bad_request(
+                "invalid_query",
+                "created_before must be an RFC 3339 timestamp (e.g. 2024-01-01T00:00:00Z)",
+            )
+        })?;
+
+    if let (Some(ref after), Some(ref before)) = (&created_after, &created_before) {
+        if after > before {
+            return Err(AppError::bad_request(
+                "invalid_range",
+                "created_after must not be later than created_before",
+            ));
+        }
+    }
+
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
     if let Some(raw_cursor) = &q.cursor {
@@ -470,8 +511,8 @@ pub async fn list(
             &state.pool,
             &merchant_id,
             q.status.as_deref(),
-            q.created_after.as_deref(),
-            q.created_before.as_deref(),
+            created_after.as_deref(),
+            created_before.as_deref(),
             limit,
             Some((&cursor_ts, &cursor_id)),
         )
@@ -498,8 +539,8 @@ pub async fn list(
             &state.pool,
             &merchant_id,
             q.status.as_deref(),
-            q.created_after.as_deref(),
-            q.created_before.as_deref(),
+            created_after.as_deref(),
+            created_before.as_deref(),
             limit,
             offset,
         )
@@ -574,6 +615,26 @@ async fn generate_unique_memo(pool: &db::Db) -> Result<String, AppError> {
     ))
 }
 
+/// Parse an RFC 3339 timestamp string and return it normalised to the UTC
+/// form used in the database (`%Y-%m-%dT%H:%M:%SZ`).  Sub-second precision
+/// and UTC offsets are accepted and converted; a bare date or any other
+/// non-RFC-3339 value returns `Err`.
+fn parse_utc_timestamp(raw: &str) -> Result<String, ()> {
+    let dt = time::OffsetDateTime::parse(raw, &Rfc3339).map_err(|_| ())?;
+    let utc = dt.to_offset(time::UtcOffset::UTC);
+    // Format without sub-seconds, matching the stored %Y-%m-%dT%H:%M:%SZ form.
+    let formatted = utc.format(&Rfc3339).map_err(|_| ())?;
+    // Rfc3339 may include sub-seconds; keep only up to the seconds marker.
+    // The stored timestamps are always "…:SSZ", so truncate at that point.
+    let truncated = if let Some(pos) = formatted.find('.') {
+        format!("{}Z", &formatted[..pos])
+    } else {
+        // Already no sub-seconds; ensure it ends with Z (offset was +00:00).
+        formatted.replace("+00:00", "Z")
+    };
+    Ok(truncated)
+}
+
 fn to_json(p: &db::Payment) -> Value {
     // Canonicalize amount: parse to stroops and format back to canonical form.
     // This ensures "10.00", "10.0", and "10" all serialize identically,
@@ -620,25 +681,39 @@ fn to_json(p: &db::Payment) -> Value {
 /// attempted yet, gets `null` (rendered as "none"). Any delivery that has not
 /// succeeded — including `pending` — is reported as `"failing"` so a stuck or
 /// retrying webhook is visible rather than silently omitted.
+///
+/// Fetches the latest delivery status for the whole page in a single query
+/// rather than one query per payment.
 async fn attach_webhook_status(
     pool: &db::Db,
     payments: &[db::Payment],
     rows: &mut [Value],
 ) -> Result<(), AppError> {
+    let ids_with_webhook: Vec<&str> = payments
+        .iter()
+        .filter(|p| p.webhook_url.is_some())
+        .map(|p| p.id.as_str())
+        .collect();
+
+    if ids_with_webhook.is_empty() {
+        return Ok(());
+    }
+
+    let status_map =
+        db::latest_webhook_status_for_payments(pool, &ids_with_webhook).await?;
+
     for (payment, row) in payments.iter().zip(rows.iter_mut()) {
         if payment.webhook_url.is_none() {
             continue;
         }
-        let deliveries = db::list_webhook_deliveries(pool, &payment.id).await?;
-        let Some(latest) = deliveries.first() else {
-            continue;
-        };
-        let status = if latest.status == "delivered" {
-            "delivered"
-        } else {
-            "failing"
-        };
-        row["webhook_status"] = Value::String(status.to_string());
+        if let Some(status) = status_map.get(&payment.id) {
+            let display = if status == "delivered" {
+                "delivered"
+            } else {
+                "failing"
+            };
+            row["webhook_status"] = Value::String(display.to_string());
+        }
     }
     Ok(())
 }
