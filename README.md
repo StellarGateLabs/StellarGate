@@ -957,12 +957,13 @@ merchant comes from the API key and cannot be overridden by the body.
   "asset": "XLM",
   "asset_issuer": null,
   "status": "pending",
+  "payment_uri": "web+stellar:pay?destination=GBBD47IF6LWK7P7...&amount=10&memo=A1B2C3D4&memo_type=MEMO_TEXT&network_passphrase=Test%20SDF%20Network%20%3B%20September%202015",
   "created_at": "2026-04-29T15:00:00Z",
   "expires_at": "2026-04-29T16:00:00Z"
 }
 ```
 
-> The payer must send **exactly** `amount` of `asset` to `destination_address` with `memo` set as a **text memo**. The intent expires at `expires_at` if unpaid.
+> The payer must send **exactly** `amount` of `asset` to `destination_address` with `memo` set as a **text memo**. The intent expires at `expires_at` if unpaid. `payment_uri` is a ready-made SEP-7 URI you can render as a QR code or a "Pay with wallet" link.
 
 ---
 
@@ -1001,7 +1002,8 @@ curl http://localhost:3000/payments/$ID -H "Authorization: Bearer $API_KEY"
   "paid_amount": null,
   "created_at": "2026-04-29T15:00:00Z",
   "updated_at": "2026-04-29T15:00:00Z",
-  "expires_at": "2026-04-29T16:00:00Z"
+  "expires_at": "2026-04-29T16:00:00Z",
+  "payment_uri": "web+stellar:pay?destination=GBBD47IF6LWK7P7...&amount=10&memo=A1B2C3D4&memo_type=MEMO_TEXT&network_passphrase=Test%20SDF%20Network%20%3B%20September%202015"
 }
 ```
 
