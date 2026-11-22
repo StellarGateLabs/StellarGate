@@ -101,7 +101,7 @@ CREATE TABLE webhook_deliveries (
             attempts INTEGER NOT NULL DEFAULT 0,
             last_attempt TEXT,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-        , acknowledged_at TEXT, manual_attempts INTEGER NOT NULL DEFAULT 0)
+        , acknowledged_at TEXT, manual_attempts INTEGER NOT NULL DEFAULT 0, claimed_at TEXT)
 ;
 CREATE TRIGGER trg_api_keys_keep_one_active
          BEFORE UPDATE OF revoked_at ON api_keys

@@ -35,7 +35,15 @@ pub async fn sweep_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
         let n = expired.len();
         for payment in &expired {
             info!(payment_id = %payment.id, "payment intent expired");
-            webhook::dispatch(state, payment, EXPIRED_EVENT, None).await;
+            // Issue #995: if the intent has a non-zero paid_amount, signal that
+            // funds need refunding via the `delta` field so receivers don't
+            // silently ignore partial funds that need to be returned.
+            let refund_due: Option<String> = payment.paid_amount.as_deref().and_then(|pa| {
+                crate::money::parse_stroops(pa)
+                    .filter(|&s| s > 0)
+                    .map(|_| pa.to_string())
+            });
+            webhook::dispatch(state, payment, EXPIRED_EVENT, refund_due.as_deref()).await;
         }
         total += n;
         // A short batch means the backlog is drained; stop looping.
@@ -240,6 +248,119 @@ pub(crate) mod tests {
                 signature
             ),
             "expiry webhook signature must verify against the received body"
+        );
+    }
+
+    /// Issue #995: an intent that expires with a partial payment must include
+    /// a `delta` field in the `payment.expired` webhook so receivers know
+    /// funds need to be refunded.
+    #[tokio::test]
+    async fn sweep_expired_underpaid_includes_refund_due_in_payload() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let state = Arc::new(memory_state(test_config(true)).await);
+        let webhook_url = format!("{}/hook", server.uri());
+
+        // Create a payment and partially pay it.
+        let payment = db::create_payment(
+            &state.pool,
+            db::NewPayment {
+                id: "pay_partial_expiry",
+                merchant_id: "merchant1",
+                destination_address: "GDESTINATION",
+                memo: "PARTIALMEMO",
+                amount: "10",
+                asset: "XLM",
+                asset_issuer: None,
+                webhook_url: Some(&webhook_url),
+                ttl_secs: -10,
+            },
+        )
+        .await
+        .expect("partial expiry payment fixture should be created");
+
+        // Simulate a partial payment arriving: set paid_amount to 4 XLM.
+        db::update_payment_status(&state.pool, &payment.id, "underpaid", "TX_PARTIAL", "4")
+            .await
+            .expect("partial payment update should succeed");
+
+        let expired_count = sweep_once(&state).await.unwrap();
+        assert_eq!(expired_count, 1, "the underpaid overdue intent must be swept");
+
+        let received = server
+            .received_requests()
+            .await
+            .expect("mock server should capture the expiry webhook");
+        assert_eq!(received.len(), 1, "exactly one webhook POST must be sent");
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&received[0].body)
+                .expect("expiry webhook body should be valid JSON");
+        assert_eq!(body["event"], EXPIRED_EVENT);
+        assert_eq!(body["status"], "expired");
+        // delta must be present and equal to paid_amount so the receiver
+        // knows exactly how much to refund.
+        assert!(
+            !body["delta"].is_null(),
+            "delta must be present for a partially-paid expiry (issue #995)"
+        );
+        assert_eq!(
+            body["delta"].as_str().unwrap(),
+            "4",
+            "delta must equal the received amount"
+        );
+    }
+
+    /// Issue #995: an intent that expires with zero payment (never paid) must
+    /// NOT include `delta` — no funds to refund means no refund signal.
+    #[tokio::test]
+    async fn sweep_expired_unpaid_has_no_delta() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let state = Arc::new(memory_state(test_config(true)).await);
+        let webhook_url = format!("{}/hook", server.uri());
+
+        db::create_payment(
+            &state.pool,
+            db::NewPayment {
+                id: "pay_unpaid_expiry",
+                merchant_id: "merchant1",
+                destination_address: "GDESTINATION",
+                memo: "UNPAIDMEMO",
+                amount: "10",
+                asset: "XLM",
+                asset_issuer: None,
+                webhook_url: Some(&webhook_url),
+                ttl_secs: -10,
+            },
+        )
+        .await
+        .expect("unpaid expiry payment fixture should be created");
+
+        sweep_once(&state).await.unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&received[0].body)
+                .expect("expiry webhook body should be valid JSON");
+        assert_eq!(body["event"], EXPIRED_EVENT);
+        assert!(
+            body["delta"].is_null(),
+            "delta must NOT be present for an unpaid expiry (no refund needed)"
         );
     }
 

@@ -73,7 +73,11 @@ Fired when cumulative payment equals the requested amount exactly.
   "paid_amount": "10.00",
   "asset": "XLM",
   "asset_issuer": null,
-  "status": "completed"
+  "status": "completed",
+  "memo": "ORDER-1234",
+  "destination_address": "GDEST...",
+  "updated_at": "2024-06-22T15:30:45Z",
+  "expires_at": "2024-06-22T16:30:00Z"
 }
 ```
 
@@ -132,9 +136,39 @@ Fired when a payment intent's TTL elapses before payment arrives. No further tra
   "amount": "10.00",
   "paid_amount": null,
   "asset": "XLM",
-  "status": "expired"
+  "status": "expired",
+  "memo": "ORDER-1234",
+  "destination_address": "GDEST...",
+  "created_at": "2024-06-22T14:30:00Z",
+  "updated_at": "2024-06-22T15:30:45Z",
+  "expires_at": "2024-06-22T15:30:45Z"
 }
 ```
+
+If the intent received a **partial payment** before expiring, the payload includes a `delta` field with the received amount that must be refunded to the customer. An unpaid expiry (no funds received) has no `delta`.
+
+```json
+{
+  "id": "9f1c2e7a-4b3d-4e5f-8a6b-1c2d3e4f5a6b",
+  "created_at": "2024-06-22T15:30:45Z",
+  "event": "payment.expired",
+  "payment_id": "a1b2c3d4-...",
+  "merchant_id": "your-merchant-id",
+  "tx_hash": "abc123...",
+  "amount": "10.00",
+  "paid_amount": "4.00",
+  "asset": "XLM",
+  "status": "expired",
+  "delta": "4.00",
+  "memo": "ORDER-1234",
+  "destination_address": "GDEST...",
+  "created_at": "2024-06-22T14:30:00Z",
+  "updated_at": "2024-06-22T15:30:45Z",
+  "expires_at": "2024-06-22T15:30:45Z"
+}
+```
+
+> When `delta` is present on a `payment.expired` event, the customer sent funds that never reached the requested amount. Refund `delta` to the payer — the same refund obligation as `payment.unexpected`.
 
 ### `payment.unexpected`
 

@@ -143,6 +143,13 @@ pub fn build_payload(payment: &db::Payment, event: &str, delta: Option<&str>) ->
         asset, which has no issuer (issue #223). */
         "asset_issuer": payment.asset_issuer,
         "status": payment.status,
+        // Issue #994: include customer-facing reference and timestamps so
+        // receivers don't have to call GET /v1/payments/:id just to get these.
+        "memo": payment.memo,
+        "destination_address": payment.destination_address,
+        "created_at": payment.created_at,
+        "updated_at": payment.updated_at,
+        "expires_at": payment.expires_at,
     });
     if let Some(d) = canonical_delta {
         payload["delta"] = json!(d);
@@ -467,6 +474,20 @@ pub async fn redrive_once(state: &Arc<AppState>) -> usize {
 /// with a fresh timestamp on every attempt (the receiver's replay-tolerance
 /// window is measured from when the request actually lands).
 async fn redrive_one(state: &Arc<AppState>, delivery: db::WebhookDelivery) {
+    // Claim the row atomically before sending (issue #993). If another caller
+    // (e.g. a concurrent manual redeliver) won the race, skip this delivery.
+    match db::claim_webhook_delivery(&state.pool, &delivery.id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            debug!(delivery_id = %delivery.id, "redrive skipped: row already claimed");
+            return;
+        }
+        Err(e) => {
+            warn!(delivery_id = %delivery.id, error = %e, "redrive: failed to claim delivery row");
+            return;
+        }
+    }
+
     let event = delivery.event();
     let attempt = delivery.attempts + 1;
 
@@ -817,6 +838,53 @@ mod tests {
                 "serialised body must contain the event string (event={event})"
             );
         }
+    }
+
+    /// Issue #994: every webhook payload must include memo, destination_address,
+    /// created_at, updated_at, and expires_at so receivers don't have to
+    /// round-trip GET /v1/payments/:id just to get these fields.
+    #[test]
+    fn build_payload_includes_required_context_fields() {
+        let payment = db::Payment {
+            id: "pay_ctx".into(),
+            merchant_id: "merchant_1".into(),
+            destination_address: "GDEST123".into(),
+            memo: "ORDER-999".into(),
+            amount: "5".into(),
+            asset: "XLM".into(),
+            asset_issuer: None,
+            status: "completed".into(),
+            tx_hash: None,
+            paid_amount: Some("5".into()),
+            webhook_url: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:01:00Z".into(),
+            expires_at: "2026-01-01T01:00:00Z".into(),
+        };
+
+        let payload = build_payload(&payment, "payment.completed", None);
+
+        assert_eq!(payload["memo"].as_str(), Some("ORDER-999"), "memo must be present");
+        assert_eq!(
+            payload["destination_address"].as_str(),
+            Some("GDEST123"),
+            "destination_address must be present"
+        );
+        assert_eq!(
+            payload["created_at"].as_str(),
+            Some("2026-01-01T00:00:00Z"),
+            "created_at must be present in RFC 3339"
+        );
+        assert_eq!(
+            payload["updated_at"].as_str(),
+            Some("2026-01-01T00:01:00Z"),
+            "updated_at must be present in RFC 3339"
+        );
+        assert_eq!(
+            payload["expires_at"].as_str(),
+            Some("2026-01-01T01:00:00Z"),
+            "expires_at must be present in RFC 3339"
+        );
     }
 
     // ── pinned-client cache (issue #996) ────────────────────────────────────

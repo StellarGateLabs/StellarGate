@@ -234,6 +234,22 @@ pub async fn migrate(pool: &Db) -> Result<()> {
         .await?;
     }
 
+    /* `claimed_at` supports the atomic claim step (issue #993): the redrive
+    worker and manual redeliver both write `status = 'sending'` with this
+    timestamp before sending, so a concurrent second caller sees `status NOT IN
+    ('pending','failed')` and backs off. Stale `sending` rows left by a crash
+    are detected by comparing `claimed_at` against a grace window. */
+    let has_claimed_at: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'claimed_at'",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if has_claimed_at == 0 {
+        sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN claimed_at TEXT")
+            .execute(&mut *tx)
+            .await?;
+    }
+
     /* Durable key/value state — used by the Horizon poller to persist its
     paging cursor so it resumes exactly where it left off across restarts. */
     sqlx::query(
@@ -1058,7 +1074,7 @@ pub async fn update_webhook_delivery(
     attempts: i64,
 ) -> Result<()> {
     sqlx::query(
-        "UPDATE webhook_deliveries SET status = ?, attempts = ?, last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+        "UPDATE webhook_deliveries SET status = ?, attempts = ?, claimed_at = NULL, last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
     )
     .bind(status)
     .bind(attempts)
@@ -1066,6 +1082,80 @@ pub async fn update_webhook_delivery(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Record the outcome of a forced manual redelivery (issue #992).
+///
+/// Unlike `update_webhook_delivery`, this never downgrades a row whose status
+/// is already `"delivered"`:
+/// - On success, writes `status = "delivered"` unconditionally (fine — it was
+///   already delivered).
+/// - On failure, only increments `manual_attempts` and updates `last_attempt`;
+///   it leaves `status` and `attempts` exactly as they were, so a previously
+///   delivered row stays `"delivered"` and is never re-eligible for the redrive
+///   worker.
+///
+/// Returns `true` when the row was updated (always, unless the id doesn't
+/// exist).
+pub async fn record_forced_redeliver_outcome(
+    pool: &Db,
+    id: &str,
+    succeeded: bool,
+) -> Result<()> {
+    if succeeded {
+        // A successful forced redelivery is unambiguously good — write
+        // delivered unconditionally.
+        sqlx::query(
+            "UPDATE webhook_deliveries
+                SET status = 'delivered',
+                    manual_attempts = manual_attempts + 1,
+                    last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+              WHERE id = ?",
+        )
+        .bind(id)
+        .execute(pool)
+        .await?;
+    } else {
+        // Failed forced redelivery: bump manual_attempts only, never touch
+        // status/attempts, so a delivered row cannot become eligible for the
+        // redrive worker.
+        sqlx::query(
+            "UPDATE webhook_deliveries
+                SET manual_attempts = manual_attempts + 1,
+                    last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+              WHERE id = ?",
+        )
+        .bind(id)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Atomically claim a delivery row for sending (issue #993).
+///
+/// Transitions `status` from `pending` or `failed` to `sending`, but only if
+/// the row is currently in one of those two states. Returns `true` when the
+/// claim succeeded (this goroutine owns the row), `false` when another caller
+/// won the race (or the row is already delivered/sending).
+///
+/// A claimed row must be released by calling `update_webhook_delivery` with
+/// the final outcome. Stale `sending` rows — left behind by a crash —
+/// are expired back to `pending` by callers that also check
+/// `claimed_at` against a grace window before considering them stuck.
+pub async fn claim_webhook_delivery(pool: &Db, id: &str) -> Result<bool> {
+    let affected = sqlx::query(
+        "UPDATE webhook_deliveries
+            SET status = 'sending',
+                claimed_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+          WHERE id = ?
+            AND status IN ('pending', 'failed')",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected == 1)
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1087,6 +1177,10 @@ pub struct WebhookDelivery {
     /// acknowledged it. `None` means nobody has looked at it yet, which is
     /// what keeps a terminal failure exempt from retention (issue #319).
     pub acknowledged_at: Option<String>,
+    /// When this row was claimed for sending (issue #993). Set to `now` by
+    /// `claim_webhook_delivery`; cleared (set to NULL) on final outcome write.
+    /// Used to detect stale `sending` rows left by a crash.
+    pub claimed_at: Option<String>,
     pub created_at: String,
 }
 
@@ -1136,6 +1230,7 @@ fn row_to_webhook_delivery(row: &sqlx::sqlite::SqliteRow) -> WebhookDelivery {
         manual_attempts: row.get("manual_attempts"),
         last_attempt: row.get("last_attempt"),
         acknowledged_at: row.get("acknowledged_at"),
+        claimed_at: row.get("claimed_at"),
         created_at: normalize_ts(&row.get::<String, _>("created_at")),
     }
 }
@@ -1169,7 +1264,7 @@ pub async fn list_redrivable_deliveries(
     backoff_max_secs: i64,
 ) -> Result<Vec<WebhookDelivery>> {
     let rows = sqlx::query(
-        "SELECT id, payment_id, url, payload, event_type, status, attempts, manual_attempts, last_attempt, acknowledged_at, created_at
+        "SELECT id, payment_id, url, payload, event_type, status, attempts, manual_attempts, last_attempt, acknowledged_at, claimed_at, created_at
          FROM webhook_deliveries
          WHERE status IN ('pending', 'failed')
            AND attempts < ?
@@ -1194,7 +1289,7 @@ pub async fn list_redrivable_deliveries(
 /// Get all webhook deliveries for a payment, ordered by created_at descending.
 pub async fn list_webhook_deliveries(pool: &Db, payment_id: &str) -> Result<Vec<WebhookDelivery>> {
     let rows = sqlx::query(
-        "SELECT id, payment_id, url, payload, event_type, status, attempts, manual_attempts, last_attempt, acknowledged_at, created_at
+        "SELECT id, payment_id, url, payload, event_type, status, attempts, manual_attempts, last_attempt, acknowledged_at, claimed_at, created_at
          FROM webhook_deliveries WHERE payment_id = ? ORDER BY created_at DESC",
     )
     .bind(payment_id)
@@ -1207,7 +1302,7 @@ pub async fn list_webhook_deliveries(pool: &Db, payment_id: &str) -> Result<Vec<
 /// Get a specific webhook delivery by id.
 pub async fn get_webhook_delivery(pool: &Db, id: &str) -> Result<Option<WebhookDelivery>> {
     let row = sqlx::query(
-        "SELECT id, payment_id, url, payload, event_type, status, attempts, manual_attempts, last_attempt, acknowledged_at, created_at
+        "SELECT id, payment_id, url, payload, event_type, status, attempts, manual_attempts, last_attempt, acknowledged_at, claimed_at, created_at
          FROM webhook_deliveries WHERE id = ?",
     )
     .bind(id)
