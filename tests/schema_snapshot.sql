@@ -64,7 +64,7 @@ CREATE TABLE payments (
             amount TEXT NOT NULL,
             asset TEXT NOT NULL DEFAULT 'XLM',
             asset_issuer TEXT,
-            status TEXT NOT NULL DEFAULT 'pending',
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed', 'underpaid', 'expired')),
             webhook_url TEXT,
             tx_hash TEXT,
             paid_amount TEXT,
@@ -97,7 +97,7 @@ CREATE TABLE webhook_deliveries (
             url TEXT NOT NULL,
             payload TEXT NOT NULL,
             event_type TEXT,
-            status TEXT NOT NULL DEFAULT 'pending',
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'delivered', 'failed')),
             attempts INTEGER NOT NULL DEFAULT 0,
             last_attempt TEXT,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
