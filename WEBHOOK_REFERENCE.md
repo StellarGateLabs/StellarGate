@@ -117,6 +117,25 @@ Fired when a payment arrives but falls **short** of the requested amount. The `d
 }
 ```
 
+### `payment.cancelled`
+
+Fired when a merchant cancels a pending intent via `POST /v1/payments/{id}/cancel`. This is a **terminal** state: the intent can no longer be paid, and no further events will follow for that intent. Cancellation is refused with `409` if the intent already has any processed transactions (for example a partial payment), so a `payment.cancelled` event never follows a `payment.underpaid` for the same intent.
+
+```json
+{
+  "id": "9f1c2e7a-4b3d-4e5f-8a6b-1c2d3e4f5a6b",
+  "created_at": "2024-06-22T15:30:45Z",
+  "event": "payment.cancelled",
+  "payment_id": "a1b2c3d4-...",
+  "merchant_id": "your-merchant-id",
+  "tx_hash": null,
+  "amount": "10.00",
+  "paid_amount": null,
+  "asset": "XLM",
+  "status": "cancelled"
+}
+```
+
 ### `payment.expired`
 
 Fired when a payment intent's TTL elapses before payment arrives. No further transactions are watched for this intent.

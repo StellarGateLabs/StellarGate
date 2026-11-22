@@ -2310,6 +2310,197 @@ async fn test_both_mounts_share_the_same_data() {
     assert_eq!(via_v1.json::<Value>()["id"], json!(id));
 }
 
+// ── Cancelling a pending payment (issue #261) ────────────────────────────
+
+/// The happy path: a pending intent can be closed by its owner, and the
+/// cancellation is durable — a later read must not still say `pending`.
+#[tokio::test]
+async fn test_cancel_pending_payment() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", auth.clone())
+        .json(&json!({ "amount": "10", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let res = server
+        .post(&format!("/payments/{id}/cancel"))
+        .add_header("Authorization", auth.clone())
+        .await;
+    res.assert_status_ok();
+    assert_eq!(res.json::<Value>()["status"], "cancelled");
+
+    let after = server
+        .get(&format!("/payments/{id}"))
+        .add_header("Authorization", auth)
+        .await;
+    after.assert_status_ok();
+    assert_eq!(after.json::<Value>()["status"], "cancelled");
+}
+
+/// Cancelling someone else's intent must look exactly like cancelling one that
+/// does not exist — a 403 would confirm the payment is real.
+#[tokio::test]
+async fn test_cancel_rejects_other_merchants_payment() {
+    let server = test_server().await;
+    let owner_key = provision_merchant(&server).await;
+    let stranger_key = provision_merchant(&server).await;
+
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {owner_key}"))
+        .json(&json!({ "amount": "10", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let res = server
+        .post(&format!("/payments/{id}/cancel"))
+        .add_header("Authorization", format!("Bearer {stranger_key}"))
+        .await;
+    res.assert_status(StatusCode::NOT_FOUND);
+    assert_eq!(res.json::<Value>()["code"], "payment_not_found");
+
+    // The owner's intent is untouched.
+    let after = server
+        .get(&format!("/payments/{id}"))
+        .add_header("Authorization", format!("Bearer {owner_key}"))
+        .await;
+    after.assert_status_ok();
+    assert_eq!(after.json::<Value>()["status"], "pending");
+}
+
+/// Only `pending` may be cancelled; a settled or aged-out intent is final.
+#[tokio::test]
+async fn test_cancel_rejects_non_pending_payment() {
+    let (server, pool) = test_server_with_pool().await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+
+    for status in ["completed", "expired"] {
+        let id = server
+            .post("/payments")
+            .add_header("Authorization", auth.clone())
+            .json(&json!({ "amount": "10", "asset": "XLM" }))
+            .await
+            .json::<Value>()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        stellargate::db::update_payment_status(&pool, &id, status, "TX", "10")
+            .await
+            .unwrap();
+
+        let res = server
+            .post(&format!("/payments/{id}/cancel"))
+            .add_header("Authorization", auth.clone())
+            .await;
+        res.assert_status(StatusCode::CONFLICT);
+        assert_eq!(res.json::<Value>()["code"], "payment_not_pending");
+
+        let after = server
+            .get(&format!("/payments/{id}"))
+            .add_header("Authorization", auth.clone())
+            .await;
+        assert_eq!(after.json::<Value>()["status"], status);
+    }
+}
+
+/// Money has already landed against this intent, so cancelling it would hide
+/// a partial payment from the merchant. Refuse rather than silently void it.
+#[tokio::test]
+async fn test_cancel_rejects_payment_with_processed_transactions() {
+    let (server, pool) = test_server_with_pool().await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", auth.clone())
+        .json(&json!({ "amount": "10", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    sqlx::query(
+        "INSERT INTO processed_transactions (tx_hash, payment_id, amount) VALUES (?, ?, ?)",
+    )
+    .bind("TX_CANCEL_PARTIAL")
+    .bind(&id)
+    .bind("3")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let res = server
+        .post(&format!("/payments/{id}/cancel"))
+        .add_header("Authorization", auth.clone())
+        .await;
+    res.assert_status(StatusCode::CONFLICT);
+    assert_eq!(
+        res.json::<Value>()["code"],
+        "payment_has_processed_transactions"
+    );
+
+    let after = server
+        .get(&format!("/payments/{id}"))
+        .add_header("Authorization", auth)
+        .await;
+    assert_eq!(after.json::<Value>()["status"], "pending");
+}
+
+#[tokio::test]
+async fn test_cancel_unauthenticated_returns_401() {
+    let res = test_server()
+        .await
+        .post("/payments/nonexistent/cancel")
+        .await;
+    res.assert_status(StatusCode::UNAUTHORIZED);
+    assert_eq!(res.json::<Value>()["code"], "unauthorized");
+}
+
+/// `cancelled` is a producible status, so it must be filterable.
+#[tokio::test]
+async fn test_list_filters_by_cancelled_status() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", auth.clone())
+        .json(&json!({ "amount": "10", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    server
+        .post(&format!("/payments/{id}/cancel"))
+        .add_header("Authorization", auth.clone())
+        .await
+        .assert_status_ok();
+
+    let res = server
+        .get("/payments?status=cancelled")
+        .add_header("Authorization", auth)
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+    assert_eq!(body["total"], 1);
+    assert_eq!(body["payments"][0]["id"], json!(id));
+    assert_eq!(body["payments"][0]["status"], "cancelled");
+}
+
 // ── axum 0.8 upgrade guards (issues #635, #636) ──────────────────────────
 
 /// Baseline security headers the outermost layers stamp on every response,

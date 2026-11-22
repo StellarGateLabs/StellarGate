@@ -37,6 +37,12 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Webhook event emitted when a merchant cancels a pending payment intent.
+///
+/// A cancelled intent is terminal: it can no longer be paid, and the event
+/// tells the merchant's system to release or void the associated order.
+pub const CANCELLED_EVENT: &str = "payment.cancelled";
+
 /// Redact a webhook URL for logging: keep scheme and host so a target is
 /// still identifiable, but drop the path and query string entirely.
 ///
@@ -799,6 +805,7 @@ mod tests {
             "payment.overpaid",
             "payment.underpaid",
             "payment.expired",
+            CANCELLED_EVENT,
         ] {
             let payload = build_payload(&payment, event, None);
             assert_eq!(

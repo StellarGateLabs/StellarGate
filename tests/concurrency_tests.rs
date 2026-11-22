@@ -486,6 +486,107 @@ async fn concurrent_last_key_revocations_leave_exactly_one_active() {
     );
 }
 
+// ── issue #261: race-safe cancel vs. settlement ─────────────────────────────
+
+/// A `cancel_payment` call racing a settlement `reconcile_payment` for the same
+/// pending intent must resolve to exactly one winner:
+///
+/// * if the cancel wins, the intent ends `cancelled` and no
+///   `processed_transactions` rows exist; or
+/// * if settlement wins, the intent ends `completed`/`underpaid` and the cancel
+///   reports `NotPending` (or `HasProcessedTransactions`).
+///
+/// Either way the intent must never be both cancelled and settled.
+#[tokio::test]
+async fn concurrent_cancel_and_settle_have_exactly_one_winner() {
+    use stellargate::db::CancelOutcome;
+
+    let pool = memory_pool().await;
+    let payment_id = seed_pending_payment(&pool, None).await;
+    let state = make_state(pool.clone(), None);
+    let hp = make_horizon_payment();
+
+    let (cancel_res, settle_res) = tokio::join!(
+        db::cancel_payment(&pool, &payment_id, "test-merchant"),
+        reconcile_payment(&state, &hp),
+    );
+
+    let cancel_outcome = cancel_res.expect("cancel_payment must not error");
+    settle_res.expect("reconcile_payment must not error");
+
+    let payment = db::get_payment(&pool, &payment_id)
+        .await
+        .unwrap()
+        .expect("payment must still exist");
+
+    let processed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM processed_transactions WHERE payment_id = ?")
+            .bind(&payment_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    match cancel_outcome {
+        CancelOutcome::Cancelled => {
+            assert_eq!(
+                payment.status, "cancelled",
+                "cancel won the race, so the intent must be cancelled"
+            );
+            assert_eq!(
+                processed, 0,
+                "a cancelled intent must have no processed_transactions rows"
+            );
+        }
+        CancelOutcome::NotPending | CancelOutcome::HasProcessedTransactions => {
+            assert!(
+                payment.status == "completed" || payment.status == "underpaid",
+                "settlement won the race, so status must be completed/underpaid; got {}",
+                payment.status
+            );
+        }
+        other => panic!("unexpected cancel outcome: {other:?}"),
+    }
+}
+
+/// Two concurrent `cancel_payment` calls for the same pending intent must yield
+/// exactly one `Cancelled` and one `NotPending`.
+#[tokio::test]
+async fn concurrent_cancels_yield_exactly_one_success() {
+    use stellargate::db::CancelOutcome;
+
+    let pool = memory_pool().await;
+    let payment_id = seed_pending_payment(&pool, None).await;
+
+    let (a, b) = tokio::join!(
+        db::cancel_payment(&pool, &payment_id, "test-merchant"),
+        db::cancel_payment(&pool, &payment_id, "test-merchant"),
+    );
+
+    let a = a.expect("first cancel must not error");
+    let b = b.expect("second cancel must not error");
+
+    let cancelled = [&a, &b]
+        .iter()
+        .filter(|o| ***o == CancelOutcome::Cancelled)
+        .count();
+    let not_pending = [&a, &b]
+        .iter()
+        .filter(|o| ***o == CancelOutcome::NotPending)
+        .count();
+
+    assert_eq!(
+        cancelled, 1,
+        "exactly one cancel must succeed; outcomes: {a:?}, {b:?}"
+    );
+    assert_eq!(
+        not_pending, 1,
+        "exactly one cancel must report NotPending; outcomes: {a:?}, {b:?}"
+    );
+
+    let payment = db::get_payment(&pool, &payment_id).await.unwrap().unwrap();
+    assert_eq!(payment.status, "cancelled");
+}
+
 // ── issue #621: DB-level trigger backs up the last-key guard ─────────────────
 
 #[tokio::test]

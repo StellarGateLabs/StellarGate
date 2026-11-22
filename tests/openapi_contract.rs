@@ -147,6 +147,11 @@ fn contract() -> Vec<DocOp> {
         },
         DocOp {
             method: Method::POST,
+            v1: "/v1/payments/contract-probe/cancel",
+            legacy: "/payments/contract-probe/cancel",
+        },
+        DocOp {
+            method: Method::POST,
             v1: "/v1/payments/contract-probe/webhooks/contract-delivery/redeliver",
             legacy: "/payments/contract-probe/webhooks/contract-delivery/redeliver",
         },
@@ -306,12 +311,14 @@ async fn openapi_documents_exactly_the_intended_paths() {
         "/v1/merchants/{id}/keys/{key_id}",
         "/v1/payments",
         "/v1/payments/{id}",
+        "/v1/payments/{id}/cancel",
         "/v1/payments/{id}/webhooks",
         "/v1/payments/{id}/webhooks/{delivery_id}/redeliver",
         // Deprecated unprefixed twins.
         "/network",
         "/payments",
         "/payments/{id}",
+        "/payments/{id}/cancel",
         "/payments/{id}/webhooks",
         "/payments/{id}/webhooks/{delivery_id}/redeliver",
     ]
