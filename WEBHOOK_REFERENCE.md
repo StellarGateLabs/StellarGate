@@ -57,6 +57,14 @@ body, so they are covered by the HMAC signature.
 
 StellarGate fires exactly one event when a payment settles, determined by comparing received amount to requested amount:
 
+### `webhook.test`
+
+Sent only by `POST /v1/webhooks/test`, so a merchant can check a receiver, its TLS
+setup and its signature verification without paying on-chain. The payload is
+`{ "event": "webhook.test", "sentAt": <unix seconds> }`. It is signed and sent with the same
+headers as real events. It is not stored in webhook deliveries, so it does not appear in
+`GET /v1/payments/{id}/webhooks`.
+
 ### `payment.completed`
 
 Fired when cumulative payment equals the requested amount exactly.
