@@ -27,6 +27,7 @@ use tower_http::{
 };
 
 mod payments;
+mod webhooks;
 
 /// Reject request bodies larger than this (256 KiB) before they hit a handler.
 const MAX_BODY_BYTES: usize = 256 * 1024;
@@ -364,6 +365,19 @@ fn api_v1(
         "/{id}/webhooks/{delivery_id}/redeliver",
         post(payments::redeliver_webhook)
             .route_layer(middleware::from_fn_with_state(
+                merchant_redeliver_limit.clone(),
+                merchant_redeliver_limit_middleware,
+            ))
+            .route_layer(auth_layer()),
+    );
+
+    /* Test delivery (#1048). It makes the same kind of outbound request as
+    redelivery, so it gets the same credential check and the same per-merchant
+    limiter, sharing that quota. Nothing is written to `webhook_deliveries`. */
+    let webhooks = axum::Router::new().route(
+        "/test",
+        post(webhooks::send_test)
+            .route_layer(middleware::from_fn_with_state(
                 merchant_redeliver_limit,
                 merchant_redeliver_limit_middleware,
             ))
@@ -390,6 +404,7 @@ fn api_v1(
               own payment has no API key. See `payments::get_by_id`. */
             .route("/{id}", get(payments::get_by_id)),
     )
+    .nest("/webhooks", webhooks)
 }
 
 /// Tag a response served from an unversioned path as deprecated.
@@ -1782,6 +1797,18 @@ mod tests {
             payment_metrics: crate::metrics::PaymentMetrics::new(),
             task_health: crate::TaskHealth::new(),
         })
+    }
+
+    #[tokio::test]
+    async fn webhook_test_endpoint_requires_credentials() {
+        let state = header_test_state("testnet").await;
+        let server = TestServer::new(router(state));
+
+        let res = server
+            .post("/v1/webhooks/test")
+            .json(&json!({ "url": "https://example.com/hook" }))
+            .await;
+        res.assert_status(StatusCode::UNAUTHORIZED);
     }
 
     /// Representatives of the three acceptance criteria:

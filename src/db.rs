@@ -73,7 +73,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             amount TEXT NOT NULL,
             asset TEXT NOT NULL DEFAULT 'XLM',
             asset_issuer TEXT,
-            status TEXT NOT NULL DEFAULT 'pending',
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed', 'underpaid', 'expired')),
             webhook_url TEXT,
             tx_hash TEXT,
             paid_amount TEXT,
@@ -158,7 +158,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             url TEXT NOT NULL,
             payload TEXT NOT NULL,
             event_type TEXT,
-            status TEXT NOT NULL DEFAULT 'pending',
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'delivered', 'failed')),
             attempts INTEGER NOT NULL DEFAULT 0,
             last_attempt TEXT,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
@@ -497,6 +497,200 @@ pub async fn migrate(pool: &Db) -> Result<()> {
         sqlx::query(sqlx::AssertSqlSafe(sql))
             .execute(&mut *tx)
             .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Statuses the API and the watcher write. The CHECK constraints keep any other
+/// value out of these tables: a row with an unknown status is handled by no
+/// query, so it is never swept, redriven or pruned.
+const PAYMENT_STATUSES: [&str; 4] = ["pending", "completed", "underpaid", "expired"];
+const WEBHOOK_DELIVERY_STATUSES: [&str; 3] = ["pending", "delivered", "failed"];
+
+/// Final DDL for `payments`, used when rebuilding a table created before the
+/// CHECK existed. Matches the fresh-database statement in [`migrate`].
+const PAYMENTS_REBUILD_DDL: &str = "CREATE TABLE payments (
+            id TEXT PRIMARY KEY,
+            merchant_id TEXT NOT NULL DEFAULT 'anonymous',
+            destination_address TEXT NOT NULL,
+            memo TEXT NOT NULL UNIQUE,
+            amount TEXT NOT NULL,
+            asset TEXT NOT NULL DEFAULT 'XLM',
+            asset_issuer TEXT,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed', 'underpaid', 'expired')),
+            webhook_url TEXT,
+            tx_hash TEXT,
+            paid_amount TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            expires_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 hour'))
+        )";
+
+/// Final DDL for `webhook_deliveries`, used when rebuilding a table created
+/// before the CHECK existed.
+const WEBHOOK_DELIVERIES_REBUILD_DDL: &str = "CREATE TABLE webhook_deliveries (
+            id TEXT PRIMARY KEY,
+            payment_id TEXT NOT NULL,
+            url TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            event_type TEXT,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'delivered', 'failed')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_attempt TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            acknowledged_at TEXT,
+            manual_attempts INTEGER NOT NULL DEFAULT 0
+        )";
+
+const PAYMENTS_INDEXES: [&str; 4] = [
+    "CREATE INDEX IF NOT EXISTS idx_payments_memo ON payments(memo)",
+    "CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)",
+    "CREATE INDEX IF NOT EXISTS idx_payments_created_id ON payments(created_at DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_payments_status_expires_at ON payments(status, expires_at)
+         WHERE status IN ('pending', 'underpaid')",
+];
+
+const WEBHOOK_DELIVERIES_INDEXES: [&str; 2] = [
+    "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_payment ON webhook_deliveries(payment_id)",
+    "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_redrive
+         ON webhook_deliveries(status, attempts, last_attempt, created_at)
+         WHERE status IN ('pending', 'failed')",
+];
+
+/// Rows whose status is outside the allowed set, as `(table, status, count)`.
+/// Empty when every row is valid.
+pub async fn out_of_set_statuses(pool: &Db) -> Result<Vec<(String, String, i64)>> {
+    let checks: Vec<(&str, &[&str])> = vec![
+        ("payments", &PAYMENT_STATUSES[..]),
+        ("webhook_deliveries", &WEBHOOK_DELIVERY_STATUSES[..]),
+    ];
+
+    let mut found = Vec::new();
+    for (table, allowed) in checks {
+        let placeholders = vec!["?"; allowed.len()].join(", ");
+        let sql = format!(
+            "SELECT status, COUNT(*) FROM {table} WHERE status NOT IN ({placeholders}) GROUP BY status"
+        );
+        let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
+        for status in allowed {
+            query = query.bind(*status);
+        }
+        for (status, count) in query.fetch_all(pool).await? {
+            found.push((table.to_string(), status, count));
+        }
+    }
+    Ok(found)
+}
+
+/// True when `table` exists and its stored DDL has no status CHECK.
+async fn lacks_status_check(pool: &Db, table: &str) -> Result<bool> {
+    let ddl: Option<String> =
+        sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+            .bind(table)
+            .fetch_optional(pool)
+            .await?;
+    Ok(ddl.is_some_and(|sql| !sql.contains("CHECK (status IN")))
+}
+
+/// Adds the status CHECK to tables created before it existed.
+///
+/// Reports every row whose status is outside the allowed set. When any such row
+/// exists, the constraint is not added: the rebuild would fail on that row, and
+/// the row is what needs fixing. The warning names each offending value.
+pub async fn enforce_status_checks(pool: &Db) -> Result<()> {
+    let out_of_set = out_of_set_statuses(pool).await?;
+    if !out_of_set.is_empty() {
+        for (table, status, count) in &out_of_set {
+            tracing::warn!(
+                table = %table,
+                status = %status,
+                count,
+                "rows with a status outside the allowed set; status CHECK not added"
+            );
+        }
+        return Ok(());
+    }
+
+    if lacks_status_check(pool, "payments").await? {
+        rebuild_table(pool, "payments", PAYMENTS_REBUILD_DDL, &PAYMENTS_INDEXES).await?;
+    }
+    if lacks_status_check(pool, "webhook_deliveries").await? {
+        rebuild_table(
+            pool,
+            "webhook_deliveries",
+            WEBHOOK_DELIVERIES_REBUILD_DDL,
+            &WEBHOOK_DELIVERIES_INDEXES,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Rebuilds `table` from `create` and copies every row across.
+///
+/// Runs with foreign keys off on one connection. Dropping `payments` with them
+/// on would cascade-delete its deliveries. Foreign keys are switched back on
+/// afterwards whether or not the rebuild succeeded.
+async fn rebuild_table(pool: &Db, table: &str, create: &str, indexes: &[&str]) -> Result<()> {
+    let mut conn = pool.acquire().await?;
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *conn)
+        .await?;
+
+    let outcome = rebuild_on(&mut *conn, table, create, indexes).await;
+
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *conn)
+        .await?;
+    outcome
+}
+
+/// The transactional body of [`rebuild_table`]: copy, drop, create, restore,
+/// index, then `foreign_key_check`. Commits only if the check is clean.
+async fn rebuild_on(
+    conn: &mut sqlx::SqliteConnection,
+    table: &str,
+    create: &str,
+    indexes: &[&str],
+) -> Result<()> {
+    let mut tx = conn.begin().await?;
+
+    sqlx::query(&format!(
+        "CREATE TEMP TABLE {table}_rebuild_src AS SELECT * FROM {table}"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!("DROP TABLE {table}"))
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(create).execute(&mut *tx).await?;
+
+    let columns: Vec<String> =
+        sqlx::query_scalar(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .fetch_all(&mut *tx)
+            .await?;
+    let column_list = columns.join(", ");
+    sqlx::query(&format!(
+        "INSERT INTO {table} ({column_list}) SELECT {column_list} FROM temp.{table}_rebuild_src"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!("DROP TABLE temp.{table}_rebuild_src"))
+        .execute(&mut *tx)
+        .await?;
+
+    for index in indexes {
+        sqlx::query(index).execute(&mut *tx).await?;
+    }
+
+    if !sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&mut *tx)
+        .await?
+        .is_empty()
+    {
+        anyhow::bail!("foreign key check failed after rebuilding {table}");
     }
 
     tx.commit().await?;

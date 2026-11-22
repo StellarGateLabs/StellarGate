@@ -1069,6 +1069,54 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /v1/webhooks/test:
+    post:
+      operationId: sendTestWebhook
+      summary: Send a test webhook to a URL
+      description: |
+        Sends a signed `webhook.test` event to `url` through the same SSRF guard,
+        signing and client as real deliveries. The receiver's status code and
+        latency are returned. Nothing is stored in webhook deliveries.
+
+        Shares the redelivery rate limit for the merchant.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  type: string
+                  format: uri
+      responses:
+        "200":
+          description: The receiver's outcome. `delivered` is false when the receiver answered with a non-2xx status or the request failed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  delivered:
+                    type: boolean
+                  status:
+                    type: integer
+                    nullable: true
+                  latencyMs:
+                    type: integer
+                  error:
+                    type: string
+                    nullable: true
+                    enum: [timeout, request_failed]
+        "400":
+          description: The URL was rejected (`invalid_webhook_url`).
+        "401":
+          description: Missing or invalid credentials.
+        "429":
+          description: Rate limit exceeded.
   /v1/payments/{id}/webhooks/{delivery_id}/redeliver:
     post:
       operationId: redeliverWebhook
