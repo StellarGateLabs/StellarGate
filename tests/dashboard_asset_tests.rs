@@ -241,7 +241,7 @@ fn dashboard_api_requests_use_canonical_v1_base() {
     assert_eq!(
         direct_fetches,
         [
-            "return fetch(API_BASE + path, { method: opts.method || \"GET\", headers: headers, body: opts.body || null }).then(",
+            "return fetch(API_BASE + path, { method: opts.method || \"GET\", headers: headers, body: opts.body || undefined, signal: opts.signal }).then(",
             "fetch(\"/\")",
             "fetch(\"/ready\", { headers: { Accept: \"application/json\" } })",
         ],

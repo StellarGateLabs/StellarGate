@@ -41,6 +41,32 @@ const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default probe path when the subcommand is invoked without one.
 const HEALTHCHECK_DEFAULT_PATH: &str = "health";
 
+fn init_tracing() -> Result<()> {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    match std::env::var("LOG_FORMAT")
+        .unwrap_or_else(|_| "text".into())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "text" | "" => {
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+        }
+        "json" => {
+            tracing_subscriber::fmt()
+                .json()
+                .flatten_event(true)
+                .with_env_filter(filter)
+                .init();
+        }
+        other => {
+            anyhow::bail!(
+                "LOG_FORMAT={other:?} is not recognised; valid values are \"text\" or \"json\""
+            );
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load `.env` first so every setting in it is visible to the code below:
@@ -61,9 +87,7 @@ async fn main() -> Result<()> {
         std::process::exit(code);
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .init();
+    init_tracing()?;
 
     let cfg = Config::from_env()?;
     // `open_pool` builds every connection through `db::connect_options`, which

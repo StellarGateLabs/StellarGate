@@ -27,7 +27,14 @@ RUN cargo build --release --locked
 # ── Stage 2: slim runtime image ───────────────────────────────────────────────
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
 
-LABEL org.opencontainers.image.description="Non-custodial payment gateway API for accepting and settling payments on the Stellar network"
+ARG VERSION=dev
+ARG VCS_REF=unknown
+
+LABEL org.opencontainers.image.description="Non-custodial payment gateway API for accepting and settling payments on the Stellar network" \
+    org.opencontainers.image.source="https://github.com/StellarGateLabs/StellarGate" \
+    org.opencontainers.image.licenses="MIT" \
+    org.opencontainers.image.version="${VERSION}" \
+    org.opencontainers.image.revision="${VCS_REF}"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \

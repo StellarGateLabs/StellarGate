@@ -194,39 +194,165 @@ mod tests {
         })
     }
 
-    /// Aged terminal deliveries go; recent ones and in-flight ones stay.
+    /// Aged terminal deliveries go per the retention policy: delivered and
+    /// acknowledged-failed rows are deleted; an unacknowledged failure is
+    /// compacted (kept, payload cleared). Recent and in-flight rows stay.
     #[tokio::test]
-    async fn prunes_only_aged_terminal_deliveries() {
+    async fn prunes_aged_terminal_deliveries_per_policy() {
         let state = state_with(test_config(30, 7)).await;
 
-        for (id, status, age_days) in [
-            ("old-delivered", "delivered", 60),
-            ("old-failed", "failed", 60),
-            ("old-pending", "pending", 60), // still owned by the redrive worker
-            ("new-delivered", "delivered", 1),
-        ] {
+        // (id, status, age_days, acknowledged_at, payload)
+        let rows: [(&str, &str, i64, Option<&str>, &str); 5] = [
+            // Aged delivered — deleted.
+            ("old-delivered", "delivered", 60, None, "{}"),
+            // Aged failed, acknowledged — deleted (returned to ordinary retention).
+            ("old-failed-ack", "failed", 60, Some("2024-01-01T00:00:00Z"), "{}"),
+            // Aged failed, unacknowledged — compacted: row kept, payload cleared.
+            ("old-failed-unack", "failed", 60, None, "{\"event\":\"payment.completed\"}"),
+            // Aged pending — still owned by the redrive worker, never pruned.
+            ("old-pending", "pending", 60, None, "{}"),
+            // Recent delivered — inside the window, kept.
+            ("new-delivered", "delivered", 1, None, "{}"),
+        ];
+        for (id, status, age_days, ack, payload) in rows {
             sqlx::query(
                 "INSERT INTO webhook_deliveries
-                 (id, payment_id, url, payload, status, attempts, created_at)
-                 VALUES (?, 'p', 'https://e.example/h', '{}', ?, 1,
-                         strftime('%Y-%m-%dT%H:%M:%SZ','now', ?))",
+                 (id, payment_id, url, payload, status, attempts, created_at, acknowledged_at)
+                 VALUES (?, 'p', 'https://e.example/h', ?, ?, 1,
+                         strftime('%Y-%m-%dT%H:%M:%SZ','now', ?), ?)",
             )
             .bind(id)
+            .bind(payload)
             .bind(status)
             .bind(format!("-{age_days} days"))
+            .bind(ack)
             .execute(&state.pool)
             .await
-            .expect("pending delivery count should load from sqlite");
+            .expect("delivery row should load from sqlite");
         }
 
         let (deliveries, _) = prune_once(&state).await.expect("prune_once should succeed");
-        assert_eq!(deliveries, 2, "both aged terminal rows should go");
+        // Two deleted (old-delivered, old-failed-ack) + one compacted (old-failed-unack).
+        assert_eq!(
+            deliveries, 3,
+            "two aged rows deleted and one unacknowledged failure compacted"
+        );
 
         let left: Vec<String> = sqlx::query_scalar("SELECT id FROM webhook_deliveries ORDER BY id")
             .fetch_all(&state.pool)
             .await
-            .expect("backlog drain should leave no deliveries behind");
-        assert_eq!(left, vec!["new-delivered", "old-pending"]);
+            .expect("remaining deliveries should load");
+        // old-failed-unack survives (compacted); old-pending and new-delivered stay.
+        assert_eq!(
+            left,
+            vec!["new-delivered", "old-failed-unack", "old-pending"]
+        );
+
+        // The unacknowledged failure survives with its payload cleared.
+        let unack_payload: String =
+            sqlx::query_scalar("SELECT payload FROM webhook_deliveries WHERE id = 'old-failed-unack'")
+                .fetch_one(&state.pool)
+                .await
+                .expect("compacted row payload should load");
+        assert_eq!(
+            unack_payload, "",
+            "unacknowledged failure must be compacted, not deleted"
+        );
+    }
+
+    /// An unacknowledged failed row older than the window survives pruning with
+    /// its payload cleared (issue #998).
+    #[tokio::test]
+    async fn unacknowledged_failed_row_survives_with_payload_cleared() {
+        let state = state_with(test_config(30, 7)).await;
+        sqlx::query(
+            "INSERT INTO webhook_deliveries
+             (id, payment_id, url, payload, status, created_at)
+             VALUES ('unack-fail', 'p', 'https://e.example/h', '{\"event\":\"payment.completed\"}',
+                     'failed', strftime('%Y-%m-%dT%H:%M:%SZ','now','-60 days'))",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        prune_once(&state).await.unwrap();
+
+        let payload: Option<String> =
+            sqlx::query_scalar("SELECT payload FROM webhook_deliveries WHERE id = 'unack-fail'")
+                .fetch_optional(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            payload.as_deref(),
+            Some(""),
+            "unacknowledged failure must survive with its payload cleared"
+        );
+    }
+
+    /// An acknowledged failed row is deleted after the window (issue #998).
+    #[tokio::test]
+    async fn acknowledged_failed_row_is_deleted_after_the_window() {
+        let state = state_with(test_config(30, 7)).await;
+        sqlx::query(
+            "INSERT INTO webhook_deliveries
+             (id, payment_id, url, payload, status, created_at, acknowledged_at)
+             VALUES ('ack-fail', 'p', 'https://e.example/h', '{\"event\":\"payment.completed\"}',
+                     'failed', strftime('%Y-%m-%dT%H:%M:%SZ','now','-60 days'),
+                     '2024-01-01T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        prune_once(&state).await.unwrap();
+
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries WHERE id = 'ack-fail'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 0, "an acknowledged failed row must be deleted after the window");
+    }
+
+    /// Retention ages rows by last activity, not `created_at`: a delivery
+    /// created 40 days ago whose last attempt was today is not pruned under a
+    /// 30-day window (issue #999).
+    #[tokio::test]
+    async fn retention_ages_by_last_attempt_not_created_at() {
+        let state = state_with(test_config(30, 7)).await;
+        // Created 40 days ago — past a 30-day window on created_at alone — but
+        // the redrive worker retried it today, so last_attempt is now.
+        sqlx::query(
+            "INSERT INTO webhook_deliveries
+             (id, payment_id, url, payload, status, attempts, created_at, last_attempt)
+             VALUES ('retried-today', 'p', 'https://e.example/h', '{}', 'failed', 5,
+                     strftime('%Y-%m-%dT%H:%M:%SZ','now','-40 days'),
+                     strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        prune_once(&state).await.unwrap();
+
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries WHERE id = 'retried-today'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            n, 1,
+            "a delivery retried today must not be pruned under a 30-day window"
+        );
+
+        // Still in window by last_attempt, so an unacknowledged failure keeps
+        // its payload (not compacted yet).
+        let payload: String =
+            sqlx::query_scalar("SELECT payload FROM webhook_deliveries WHERE id = 'retried-today'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(payload, "{}", "an in-window failure must keep its payload");
     }
 
     /// A pending delivery must never be pruned, however old: the redrive

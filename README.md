@@ -1627,7 +1627,10 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 | `stellargate_horizon_cursor_age_seconds` | gauge | Age of the most recently processed Horizon payment record — the sharpest signal of payment-detection lag |
 | `stellargate_http_requests_total` | counter | HTTP requests, labelled by `method`, matched `route` (never the raw path — bounded cardinality), and `status` |
 | `stellargate_http_request_duration_seconds` | histogram | HTTP request latency, labelled by `method` and matched `route` |
-| `stellargate_payments_total` | counter | Payments labelled by lifecycle `status` (`created`, `completed`, `overpaid`, `underpaid`, `expired`, `cancelled`) |
+| `stellargate_payments_total` | counter | Payments labelled by lifecycle `status` (`created`, `completed`, `overpaid`, `underpaid`, `expired`, `cancelled`, `unexpected`) |
+| `stellargate_horizon_stream_reconnects_total` | counter | Times the Horizon SSE listener reconnected after idle or transport failure |
+| `stellargate_horizon_repeated_cursor_4xx_total` | counter | Cursor incidents that reached three consecutive non-rate-limit Horizon 4xx responses |
+| `stellargate_horizon_records_skipped_total` | counter | Horizon payment records the reconciler refused to credit, by `reason` |
 | `stellargate_payment_settlement_latency_seconds` | histogram | Time from payment creation to a settlement outcome |
 | `stellargate_db_pool_connections` | gauge | SQLite connection pool size, labelled by `state` (`idle`, `in_use`) |
 | `stellargate_db_pool_max_connections` | gauge | Configured maximum pool size |
@@ -1647,6 +1650,8 @@ on purpose" from "not running", which `stellargate_task_running` alone reports
 identically.
 
 Structured logs (via `tracing`) carry a `request_id` field on every request span, matching the `x-request-id` response header returned to clients. Every log line emitted during a request — including internal errors (`AppError`), audit events, and auth denials — inherits `request_id` automatically from the span context. Operators can search logs directly using the request ID returned in response headers:
+
+Set `LOG_FORMAT=json` for one JSON object per log line (default `text`). Invalid values abort boot.
 
 ```bash
 # Filter JSON logs by request ID quoted by a client:
@@ -1802,21 +1807,6 @@ Release history is kept in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
-## License
-
-Released under the [MIT License](LICENSE).
-
-## Handsoff notes
-
-<!-- handsoff-issue-680 -->
-- #680: Dashboard: convert promise chains to async/await
-
-<!-- handsoff-issue-285 -->
-- #285: No tracing spans carry `merchant_id` or `payment_id` through the settlement path
-
-<!-- handsoff-issue-301 -->
-- #301: `settle()` awaits webhook delivery inline, so one slow receiver stalls settlement for every other intent
-
 ### Printable payment invoices
 
 Open a payment in the dashboard and choose **Print invoice** to print or save
@@ -1826,5 +1816,6 @@ The action is enabled only after that payment has loaded.
 
 Static-only browser regression: `cd e2e && npx playwright test --config playwright.invoice.config.js`.
 
-<!-- handsoff-issue-566 -->
-- #566: Use a descriptive .expect("...") instead of bare .unwrap() in test: src/api/mod.rs:1455
+## License
+
+Released under the [MIT License](LICENSE).

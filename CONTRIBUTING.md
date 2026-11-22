@@ -127,7 +127,8 @@ the metric.
 To produce the same report locally:
 
 ```bash
-cargo install cargo-llvm-cov --locked
+The CI job installs `cargo-llvm-cov` via `taiki-e/install-action` (prebuilt binary).
+Locally: `cargo install cargo-llvm-cov --locked`, or use the same install action output.
 cargo llvm-cov --locked --all-features --lcov --output-path lcov.info
 ```
 

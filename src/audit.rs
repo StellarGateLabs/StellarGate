@@ -13,6 +13,9 @@
 use crate::{db, horizon, money};
 use serde::Serialize;
 use sqlx::Row;
+use std::collections::HashMap;
+use std::time::Duration;
+use tracing::warn;
 
 /// One recorded transaction whose on-chain total exceeds what was credited.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -25,6 +28,9 @@ pub struct Discrepancy {
     pub missing_stroops: i64,
     pub missing_amount: String,
 }
+
+const INTER_REQUEST_DELAY: Duration = Duration::from_millis(100);
+const MAX_FETCH_ATTEMPTS: u32 = 5;
 
 /// Sum of every operation in `ops` (one transaction's payment operations) that
 /// belongs to `payment`. Pure, so it is testable without a network.
@@ -54,6 +60,36 @@ pub fn discrepancy(
     })
 }
 
+async fn fetch_payments_with_retry(
+    http: &reqwest::Client,
+    horizon_url: &str,
+    tx_hash: &str,
+) -> anyhow::Result<Vec<horizon::HorizonPayment>> {
+    let mut backoff = Duration::from_secs(1);
+    for attempt in 1..=MAX_FETCH_ATTEMPTS {
+        match horizon::fetch_transaction_payments(http, horizon_url, tx_hash).await {
+            Ok(ops) => return Ok(ops),
+            Err(e) => {
+                let retry_after = e.downcast_ref::<horizon::HorizonHttpError>().and_then(|h| {
+                    if h.is_rate_limited() {
+                        h.retry_after
+                    } else {
+                        None
+                    }
+                });
+                let delay = retry_after.unwrap_or(backoff);
+                if attempt == MAX_FETCH_ATTEMPTS {
+                    return Err(e);
+                }
+                warn!(%tx_hash, attempt, ?delay, error = %e, "Horizon fetch failed; backing off");
+                tokio::time::sleep(delay).await;
+                backoff = backoff.saturating_mul(2).min(Duration::from_secs(60));
+            }
+        }
+    }
+    unreachable!()
+}
+
 /// Scan every `processed_transactions` row against Horizon and return the
 /// under-credited ones.
 pub async fn find_under_credited(
@@ -71,6 +107,7 @@ pub async fn find_under_credited(
     .await?;
 
     let mut out = Vec::new();
+    let mut cache: HashMap<String, Vec<horizon::HorizonPayment>> = HashMap::new();
     for row in rows {
         let payment_id: String = row.get("payment_id");
         let tx_hash: String = row.get("tx_hash");
@@ -78,8 +115,23 @@ pub async fn find_under_credited(
         let Some(payment) = db::get_payment(pool, &payment_id).await? else {
             continue;
         };
-        let ops = horizon::fetch_transaction_payments(http, horizon_url, &tx_hash).await?;
+        let ops = if let Some(cached) = cache.get(&tx_hash) {
+            cached.clone()
+        } else {
+            match fetch_payments_with_retry(http, horizon_url, &tx_hash).await {
+                Ok(ops) => {
+                    cache.insert(tx_hash.clone(), ops.clone());
+                    ops
+                }
+                Err(e) => {
+                    warn!(%tx_hash, %payment_id, error = %e, "skipping row after Horizon fetch failures");
+                    tokio::time::sleep(INTER_REQUEST_DELAY).await;
+                    continue;
+                }
+            }
+        };
         out.extend(discrepancy(&payment, &tx_hash, recorded, &ops));
+        tokio::time::sleep(INTER_REQUEST_DELAY).await;
     }
     Ok(out)
 }

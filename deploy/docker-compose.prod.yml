@@ -18,6 +18,13 @@ services:
   app:
     image: ghcr.io/stellargatelabs/stellargate:${STELLARGATE_VERSION:?Set STELLARGATE_VERSION in deploy/stellargate.env to a released tag, e.g. v1.2.3 — see https://github.com/StellarGateLabs/StellarGate/releases}
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     # Compose's own default (10s) is shorter than the app's own
     # SHUTDOWN_GRACE_SECS drain budget (default 30s) — see "Shutdown grace"
     # in DEPLOYMENT.md. Raised here so the app is never SIGKILLed mid-drain.
@@ -37,7 +44,8 @@ services:
     expose:
       - "3000"
     env_file:
-      - ./stellargate.env
+      - path: ./stellargate.env
+        required: true
     environment:
       DATABASE_URL: sqlite:///data/stellargate.db
       PORT: "3000"
@@ -63,8 +71,14 @@ services:
         max-file: "5"
 
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2.8.4-alpine@sha256:af32e97399febea808609119bb21544d0265c58a02836576e32a2d082c262c17
     restart: unless-stopped
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
     depends_on:
       - app
     # A TLS-terminating reverse proxy in front of one backend needs far less
@@ -80,8 +94,9 @@ services:
       - "80:80"
       - "443:443"
       - "443:443/udp" # HTTP/3
-    env_file:
-      - ./stellargate.env
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN in deploy/stellargate.env}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL in deploy/stellargate.env}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data # ACME account + issued certificates — must persist

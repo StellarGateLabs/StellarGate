@@ -26,7 +26,7 @@ updates:
       interval: weekly
       day: monday
       time: "07:00"
-    labels: ["dependencies", "ci"]
+    labels: ["dependencies", "ci-cd"]
     commit-message:
       prefix: "chore(ci)"
 
@@ -36,7 +36,7 @@ updates:
       interval: weekly
       day: monday
       time: "07:00"
-    labels: ["dependencies", "docker"]
+    labels: ["dependencies", "deployment"]
     commit-message:
       prefix: "chore(docker)"
     ignore:
@@ -52,6 +52,17 @@ updates:
       - dependency-name: "rust"
         update-types:
           ["version-update:semver-major", "version-update:semver-minor"]
+
+  # Production compose images (Caddy, etc.) live under deploy/.
+  - package-ecosystem: docker-compose
+    directory: "/deploy"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+    labels: ["dependencies", "deployment"]
+    commit-message:
+      prefix: "chore(deploy)"
 
   # End-to-end dashboard tests depend on Playwright in e2e/.
   # Kept covered so security advisories surface and browser versions stay current.

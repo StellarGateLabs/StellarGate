@@ -58,10 +58,21 @@ if command -v firewall-cmd >/dev/null 2>&1 && sudo systemctl is-active --quiet f
 elif command -v iptables >/dev/null 2>&1; then
 	# Ubuntu on Oracle: rules live in iptables with a REJECT catch-all, so new
 	# ACCEPT rules must be INSERTed above it, not appended after.
-	for port in 80 443; do
-		if ! sudo iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
-			sudo iptables -I INPUT 6 -p tcp --dport "$port" -j ACCEPT
+	insert_iptables_accept() {
+		local port="$1"
+		if sudo iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
+			return 0
 		fi
+		local reject_line
+		reject_line="$(sudo iptables -L INPUT --line-numbers -n | awk '/REJECT|DROP/ {print $1; exit}')"
+		if [ -n "$reject_line" ]; then
+			sudo iptables -I INPUT "$reject_line" -p tcp --dport "$port" -j ACCEPT
+		else
+			sudo iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
+		fi
+	}
+	for port in 80 443; do
+		insert_iptables_accept "$port"
 	done
 	if command -v netfilter-persistent >/dev/null 2>&1; then
 		sudo netfilter-persistent save
@@ -146,7 +157,9 @@ cat <<EOF
 
     3. sudo systemctl start stellargate
 
-    4. curl https://<your-domain>/health
+    4. curl -fsS https://<your-domain>/ -o /dev/null
+       # Or probe readiness inside the stack (edge blocks /health publicly):
+       # docker compose --env-file deploy/stellargate.env -f deploy/docker-compose.prod.yml exec -T app stellargate healthcheck ready
 
   Logs:    docker compose --env-file deploy/stellargate.env -f deploy/docker-compose.prod.yml logs -f
   Status:  systemctl status stellargate

@@ -24,9 +24,12 @@ use crate::supervise::TaskExit;
 use crate::{AppState, db};
 // `KeyInit` provides `new_from_slice`; it moved off `Mac` in hmac 0.13.
 use hmac::{Hmac, KeyInit, Mac};
+use moka::sync::Cache;
 use serde_json::json;
 use sha2::Sha256;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Semaphore, watch};
 use tracing::{debug, info, warn};
@@ -332,12 +335,83 @@ fn blocked_delivery_attempts(state: &AppState) -> i64 {
 /// timeout so that each delivery attempt is independently bounded. Honors
 /// `webhook_allow_private_targets` for local dev/tests that intentionally
 /// target a loopback mock server.
+///
+/// The pinned client is **cached** keyed by `(host, validated address, timeout)`
+/// (see [`WEBHOOK_CLIENTS`]) so a settlement burst to one receiver reuses one
+/// connection pool instead of paying a fresh TCP handshake and TLS negotiation
+/// per event. SSRF safety is preserved because the cache key embeds the
+/// address `validate` just confirmed: every call still resolves and range-
+/// checks DNS first, and a client is only reused when the host resolves to the
+/// same address it was pinned to. A DNS change yields a different key — a miss
+/// — and a freshly built, freshly pinned client.
 pub(crate) async fn safe_client(state: &AppState, url: &str) -> anyhow::Result<reqwest::Client> {
     let target = crate::ssrf::validate(url, state.config.webhook_allow_private_targets).await?;
-    Ok(crate::ssrf::pinned_client(
-        &target,
-        Duration::from_secs(state.config.webhook_timeout_secs),
-    )?)
+    let timeout = Duration::from_secs(state.config.webhook_timeout_secs);
+    Ok(pinned_client_cached(&target, timeout)?)
+}
+
+/// Maximum number of distinct pinned webhook clients retained at once. Bounds
+/// resident memory: each entry holds a `reqwest::Client` and its connection
+/// pool. The number of distinct receivers a gateway talks to is small, so this
+/// only needs to stay comfortably above it while evicting abandoned receivers.
+const WEBHOOK_CLIENT_CACHE_MAX: u64 = 1024;
+
+/// How long an idle pinned client is retained after its last use. Long enough
+/// to span a settlement burst that stretches across a few minutes, short
+/// enough that a receiver a gateway has stopped talking to releases its pool.
+const WEBHOOK_CLIENT_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Cache key for [`WEBHOOK_CLIENTS`]. The validated address is part of the key,
+/// not just the host: that is what keeps the SSRF pinning guarantee once
+/// clients are reused — a different resolution (DNS change, or a second host
+/// name that happens to resolve to a different address) is a different key and
+/// therefore a cache miss, so it builds a new client pinned to the new
+/// address rather than reusing one pinned to the old one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct WebhookClientKey {
+    host: String,
+    addr: SocketAddr,
+    timeout_secs: u64,
+}
+
+/// Process-wide cache of SSRF-pinned webhook clients.
+///
+/// `reqwest::Client` is designed to be cloned and shared — its connection pool
+/// lives inside it — so this is the one piece of webhook dispatch state that is
+/// naturally process-global rather than per-`AppState`. It does not bypass the
+/// per-call validation in [`safe_client`]: that always runs first and rejects
+/// disallowed resolutions before this cache is ever consulted, so a target the
+/// SSRF guard blocks is never cached and never served here.
+static WEBHOOK_CLIENTS: LazyLock<Cache<WebhookClientKey, reqwest::Client>> = LazyLock::new(|| {
+    Cache::builder()
+        .max_capacity(WEBHOOK_CLIENT_CACHE_MAX)
+        .time_to_idle(WEBHOOK_CLIENT_CACHE_TTL)
+        .build()
+});
+
+/// Return a pinned client for `target`, reusing a cached one when `target`
+/// resolves to the same `(host, address)` already in the pool. On a cache miss
+/// a new client is built and inserted.
+///
+/// Two deliveries that race the same first-ever resolution can both miss and
+/// both build; last-writer-wins. Both clients are equivalent — pinned to the
+/// same already-validated address — so the discarded pool is merely a wasted
+/// handshake, never a correctness issue.
+fn pinned_client_cached(
+    target: &crate::ssrf::SafeTarget,
+    timeout: Duration,
+) -> reqwest::Result<reqwest::Client> {
+    let key = WebhookClientKey {
+        host: target.host().to_string(),
+        addr: target.addr(),
+        timeout_secs: timeout.as_secs(),
+    };
+    if let Some(client) = WEBHOOK_CLIENTS.get(&key) {
+        return Ok(client);
+    }
+    let client = crate::ssrf::pinned_client(target, timeout)?;
+    WEBHOOK_CLIENTS.insert(key, client.clone());
+    Ok(client)
 }
 
 /// Re-attempt every webhook delivery left `pending` or `failed` by a process
@@ -750,5 +824,100 @@ mod tests {
                 "serialised body must contain the event string (event={event})"
             );
         }
+    }
+
+    // ── pinned-client cache (issue #996) ────────────────────────────────────
+
+    /// Whether a client for this `(host, address, timeout)` is currently
+    /// cached. `moka::sync::Cache::get` is exact (not an estimate), so this is
+    /// a reliable presence check for the tests below.
+    #[cfg(test)]
+    fn client_cached_for(host: &str, addr: SocketAddr, timeout_secs: u64) -> bool {
+        WEBHOOK_CLIENTS
+            .get(&WebhookClientKey {
+                host: host.to_string(),
+                addr,
+                timeout_secs,
+            })
+            .is_some()
+    }
+
+    /// Two deliveries to the same receiver within the TTL reuse one
+    /// client/pool: the first call builds and caches it, and the second is a
+    /// cache hit.
+    #[tokio::test]
+    async fn same_receiver_reuses_one_pinned_client() {
+        // `allow_private` so validate() accepts the loopback address we use as
+        // a stand-in for a real receiver (no connection is ever made here).
+        let target = crate::ssrf::validate("http://127.0.0.1:9/hook", true)
+            .await
+            .expect("loopback must validate with allow_private");
+        let timeout = Duration::from_secs(10);
+
+        // First delivery: miss → build → cache.
+        let _first = pinned_client_cached(&target, timeout)
+            .expect("first pinned client should build");
+        assert!(
+            client_cached_for("127.0.0.1", target.addr(), 10),
+            "client must be cached after the first delivery"
+        );
+
+        // Second delivery to the same receiver is served from the cache.
+        let _second = pinned_client_cached(&target, timeout)
+            .expect("second pinned client should be served from the cache");
+    }
+
+    /// A DNS change still produces a newly validated, newly pinned client: the
+    /// same host resolving to a different address is a different cache key, so
+    /// it is a miss and builds a freshly pinned client rather than reusing the
+    /// one pinned to the old address.
+    #[tokio::test]
+    async fn dns_change_builds_a_newly_pinned_client() {
+        let t1 = crate::ssrf::validate("http://127.0.0.1:11/hook", true)
+            .await
+            .expect("first loopback target should validate");
+        let t2 = crate::ssrf::validate("http://127.0.0.1:12/hook", true)
+            .await
+            .expect("second loopback target should validate");
+        assert_ne!(t1.addr(), t2.addr(), "fixtures must resolve to distinct addresses");
+
+        let _ = pinned_client_cached(&t1, Duration::from_secs(10))
+            .expect("first pinned client should build");
+        assert!(
+            client_cached_for("127.0.0.1", t1.addr(), 10),
+            "the first resolution's client must be cached"
+        );
+        assert!(
+            !client_cached_for("127.0.0.1", t2.addr(), 10),
+            "a different validated address must not reuse the first client's entry"
+        );
+
+        let _ = pinned_client_cached(&t2, Duration::from_secs(10))
+            .expect("second pinned client should build for the new address");
+        assert!(
+            client_cached_for("127.0.0.1", t2.addr(), 10),
+            "the new resolution's client must be cached separately"
+        );
+    }
+
+    /// A different host name resolving to the same address must not reuse a
+    /// client pinned for the other host: the cache key includes the host, since
+    /// pinning binds a specific host (Host header / SNI) to the address.
+    #[tokio::test]
+    async fn different_host_at_same_address_is_not_reused() {
+        let addr: SocketAddr = "127.0.0.1:21".parse().unwrap();
+        // Same validated address, two different host names: the cache keys must
+        // differ so a client pinned for one host is never served for the other.
+        let key_a = WebhookClientKey {
+            host: "a.example".into(),
+            addr,
+            timeout_secs: 10,
+        };
+        let key_b = WebhookClientKey {
+            host: "b.example".into(),
+            addr,
+            timeout_secs: 10,
+        };
+        assert_ne!(key_a, key_b, "host must be part of the cache key");
     }
 }

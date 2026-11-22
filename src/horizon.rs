@@ -1464,6 +1464,7 @@ async fn reconcile_post_terminal_payment(
     dispatch carries the original terminal status — it is not mutated. The
     `delta` field carries the unexpected amount so the merchant knows exactly
     how much to refund. */
+    state.payment_metrics.record_unexpected();
     webhook::dispatch(state, payment, "payment.unexpected", Some(&amount_str)).await;
     Ok(())
 }

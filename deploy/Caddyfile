@@ -27,6 +27,15 @@
 	@metrics path /metrics /v1/metrics
 	respond @metrics 404
 
+	# Optional: restrict admin UI and provisioning API to known networks.
+	# When ADMIN_ALLOWED_CIDRS is unset or empty, admin routes stay reachable
+	# from anywhere (legacy behaviour).
+	@admin_blocked {
+		path /dashboard/admin* /dashboard/admin.js /v1/merchants* /merchants*
+		not remote_ip {$ADMIN_ALLOWED_CIDRS}
+	}
+	respond @admin_blocked 404
+
 	# /ready and /health are liveness/readiness probes for the orchestrator.
 	# They are unauthenticated and exempt from the app-side rate limiter, and
 	# /ready contacts Horizon — so exposing them publicly lets anonymous

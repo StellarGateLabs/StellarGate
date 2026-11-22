@@ -481,6 +481,7 @@ struct PaymentMetricsInner {
     overpaid: AtomicU64,
     underpaid: AtomicU64,
     expired: AtomicU64,
+    unexpected: AtomicU64,
     settlement_latency_sum_secs: AtomicU64,
     settlement_latency_count: AtomicU64,
     settlement_latency_buckets: [AtomicU64; 12],
@@ -494,6 +495,7 @@ impl Default for PaymentMetricsInner {
             overpaid: AtomicU64::new(0),
             underpaid: AtomicU64::new(0),
             expired: AtomicU64::new(0),
+            unexpected: AtomicU64::new(0),
             settlement_latency_sum_secs: AtomicU64::new(0),
             settlement_latency_count: AtomicU64::new(0),
             settlement_latency_buckets: Default::default(),
@@ -517,6 +519,11 @@ impl PaymentMetrics {
     /// Record a payment intent swept to `expired` by the sweeper.
     pub fn record_expired(&self) {
         self.inner.expired.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record funds received after an intent reached a terminal status.
+    pub fn record_unexpected(&self) {
+        self.inner.unexpected.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a settlement outcome (`completed`, `overpaid`, or `underpaid`)
@@ -568,6 +575,9 @@ impl PaymentMetrics {
     }
     pub fn expired(&self) -> u64 {
         self.inner.expired.load(Ordering::Relaxed)
+    }
+    pub fn unexpected(&self) -> u64 {
+        self.inner.unexpected.load(Ordering::Relaxed)
     }
     pub fn settlement_latency_sum_secs(&self) -> u64 {
         self.inner
@@ -1083,7 +1093,9 @@ pub fn render(
     }
 
     // stellargate_payments_total — counter vec by lifecycle status.
-    out.push_str("# HELP stellargate_payments_total Total payments by lifecycle status.\n");
+    out.push_str(
+        "# HELP stellargate_payments_total Total payments by lifecycle status (including unexpected post-terminal receipts).\n",
+    );
     out.push_str("# TYPE stellargate_payments_total counter\n");
     out.push_str(&format!(
         "stellargate_payments_total{{status=\"created\"}} {}\n",
@@ -1104,6 +1116,10 @@ pub fn render(
     out.push_str(&format!(
         "stellargate_payments_total{{status=\"expired\"}} {}\n",
         payments.expired()
+    ));
+    out.push_str(&format!(
+        "stellargate_payments_total{{status=\"unexpected\"}} {}\n",
+        payments.unexpected()
     ));
 
     // stellargate_payment_settlement_latency_seconds — histogram: creation to

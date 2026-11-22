@@ -13,26 +13,62 @@ This document describes how to deploy the gateway in production.
 They are unauthenticated and are exempt from the API rate limiter, so they must
 not be reachable from the public internet.
 
-- Point probes at the container directly (e.g. `http://<container-ip>:8080/ready`)
-or at an internal-only listener, not through the public reverse proxy.
-- If you front the gateway with Caddy (see `deploy/Caddyfile`), restrict
-`/ready` and `/health` to internal sources (private CIDRs / the orchestrator's
-address) and do not expose them on the public site block.
+- Point probes at the container directly (e.g. `http://app:3000/ready` on the
+  Docker network) or at an internal-only listener, not through the public
+  reverse proxy.
+- If you front the gateway with Caddy (see `deploy/Caddyfile`), block
+  `/ready` and `/health` on the public site block (the stock Caddyfile does
+  this).
 
 Exposing `/ready` publicly lets anonymous callers drive outbound Horizon
 requests and can get the gateway's egress IP rate-limited by Horizon, which
 degrades payment detection.
 
+## Shutdown grace
+
+The gateway honours `SHUTDOWN_GRACE_SECS` (default 30) while draining HTTP and
+background tasks. Docker Compose should set `stop_grace_period` a few seconds
+**above** that budget so the process is not SIGKILL'd mid-drain — the root
+`docker-compose.yml` and `deploy/docker-compose.prod.yml` use `35s`.
+
+## Resource limits
+
+`deploy/docker-compose.prod.yml` sets CPU and memory limits sized for a small
+always-on VM (see comments in that file). Dev defaults live in the root
+`docker-compose.yml` and can be overridden with `COMPOSE_CPU_LIMIT` /
+`COMPOSE_MEMORY_LIMIT` / `COMPOSE_MEMORY_RESERVATION`.
+
+## Backup procedure
+
+The SQLite database lives in the `stellargate_data` volume (`/data` in the app
+container). To back up:
+
+1. `docker compose … stop app` (or pause traffic at the proxy).
+2. Copy `/data/stellargate.db` and any `-wal`/`-shm` siblings from the volume.
+3. Start the stack again.
+
+Restore by placing the files back into a fresh volume before first boot.
+
+## Forward-only migrations
+
+Schema changes are applied only through idempotent statements in `db::migrate`
+on every startup — there is no down migration. Roll forward with a fixed
+release image; see [MIGRATIONS.md](MIGRATIONS.md).
+
+## Operating
+
+- **Metrics:** scrape `GET /metrics` with `Authorization: Bearer <METRICS_TOKEN>` from a trusted network (blocked at the Caddy edge by default).
+- **Logs:** container stdout; set `RUST_LOG` in `stellargate.env`. Structured JSON via `LOG_FORMAT=json` when supported by your release.
+
 ## Environment
 
-See `.env.example` for the full list of configuration variables, including
-`STELLAR_HORIZON_URL`, `DATABASE_URL`, and the API bind address.
+See `.env.example` and `deploy/stellargate.env.example` for configuration.
+`PORT` defaults to `3000`; the API listens on `BIND_ADDR` (default all IPv4
+interfaces). Settings in a `.env` file are read at startup, including
+`RUST_LOG` and `PORT` (used by `stellargate healthcheck`). Variables already
+set in the process environment take precedence over `.env`.
 
-`PORT` and `BIND_ADDR` set where the API listens. The default `BIND_ADDR` of
-`0.0.0.0` listens on all IPv4 interfaces. When a reverse proxy on the same host
-is the only client, set `BIND_ADDR=127.0.0.1` so the API is unreachable from
-other hosts. Use `BIND_ADDR=::` to listen on IPv6.
+## Upgrades and rollback
 
-Settings in a `.env` file are read at startup, including `RUST_LOG` and `PORT`
-(used by `stellargate healthcheck`). Variables already set in the process
-environment take precedence over `.env`.
+Pin `STELLARGATE_VERSION` in `deploy/stellargate.env` to a released GHCR tag,
+then `systemctl restart stellargate` (or `docker compose up -d --pull always`).

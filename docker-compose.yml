@@ -8,7 +8,8 @@ services:
     ports:
       - "${PORT:-3000}:3000"
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       # Override the DATABASE_URL to point at the persistent volume
       DATABASE_URL: sqlite:///data/stellargate.db

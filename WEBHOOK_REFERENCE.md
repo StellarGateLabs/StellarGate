@@ -155,6 +155,36 @@ Fired when a payment intent's TTL elapses before payment arrives. No further tra
 }
 ```
 
+### `payment.unexpected`
+
+Fired when an on-chain payment arrives for an intent that is **already terminal** — the customer paid again after the intent reached `completed`, or paid after it `expired`. Once an intent is terminal the gateway never changes its status, and it is the only component that can see such a payment, so this event is the merchant's signal that funds have arrived that must be returned. **It always requires the merchant to act.**
+
+- `delta` is the **unexpected amount** — the amount that just arrived and must be refunded.
+- `status` is **unchanged**: it keeps the intent's terminal value (`completed` or `expired`). The intent's own `amount` and `paid_amount` are not updated by the new payment.
+- **What to do with the funds:** refund `delta` to the payer. The gateway records the transaction so it is not re-processed, but it does not move the funds for you.
+
+```json
+{
+  "id": "9f1c2e7a-4b3d-4e5f-8a6b-1c2d3e4f5a6b",
+  "created_at": "2024-06-22T15:30:45Z",
+  "event": "payment.unexpected",
+  "payment_id": "a1b2c3d4-...",
+  "merchant_id": "your-merchant-id",
+  "tx_hash": "abc123def456...",
+  "amount": "10.00",
+  "paid_amount": "10.00",
+  "asset": "XLM",
+  "asset_issuer": null,
+  "status": "completed",
+  "delta": "5.00"
+}
+```
+
+> `payment.unexpected` can fire more than once for the same payment with
+> different amounts (e.g. a customer sends again, then again). Deduplicate on
+> the `id` field, never on `(payment_id, event)` — see
+> [Event identity and deduplication](#event-identity-and-deduplication).
+
 ## Webhook Headers
 
 Every webhook request includes four headers:

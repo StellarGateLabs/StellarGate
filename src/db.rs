@@ -1414,20 +1414,50 @@ pub async fn prune_idempotency_keys(pool: &Db, retention_days: i64) -> Result<u6
     Ok(n)
 }
 
-/// Delete one batch of webhook deliveries that have finished and aged out.
+/// Prune one batch of webhook deliveries that have finished and aged out.
 ///
-/// Only `delivered` and `failed` rows are eligible. A `pending` row is still
-/// owned by the redrive worker — pruning it would silently drop a delivery
-/// that was going to be retried. The worker marks rows `failed` once attempts
-/// are exhausted, so nothing stays exempt forever (issue #111).
+/// A row is aged out once it has been idle for `retention_days`: the age is
+/// measured from the **last activity** (`COALESCE(last_attempt, created_at)`),
+/// not `created_at`. A delivery the redrive worker retried for days and that
+/// finally reached a terminal state today must not be deleted on the next
+/// retention tick merely because it was *created* more than `retention_days`
+/// ago — the window is meant to keep a terminal record available for
+/// investigation for N days after it became terminal (issue #999).
+///
+/// What happens to an aged terminal row depends on the outcome:
+///
+/// - `delivered` rows are deleted.
+/// - `failed` rows that have been **acknowledged** (`acknowledged_at IS NOT
+///   NULL`) are deleted — somebody saw the failure and acted, so it returns to
+///   ordinary retention.
+/// - `failed` rows that **nobody has acknowledged** are exempt from deletion:
+///   they are the evidence for "we never received your webhook", and that
+///   question usually arrives long after the fact. They are **compacted**
+///   instead — `payload` is cleared — so the record stays queryable
+///   indefinitely at a few hundred bytes (issue #998).
+///
+/// A `pending` row is never eligible on either path: the redrive worker still
+/// owns it, and pruning it would silently drop a delivery the merchant is owed.
+/// The worker marks rows `failed` once attempts are exhausted, so nothing stays
+/// exempt forever (issue #111).
+///
+/// Returns how many rows were touched (deleted or compacted). The caller loops
+/// until a batch comes back short; compaction is idempotent (`payload <> ''`),
+/// so a compacted row drops out of the working set and stops counting as work.
 pub async fn prune_webhook_deliveries(pool: &Db, retention_days: i64) -> Result<u64> {
     let cutoff = format!("-{retention_days} days");
-    let n = sqlx::query(
+
+    // Delete rows that have aged out AND are safe to forget: delivered rows,
+    // and failed rows somebody has acknowledged.
+    let deleted = sqlx::query(
         "DELETE FROM webhook_deliveries
           WHERE rowid IN (
               SELECT rowid FROM webhook_deliveries
-               WHERE status IN ('delivered','failed')
-                 AND created_at < strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
+               WHERE COALESCE(last_attempt, created_at) < strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
+                 AND (
+                     status = 'delivered'
+                     OR (status = 'failed' AND acknowledged_at IS NOT NULL)
+                 )
                LIMIT ?
           )",
     )
@@ -1436,7 +1466,29 @@ pub async fn prune_webhook_deliveries(pool: &Db, retention_days: i64) -> Result<
     .execute(pool)
     .await?
     .rows_affected();
-    Ok(n)
+
+    // An unacknowledged failure past the window is compacted, not deleted: the
+    // row survives with its payload cleared. `payload <> ''` keeps this
+    // idempotent — a row already compacted is not touched again, so it does
+    // not re-enter the retention worker's working set on every cycle.
+    let compacted = sqlx::query(
+        "UPDATE webhook_deliveries SET payload = ''
+          WHERE rowid IN (
+              SELECT rowid FROM webhook_deliveries
+               WHERE COALESCE(last_attempt, created_at) < strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
+                 AND status = 'failed'
+                 AND acknowledged_at IS NULL
+                 AND payload <> ''
+               LIMIT ?
+          )",
+    )
+    .bind(&cutoff)
+    .bind(PRUNE_BATCH)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(deleted + compacted)
 }
 
 /// A key as exposed to an operator. Never carries the secret — only a
@@ -2348,6 +2400,117 @@ mod tests {
                 .iter()
                 .map(|(_, _, _, d)| d.as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    // ── prune_webhook_deliveries (issues #998, #999) ────────────────────────
+
+    /// `prune_webhook_deliveries` implements the documented retention policy:
+    /// delivered and acknowledged-failed rows are deleted, while an
+    /// unacknowledged failed row is compacted (payload cleared, row kept) so
+    /// the evidence of a never-acknowledged failure stays queryable (issue
+    /// #998).
+    #[tokio::test]
+    async fn prune_compacts_unacknowledged_failures_and_deletes_acknowledged() {
+        let pool = memory_db().await;
+
+        let rows: [(&str, &str, i64, Option<&str>); 3] = [
+            // Aged delivered — deleted.
+            ("del", "delivered", 60, None),
+            // Aged failed, acknowledged — deleted (returned to ordinary retention).
+            ("ack", "failed", 60, Some("2024-01-01T00:00:00Z")),
+            // Aged failed, unacknowledged — compacted, not deleted.
+            ("unack", "failed", 60, None),
+        ];
+        for (id, status, age_days, ack) in rows {
+            sqlx::query(
+                "INSERT INTO webhook_deliveries
+                 (id, payment_id, url, payload, status, created_at, acknowledged_at)
+                 VALUES (?, 'p', 'https://e.example/h', '{\"event\":\"payment.completed\"}', ?,
+                         strftime('%Y-%m-%dT%H:%M:%SZ','now', ?), ?)",
+            )
+            .bind(id)
+            .bind(status)
+            .bind(format!("-{age_days} days"))
+            .bind(ack)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // prune_webhook_deliveries is batched; drain it fully.
+        while prune_webhook_deliveries(&pool, 30).await.unwrap() > 0 {}
+
+        let del: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries WHERE id = 'del'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let ack: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries WHERE id = 'ack'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(del, 0, "aged delivered row must be deleted");
+        assert_eq!(ack, 0, "aged acknowledged-failed row must be deleted");
+
+        let unack_present: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries WHERE id = 'unack'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(unack_present, 1, "unacknowledged failure must survive pruning");
+        let unack_payload: String =
+            sqlx::query_scalar("SELECT payload FROM webhook_deliveries WHERE id = 'unack'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            unack_payload, "",
+            "unacknowledged failure must be compacted (payload cleared), not deleted"
+        );
+
+        // A compacted row is inert: a further prune pass touches nothing.
+        let touched = prune_webhook_deliveries(&pool, 30).await.unwrap();
+        assert_eq!(
+            touched, 0,
+            "a compacted row must not be re-touched on the next cycle"
+        );
+    }
+
+    /// `prune_webhook_deliveries` ages rows by last activity, not `created_at`:
+    /// a delivery created long ago but retried today is still within the window
+    /// and must not be pruned (issue #999).
+    #[tokio::test]
+    async fn prune_ages_by_last_attempt_not_created_at() {
+        let pool = memory_db().await;
+        // Created 40 days ago — past a 30-day window on created_at alone — but
+        // the redrive worker retried it today, so last_attempt is now.
+        sqlx::query(
+            "INSERT INTO webhook_deliveries
+             (id, payment_id, url, payload, status, attempts, created_at, last_attempt)
+             VALUES ('retried-today', 'p', 'https://e.example/h', '{\"event\":\"x\"}', 'failed', 5,
+                     strftime('%Y-%m-%dT%H:%M:%SZ','now','-40 days'),
+                     strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let touched = prune_webhook_deliveries(&pool, 30).await.unwrap();
+        assert_eq!(
+            touched, 0,
+            "a delivery retried today must not be pruned under a 30-day window"
+        );
+
+        let payload: String =
+            sqlx::query_scalar("SELECT payload FROM webhook_deliveries WHERE id = 'retried-today'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            payload, "{\"event\":\"x\"}",
+            "an in-window failure must keep its payload"
         );
     }
 

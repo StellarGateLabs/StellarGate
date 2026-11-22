@@ -1,0 +1,6 @@
+# Apply with: gh label create --repo StellarGateLabs/StellarGate -f .github/labels.yml
+# (or create manually from Settings → Labels)
+
+- name: test-removal-approved
+  color: fbcA04
+  description: Maintainer-approved removal of regression tests flagged by check-test-count.sh

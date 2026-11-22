@@ -24,6 +24,23 @@ pub struct SafeTarget {
     addr: SocketAddr,
 }
 
+impl SafeTarget {
+    /// The host the URL names, as resolved and validated. The client built by
+    /// [`pinned_client`] is pinned to [`addr`](Self::addr) for *this* host, so a
+    /// cached client must never be reused for a different host that happens to
+    /// resolve to the same address.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// The one concrete address `validate` confirmed safe (or, with
+    /// `allow_private`, resolved without the range check). This is the address
+    /// the pinned client connects to regardless of later DNS answers.
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
 /// Validate `url` is an http(s) URL whose host resolves to an address that
 /// isn't loopback/link-local/private/reserved. `allow_private` bypasses the
 /// range check (still resolves and validates the URL shape) for local

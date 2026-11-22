@@ -22,7 +22,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.8"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "io-util", "fs"] }
 tower-http = { version = "0.7", features = ["cors", "trace", "limit", "request-id", "timeout", "set-header", "compression-gzip", "compression-br"] }
 governor = "0.10"
 moka = { version = "0.12", features = ["sync"] }
@@ -31,7 +31,7 @@ serde_json = "1"
 # sqlx 0.9 split the old `runtime-tokio-rustls` feature into `runtime-tokio`
 # plus a separate TLS feature. SQLite never opens a network connection, so no
 # TLS backend is enabled.
-sqlx = { version = "0.9", features = ["sqlite", "runtime-tokio", "migrate"] }
+sqlx = { version = "0.9", features = ["sqlite", "runtime-tokio"] }
 uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 futures-util = "0.3"
@@ -40,7 +40,7 @@ sha2 = "0.11"
 hex = "0.4"
 dotenvy = "0.15"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
 time = { version = "0.3", features = ["parsing"] }
 # API key generation. Uses the OS CSPRNG — a UUIDv4 is random but only carries

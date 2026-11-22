@@ -802,6 +802,31 @@ struct IssueKeyRequest {
     label: Option<String>,
 }
 
+async fn dashboard_manifest() -> impl IntoResponse {
+    dashboard_asset(
+        include_str!("../../static/manifest.webmanifest"),
+        "application/manifest+json",
+    )
+}
+
+async fn dashboard_icon_svg() -> impl IntoResponse {
+    dashboard_asset(include_str!("../../static/icon.svg"), "image/svg+xml")
+}
+
+async fn dashboard_icon_192() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, HeaderValue::from_static("image/png"))],
+        include_bytes!("../../static/icon-192.png").as_slice(),
+    )
+}
+
+async fn dashboard_icon_512() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, HeaderValue::from_static("image/png"))],
+        include_bytes!("../../static/icon-512.png").as_slice(),
+    )
+}
+
 async fn rate_limit_middleware(
     State(rate_limit): State<RateLimitState>,
     req: Request,
