@@ -282,7 +282,7 @@ pub async fn create(
             db::find_payment_id_by_idempotency_key(&state.pool, &merchant_id, key).await?
     {
         if let Some(payment) = db::get_payment(&state.pool, &existing_id).await? {
-            return Ok((StatusCode::OK, Json(to_json(&payment))));
+            return Ok((StatusCode::OK, Json(to_json_with_network(&payment, &state.config.network))));
         }
         sqlx::query("DELETE FROM idempotency_keys WHERE merchant_id = ? AND idempotency_key = ?")
             .bind(&merchant_id)
@@ -304,7 +304,7 @@ pub async fn create(
             for it with a short retry loop and then return that payment. */
             for _ in 0..50 {
                 if let Some(payment) = db::get_payment(&state.pool, &canonical_id).await? {
-                    return Ok((StatusCode::OK, Json(to_json(&payment))));
+                    return Ok((StatusCode::OK, Json(to_json_with_network(&payment, &state.config.network))));
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -351,7 +351,7 @@ pub async fn create(
         "payment created"
     );
 
-    Ok((StatusCode::CREATED, Json(to_json(&payment))))
+    Ok((StatusCode::CREATED, Json(to_json_with_network(&payment, &state.config.network))))
 }
 
 /// `GET /payments/:id` — status for one payment.
@@ -388,7 +388,7 @@ pub async fn get_by_id(
     to the public view — a typo'd or revoked key should say so, not quietly
     return less data and leave the caller wondering why fields are missing. */
     match db::find_merchant_by_key(&state.pool, &key).await? {
-        Some(merchant_id) if merchant_id == payment.merchant_id => Ok(Json(to_json(&payment))),
+        Some(merchant_id) if merchant_id == payment.merchant_id => Ok(Json(to_json_with_network(&payment, &state.config.network))),
         Some(_) => Err(AppError::not_found(
             "payment_not_found",
             "payment not found",
@@ -483,7 +483,7 @@ pub async fn list(
             None
         };
 
-        let mut rows = payments.iter().map(to_json).collect::<Vec<_>>();
+        let mut rows = payments.iter().map(|p| to_json_with_network(p, &state.config.network)).collect::<Vec<_>>();
         attach_webhook_status(&state.pool, &payments, &mut rows).await?;
 
         Ok(Json(json!({
@@ -508,7 +508,7 @@ pub async fn list(
         // Provide next_cursor to ease migration to keyset pagination.
         let next_cursor = payments.last().map(|p| encode_cursor(&p.created_at, &p.id));
 
-        let mut rows = payments.iter().map(to_json).collect::<Vec<_>>();
+        let mut rows = payments.iter().map(|p| to_json_with_network(p, &state.config.network)).collect::<Vec<_>>();
         attach_webhook_status(&state.pool, &payments, &mut rows).await?;
 
         Ok(Json(json!({
@@ -574,7 +574,84 @@ async fn generate_unique_memo(pool: &db::Db) -> Result<String, AppError> {
     ))
 }
 
-fn to_json(p: &db::Payment) -> Value {
+/// Build a SEP-7 `web+stellar:pay` URI for `payment`.
+///
+/// The URI encodes the destination address, memo (as `MEMO_TEXT`), the
+/// stroop-exact amount, and—for issued assets—the asset code and issuer.
+/// For non-public networks the `network_passphrase` parameter is included so
+/// SEP-7-capable wallets submit the transaction on the correct network rather
+/// than silently signing for mainnet (issue #1012).
+///
+/// The amount is derived from the stored stroop count so floating-point
+/// rounding (the bug present in the dashboard's `buildSep7Uri`) cannot occur.
+pub fn build_sep7_uri(p: &db::Payment, network: &str) -> String {
+    use std::fmt::Write as _;
+
+    // Use the stroop-exact amount to avoid any floating-point rounding.
+    let amount_str = crate::money::parse_stroops(&p.amount)
+        .map(crate::money::stroops_to_string)
+        .unwrap_or_else(|| p.amount.clone());
+
+    let mut params = String::new();
+
+    // destination is always present.
+    let _ = write!(params, "destination={}", sep7_encode(&p.destination_address));
+
+    let _ = write!(params, "&amount={}", sep7_encode(&amount_str));
+
+    let asset = p.asset.to_uppercase();
+    if asset != "XLM" {
+        let _ = write!(params, "&asset_code={}", sep7_encode(&asset));
+        if let Some(issuer) = &p.asset_issuer {
+            let _ = write!(params, "&asset_issuer={}", sep7_encode(issuer));
+        }
+    }
+
+    if !p.memo.is_empty() {
+        let _ = write!(params, "&memo={}", sep7_encode(&p.memo));
+        params.push_str("&memo_type=MEMO_TEXT");
+    }
+
+    // Include the passphrase for every non-public network so wallets don't
+    // silently broadcast the transaction on mainnet (the dashboard had this
+    // bug — it always omitted the passphrase).
+    if network != "public" {
+        let passphrase = match network {
+            "testnet" => "Test SDF Network ; September 2015",
+            // Any other custom network must set its own passphrase via env;
+            // fall back to the testnet value so the URI at least indicates
+            // a non-mainnet context rather than omitting the parameter entirely.
+            _ => "Test SDF Network ; September 2015",
+        };
+        let _ = write!(params, "&network_passphrase={}", sep7_encode(passphrase));
+    }
+
+    format!("web+stellar:pay?{params}")
+}
+
+/// Percent-encode a value for use as a SEP-7 query parameter.
+///
+/// Encodes all characters except unreserved URI characters (letters, digits,
+/// `-`, `_`, `.`, `~`) per RFC 3986. This matches how browsers and SEP-7
+/// reference implementations encode query values.
+fn sep7_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            other => {
+                out.push('%');
+                out.push(char::from_digit((other >> 4) as u32, 16).unwrap().to_ascii_uppercase());
+                out.push(char::from_digit((other & 0xf) as u32, 16).unwrap().to_ascii_uppercase());
+            }
+        }
+    }
+    out
+}
+
+fn to_json_with_network(p: &db::Payment, network: &str) -> Value {
     // Canonicalize amount: parse to stroops and format back to canonical form.
     // This ensures "10.00", "10.0", and "10" all serialize identically,
     // eliminating spurious string-based comparisons across responses.
@@ -589,6 +666,8 @@ fn to_json(p: &db::Payment) -> Value {
         .paid_amount
         .as_ref()
         .and_then(|pa| crate::money::parse_stroops(pa).map(crate::money::stroops_to_string));
+
+    let payment_uri = build_sep7_uri(p, network);
 
     json!({
         "id": p.id,
@@ -605,11 +684,22 @@ fn to_json(p: &db::Payment) -> Value {
         "created_at": p.created_at,
         "updated_at": p.updated_at,
         "expires_at": p.expires_at,
+        // SEP-7 pay URI that encodes every field a wallet needs to prefill a
+        // payment: destination, amount (stroop-exact), asset, memo, and the
+        // network passphrase on non-public networks (issue #1012).
+        "payment_uri": payment_uri,
         // `null` when the payment has no webhook configured; otherwise the
         // status of its most recent delivery (`delivered` / `failed` /
         // `pending`). Populated by the list handlers below.
         "webhook_status": Value::Null,
     })
+}
+
+/// Legacy alias kept so internal call sites that do not yet carry the network
+/// string still compile. New code should call [`to_json_with_network`].
+#[allow(dead_code)]
+fn to_json(p: &db::Payment) -> Value {
+    to_json_with_network(p, "testnet")
 }
 
 /// Fill in `webhook_status` on each serialized payment from its latest
@@ -809,5 +899,95 @@ pub async fn redeliver_webhook(
             "webhook_delivery_failed",
             "webhook delivery failed",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_payment(amount: &str, asset: &str, asset_issuer: Option<&str>, memo: &str) -> db::Payment {
+        db::Payment {
+            id: "pay1".into(),
+            merchant_id: "merch1".into(),
+            destination_address: "GDEST1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDE".into(),
+            memo: memo.into(),
+            amount: amount.into(),
+            asset: asset.into(),
+            asset_issuer: asset_issuer.map(str::to_string),
+            status: "pending".into(),
+            webhook_url: None,
+            tx_hash: None,
+            paid_amount: None,
+            created_at: "2024-01-01T00:00:00Z".into(),
+            updated_at: "2024-01-01T00:00:00Z".into(),
+            expires_at: "2024-01-01T01:00:00Z".into(),
+        }
+    }
+
+    // ── SEP-7 URI building (issue #1012) ──────────────────────────────────
+
+    #[test]
+    fn sep7_uri_xlm_testnet_includes_passphrase() {
+        let p = make_payment("10", "XLM", None, "ABCD1234");
+        let uri = build_sep7_uri(&p, "testnet");
+        assert!(uri.starts_with("web+stellar:pay?"), "must start with scheme");
+        assert!(uri.contains("destination="), "must contain destination");
+        assert!(uri.contains("amount=10"), "must contain exact amount");
+        assert!(uri.contains("memo=ABCD1234"), "must contain memo");
+        assert!(uri.contains("memo_type=MEMO_TEXT"), "must set memo_type");
+        assert!(!uri.contains("asset_code="), "XLM must not include asset_code");
+        // testnet passphrase, percent-encoded
+        assert!(
+            uri.contains("network_passphrase="),
+            "testnet URI must include network_passphrase"
+        );
+        assert!(
+            uri.contains("Test%20SDF%20Network"),
+            "passphrase must be percent-encoded"
+        );
+    }
+
+    #[test]
+    fn sep7_uri_public_network_omits_passphrase() {
+        let p = make_payment("5", "XLM", None, "MEMO1");
+        let uri = build_sep7_uri(&p, "public");
+        assert!(!uri.contains("network_passphrase"), "mainnet must not include passphrase");
+    }
+
+    #[test]
+    fn sep7_uri_issued_asset_includes_code_and_issuer() {
+        let issuer = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+        let p = make_payment("1.5", "USDC", Some(issuer), "MEMOX");
+        let uri = build_sep7_uri(&p, "testnet");
+        assert!(uri.contains("asset_code=USDC"), "must have asset_code");
+        assert!(uri.contains(&format!("asset_issuer={}", sep7_encode(issuer))), "must have encoded issuer");
+    }
+
+    #[test]
+    fn sep7_uri_amount_is_stroop_exact() {
+        // "10.0000000" should produce "10" (no floating-point rounding)
+        let p = make_payment("10.0000000", "XLM", None, "M1");
+        let uri = build_sep7_uri(&p, "public");
+        assert!(uri.contains("amount=10&") || uri.ends_with("amount=10"), "amount must be canonical");
+        assert!(!uri.contains("amount=10.0"), "must not have trailing zeros");
+    }
+
+    #[test]
+    fn sep7_encode_encodes_special_characters() {
+        // Space, semicolon, and slash must be percent-encoded.
+        assert_eq!(sep7_encode("a b"), "a%20b");
+        assert_eq!(sep7_encode("a;b"), "a%3Bb");
+        assert_eq!(sep7_encode("a/b"), "a%2Fb");
+        // Unreserved characters must pass through unchanged.
+        assert_eq!(sep7_encode("abc-_~."), "abc-_~.");
+    }
+
+    #[test]
+    fn sep7_uri_memo_with_special_chars_is_encoded() {
+        let mut p = make_payment("1", "XLM", None, "hello world");
+        p.memo = "hello world".into();
+        let uri = build_sep7_uri(&p, "public");
+        assert!(uri.contains("memo=hello%20world"), "space in memo must be encoded");
     }
 }

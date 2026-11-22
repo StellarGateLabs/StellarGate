@@ -1830,6 +1830,15 @@ components:
           nullable: true
           enum: [delivered, failing]
           description: Latest webhook delivery health for this payment.
+        payment_uri:
+          type: string
+          description: >-
+            SEP-7 `web+stellar:pay` URI for this payment. Encodes the
+            destination address, stroop-exact amount, asset (code and issuer
+            for non-native assets), memo, and — on non-public networks — the
+            network passphrase so a SEP-7-capable wallet can prefill and submit
+            the payment directly (issue #1012).
+          example: "web+stellar:pay?destination=GDEST&amount=10&memo=A1B2C3D4&memo_type=MEMO_TEXT&network_passphrase=Test%20SDF%20Network%20%3B%20September%202015"
         paid_amount:
           type: [string, "null"]
           description: Cumulative amount received

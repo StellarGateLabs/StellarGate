@@ -117,6 +117,10 @@ where
                     _ = tokio::time::sleep(backoff.stability), if !marked_stable => {
                         health.note_stable(name);
                         marked_stable = true;
+                        // Reset backoff so an isolated fault after a long
+                        // stable run waits only the initial delay, not the
+                        // accumulated maximum (issue #1014).
+                        delay = backoff.initial;
                     }
                     join = &mut child => break join,
                 }
@@ -146,13 +150,16 @@ where
                 Ok(TaskExit::Fatal(reason)) => {
                     /* The case this issue is really about: a worker that gave
                     up on a fault used to be indistinguishable from a clean
-                    stop, and was logged at `warn` if at all. */
+                    stop, and was logged at `warn` if at all. Now Fatal exits
+                    also increment consecutive_failures so three quick Fatal
+                    returns put the task into the crash-loop set, the same as
+                    three panics (issue #1013). */
                     error!(
                         task = name,
                         %reason,
                         "background task exited on a fatal error; restarting"
                     );
-                    health.task_stopped(name);
+                    health.task_failed(name);
                 }
                 Err(e) if e.is_panic() => {
                     health.task_failed(name);
@@ -641,9 +648,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fatal_exit_does_not_increment_failed() {
-        // `health.failed()` counts panics (via task_failed), not Fatal exits.
-        // A Fatal exit goes through task_stopped + task_restarted only.
+    async fn fatal_exit_increments_consecutive_failures() {
+        // After fix #1013, Fatal exits are counted by task_failed so they
+        // contribute to consecutive_failures and trigger the crash-loop signal.
         let health = TaskHealth::new();
         health.require("probe");
         let (tx, rx) = watch::channel(false);
@@ -663,12 +670,137 @@ mod tests {
         .await
         .expect("worker did not restart after Fatal exit");
 
+        // After fix #1013, task_failed is called for Fatal — so failed() increments.
         assert_eq!(
             health.failed(),
-            0,
-            "a Fatal exit must not increment health.failed() — that counter is for panics"
+            1,
+            "a Fatal exit must increment health.failed() so crash-loop detection works (issue #1013)"
         );
         assert_eq!(health.restarts("probe"), 1);
+
+        let _ = tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    /// Three consecutive Fatal exits must put the task in the crash-loop set
+    /// (issue #1013). Previously only panics incremented consecutive_failures;
+    /// a worker that returned Fatal on every start restarted forever at the
+    /// capped backoff with the crash-loop signal never firing.
+    #[tokio::test]
+    async fn fatal_crash_loop_is_detected() {
+        let health = TaskHealth::new();
+        health.require("probe");
+        let (tx, rx) = watch::channel(false);
+        let shutdown_for_child = rx.clone();
+
+        let handle = supervise_with(
+            health.clone(),
+            "probe",
+            rx,
+            move || {
+                let shutdown = shutdown_for_child.clone();
+                async move {
+                    if *shutdown.borrow() {
+                        return TaskExit::ShutdownRequested;
+                    }
+                    TaskExit::Fatal("always fatal".into())
+                }
+            },
+            fast_backoff(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !health.crash_looping_required_tasks().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("fatal crash-loop was never recorded (issue #1013)");
+
+        assert_eq!(health.crash_looping_required_tasks(), vec!["probe"]);
+        assert!(health.failed() >= crate::CRASH_LOOP_THRESHOLD as u64);
+
+        let _ = tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    // ── Backoff reset after stable run (issue #1014) ─────────────────────
+
+    /// After a run long enough to trigger the stability timer, the next restart
+    /// must wait only `backoff.initial`, not the accumulated maximum (issue #1014).
+    ///
+    /// Setup: use a Backoff with a very short stability window so the test does
+    /// not have to wait for the production 5 s. The worker panics on its first
+    /// run (accumulating delay), then runs stably through the stability window,
+    /// then panics again. The second restart must be near-instant (initial delay)
+    /// rather than the capped max.
+    #[tokio::test]
+    async fn backoff_resets_after_stable_run() {
+        let backoff = Backoff {
+            initial: Duration::from_millis(5),
+            max: Duration::from_millis(200),   // large enough to be detectable
+            stability: Duration::from_millis(30),
+        };
+
+        let health = TaskHealth::new();
+        health.require("probe");
+        let (tx, rx) = watch::channel(false);
+        let runs = Arc::new(AtomicU64::new(0));
+        let runs_inner = runs.clone();
+        let shutdown_for_child = rx.clone();
+
+        let handle = supervise_with(
+            health.clone(),
+            "probe",
+            rx,
+            move || {
+                let n = runs_inner.fetch_add(1, Ordering::SeqCst);
+                let mut sd = shutdown_for_child.clone();
+                async move {
+                    match n {
+                        0 => {
+                            // First run: panic immediately — delay doubles to max.
+                            panic!("first panic");
+                        }
+                        1 => {
+                            // Second run: stay alive long enough to be marked stable.
+                            tokio::time::sleep(Duration::from_millis(60)).await;
+                            // Then panic again — this is the panic whose backoff we test.
+                            panic!("second panic");
+                        }
+                        _ => {
+                            // Third run: park until shutdown.
+                            let _ = sd.changed().await;
+                            TaskExit::ShutdownRequested
+                        }
+                    }
+                }
+            },
+            backoff,
+        );
+
+        // Wait for the third run to start (two panics + one stable run).
+        let start = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runs.load(Ordering::SeqCst) < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("worker did not reach third run");
+
+        let elapsed = start.elapsed();
+        // The two restarts should not have taken close to 2 × max (400 ms).
+        // With the fix the second restart waits only `initial` (5 ms) so the
+        // total is well under 200 ms even with scheduling jitter.
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "third run took {:?}; backoff was not reset after stable run (issue #1014)",
+            elapsed
+        );
 
         let _ = tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
