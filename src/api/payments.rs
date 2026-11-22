@@ -749,13 +749,30 @@ pub async fn redeliver_webhook(
     audit row if the second attempt failed, permanently losing the evidence
     that the original delivery succeeded. Require explicit opt-in via
     `?force=true` so callers cannot hit this path accidentally. */
-    if delivery.status == "delivered" && !query.force.unwrap_or(false) {
+    let is_forced = query.force.unwrap_or(false);
+    if delivery.status == "delivered" && !is_forced {
         return Err(AppError::new(
             StatusCode::CONFLICT,
             "already_delivered",
             "this webhook was already successfully delivered; \
              pass ?force=true to redeliver anyway",
         ));
+    }
+
+    /* Claim the row atomically before sending (issue #993). This prevents a
+    concurrent redrive worker tick from sending the same delivery simultaneously.
+    For already-delivered rows re-sent with force=true the row status is
+    "delivered" rather than "pending"/"failed", so we skip the claim — the
+    redrive worker never picks up delivered rows, so there is nothing to race. */
+    if !is_forced || delivery.status != "delivered" {
+        let claimed = db::claim_webhook_delivery(&state.pool, &delivery_id).await?;
+        if !claimed {
+            return Err(AppError::new(
+                StatusCode::CONFLICT,
+                "delivery_already_claimed",
+                "another send is already in progress for this delivery",
+            ));
+        }
     }
 
     // Re-validate the target on every redelivery — the delivery row may be old,
@@ -793,15 +810,25 @@ pub async fn redeliver_webhook(
         .send()
         .await;
 
-    let new_status = match result {
-        Ok(resp) if resp.status().is_success() => "delivered",
-        _ => "failed",
-    };
+    let succeeded = matches!(result, Ok(ref resp) if resp.status().is_success());
 
-    db::update_webhook_delivery(&state.pool, &delivery_id, new_status, delivery.attempts + 1)
+    if is_forced && delivery.status == "delivered" {
+        /* Issue #992: a forced redelivery of an already-delivered row must never
+        downgrade status to "failed". Use the status-preserving recorder that
+        only bumps manual_attempts on failure. */
+        db::record_forced_redeliver_outcome(&state.pool, &delivery_id, succeeded).await?;
+    } else {
+        let new_status = if succeeded { "delivered" } else { "failed" };
+        db::update_webhook_delivery(
+            &state.pool,
+            &delivery_id,
+            new_status,
+            delivery.attempts + 1,
+        )
         .await?;
+    }
 
-    if new_status == "delivered" {
+    if succeeded {
         Ok(StatusCode::OK)
     } else {
         Err(AppError::new(

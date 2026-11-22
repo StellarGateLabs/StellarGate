@@ -2423,3 +2423,158 @@ async fn test_same_endpoint_under_v1_and_legacy_mounts() {
         "both mounts must serve the same payload"
     );
 }
+
+/// Issue #992: a forced redelivery that fails must not downgrade a delivered
+/// row to failed. The status must remain "delivered" after a 503, and the
+/// redrive worker must never pick the row up again.
+#[tokio::test]
+async fn test_forced_redeliver_on_delivered_row_does_not_downgrade_to_failed() {
+    let mock = wiremock::MockServer::start().await;
+    // First call (the initial delivery): 200 OK.
+    // Second call (the forced redeliver): 503 Service Unavailable.
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls_clone = calls.clone();
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/hook"))
+        .respond_with(move |_: &wiremock::Request| {
+            let n = calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                wiremock::ResponseTemplate::new(200)
+            } else {
+                wiremock::ResponseTemplate::new(503)
+            }
+        })
+        .expect(2)
+        .mount(&mock)
+        .await;
+
+    let mut cfg = make_config();
+    cfg.webhook_allow_private_targets = true;
+    cfg.webhook_redrive_grace_secs = 0;
+    cfg.webhook_redrive_max_attempts = 8;
+    let (server, pool) = server_with_config(cfg).await;
+    let key = provision_merchant(&server).await;
+
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "5", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Insert a delivered delivery row (the initial successful delivery).
+    stellargate::db::save_webhook_delivery(
+        &pool,
+        "delivery-delivered",
+        &id,
+        &format!("{}/hook", mock.uri()),
+        r#"{"event":"payment.completed","status":"completed"}"#,
+        "payment.completed",
+    )
+    .await
+    .unwrap();
+    stellargate::db::update_webhook_delivery(&pool, "delivery-delivered", "delivered", 1)
+        .await
+        .unwrap();
+
+    // Forced redelivery — the mock returns 503.
+    let res = server
+        .post(&format!("/payments/{id}/webhooks/delivery-delivered/redeliver?force=true"))
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    // 502 Bad Gateway is expected since the receiver returned 503.
+    res.assert_status(axum::http::StatusCode::BAD_GATEWAY);
+
+    // The delivery row must still report delivered — not failed.
+    let delivery = stellargate::db::get_webhook_delivery(&pool, "delivery-delivered")
+        .await
+        .unwrap()
+        .expect("delivery row must still exist");
+    assert_eq!(
+        delivery.status, "delivered",
+        "a failed forced redeliver must not downgrade a delivered row to failed (issue #992)"
+    );
+    // manual_attempts was bumped.
+    assert_eq!(
+        delivery.manual_attempts, 1,
+        "manual_attempts must be incremented on a failed forced redeliver"
+    );
+    // The row must NOT be eligible for automatic redrive.
+    let redrivable = stellargate::db::list_redrivable_deliveries(&pool, 8, 0, 0, 0)
+        .await
+        .unwrap();
+    assert!(
+        redrivable.is_empty(),
+        "a delivered row must never be picked up by the redrive worker (issue #992)"
+    );
+}
+
+/// Issue #993: concurrent manual redeliver and redrive worker on the same
+/// pending row must result in exactly one outbound request.
+#[tokio::test]
+async fn test_concurrent_manual_and_redrive_send_exactly_one_request() {
+    let mock = wiremock::MockServer::start().await;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls_clone = calls.clone();
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/hook"))
+        .respond_with(move |_: &wiremock::Request| {
+            calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            wiremock::ResponseTemplate::new(200)
+        })
+        // Do not assert exact count here; we assert it below.
+        .mount(&mock)
+        .await;
+
+    let mut cfg = make_config();
+    cfg.webhook_allow_private_targets = true;
+    cfg.webhook_redrive_grace_secs = 0;
+    cfg.webhook_redrive_max_attempts = 8;
+    let (server, pool) = server_with_config(cfg).await;
+    let key = provision_merchant(&server).await;
+
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "5", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    stellargate::db::save_webhook_delivery(
+        &pool,
+        "delivery-concurrent",
+        &id,
+        &format!("{}/hook", mock.uri()),
+        r#"{"event":"payment.completed","status":"completed"}"#,
+        "payment.completed",
+    )
+    .await
+    .unwrap();
+
+    // Simulate a race: claim the row (as the redrive worker would), then try
+    // the manual redeliver. The claim must block the redeliver.
+    let claimed = stellargate::db::claim_webhook_delivery(&pool, "delivery-concurrent")
+        .await
+        .unwrap();
+    assert!(claimed, "first claim must succeed");
+
+    let res = server
+        .post(&format!("/payments/{id}/webhooks/delivery-concurrent/redeliver"))
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    // The row is claimed; the manual redeliver should be rejected with 409.
+    res.assert_status(axum::http::StatusCode::CONFLICT);
+
+    // The outbound request count must be zero — only the claim ran, no send.
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no outbound webhook must be sent while the row is claimed (issue #993)"
+    );
+}
