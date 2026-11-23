@@ -40,7 +40,7 @@ jobs:
     name: dashboard static checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -116,7 +116,7 @@ jobs:
     name: dashboard unit tests (node --test)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -136,7 +136,7 @@ jobs:
     name: dashboard browser smoke (no rust)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -195,7 +195,7 @@ jobs:
     name: dashboard end-to-end (playwright)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # No `toolchain:` here on purpose: with no matrix, `rust-toolchain.toml`
       # is the single source of truth for the version, so this job cannot drift
