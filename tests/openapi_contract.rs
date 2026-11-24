@@ -306,12 +306,14 @@ async fn openapi_documents_exactly_the_intended_paths() {
         "/v1/merchants/{id}/keys/{key_id}",
         "/v1/payments",
         "/v1/payments/{id}",
+        "/v1/payments/summary",
         "/v1/payments/{id}/webhooks",
         "/v1/payments/{id}/webhooks/{delivery_id}/redeliver",
         // Deprecated unprefixed twins.
         "/network",
         "/payments",
         "/payments/{id}",
+        "/payments/summary",
         "/payments/{id}/webhooks",
         "/payments/{id}/webhooks/{delivery_id}/redeliver",
     ]

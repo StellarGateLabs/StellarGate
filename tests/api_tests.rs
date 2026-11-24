@@ -2423,3 +2423,47 @@ async fn test_same_endpoint_under_v1_and_legacy_mounts() {
         "both mounts must serve the same payload"
     );
 }
+
+/// Pins the response documented in openapi.yaml for `GET /v1/payments/summary`
+/// and its deprecated unprefixed twin: `{"summary": [[status, count], ...]}`.
+#[tokio::test]
+async fn payments_summary_matches_the_documented_shape() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    for _ in 0..2 {
+        server
+            .post("/v1/payments")
+            .add_header("Authorization", format!("Bearer {key}"))
+            .json(&json!({ "amount": "10", "asset": "XLM" }))
+            .await
+            .assert_status(StatusCode::CREATED);
+    }
+
+    let res = server
+        .get("/v1/payments/summary")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    res.assert_status_ok();
+    assert_eq!(res.json::<Value>(), json!({ "summary": [["pending", 2]] }));
+    assert!(!res.headers().contains_key("deprecation"));
+
+    let legacy = server
+        .get("/payments/summary")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    legacy.assert_status_ok();
+    assert_eq!(
+        legacy.json::<Value>(),
+        json!({ "summary": [["pending", 2]] })
+    );
+    assert_eq!(legacy.header("deprecation"), "true");
+    assert_eq!(
+        legacy.header("link").to_str().unwrap(),
+        "</v1/payments/summary>; rel=\"successor-version\""
+    );
+
+    server
+        .get("/v1/payments/summary")
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+}
