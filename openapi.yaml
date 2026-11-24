@@ -1304,16 +1304,26 @@ paths:
       summary: Stellar network the gateway is configured for
       responses:
         "200":
-          description: Network identifier
+          description: Network identifier and passphrase
           content:
             application/json:
               schema:
                 type: object
-                required: [network]
+                required: [network, network_passphrase]
                 properties:
                   network:
                     type: string
                     example: testnet
+                  network_passphrase:
+                    type: string
+                    description: >-
+                      Passphrase of the configured network, for building SEP-7
+                      URIs and signing. `public` maps to the public network;
+                      any other value to testnet.
+                    enum:
+                      - "Test SDF Network ; September 2015"
+                      - "Public Global Stellar Network ; September 2015"
+                    example: "Test SDF Network ; September 2015"
 
 
 components:

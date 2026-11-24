@@ -2423,3 +2423,24 @@ async fn test_same_endpoint_under_v1_and_legacy_mounts() {
         "both mounts must serve the same payload"
     );
 }
+
+/// #1081: `/network` reports the passphrase for the configured network, so
+/// clients do not hard-code a mapping from the network name.
+#[tokio::test]
+async fn network_reports_the_passphrase_for_each_network() {
+    for (network, passphrase) in [
+        ("testnet", "Test SDF Network ; September 2015"),
+        ("public", "Public Global Stellar Network ; September 2015"),
+    ] {
+        let mut cfg = make_config();
+        cfg.network = network.into();
+        let (server, _) = server_with_config(cfg).await;
+        let res = server.get("/network").await;
+        res.assert_status_ok();
+        assert_eq!(
+            res.json::<Value>(),
+            json!({ "network": network, "network_passphrase": passphrase }),
+            "{network}"
+        );
+    }
+}

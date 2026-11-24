@@ -961,6 +961,17 @@ fn normalise_cors_origin(entry: &str) -> Result<String> {
     Ok(url.origin().ascii_serialization())
 }
 
+/// Passphrase of the Stellar network `STELLAR_NETWORK` names. Like the default
+/// Horizon URL and accepted-asset list, anything other than `public` is treated
+/// as testnet.
+pub fn network_passphrase(network: &str) -> &'static str {
+    if network == "public" {
+        "Public Global Stellar Network ; September 2015"
+    } else {
+        "Test SDF Network ; September 2015"
+    }
+}
+
 /// The Horizon endpoint used when `STELLAR_HORIZON_URL` is unset, chosen to
 /// match `STELLAR_NETWORK`. Without this, a `public` gateway with no explicit
 /// Horizon URL silently watched the testnet ledger for mainnet accounts
