@@ -2384,7 +2384,10 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(unack_present, 1, "unacknowledged failure must survive pruning");
+        assert_eq!(
+            unack_present, 1,
+            "unacknowledged failure must survive pruning"
+        );
         let unack_payload: String =
             sqlx::query_scalar("SELECT payload FROM webhook_deliveries WHERE id = 'unack'")
                 .fetch_one(&pool)

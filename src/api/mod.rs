@@ -283,6 +283,12 @@ fn dashboard_routes() -> axum::Router<Arc<AppState>> {
         .route("/dashboard/keys.js", get(dashboard_keys_js))
         .route("/dashboard/vendor/qrcode.js", get(dashboard_qrcode_js))
         .route("/dashboard/theme.js", get(dashboard_theme_js))
+        /* Web app manifest and icons (#807). Static, data-free assets; no
+        service worker is registered, so API responses are never cached. */
+        .route("/dashboard/manifest.webmanifest", get(dashboard_manifest))
+        .route("/dashboard/icon.svg", get(dashboard_icon_svg))
+        .route("/dashboard/icon-192.png", get(dashboard_icon_192))
+        .route("/dashboard/icon-512.png", get(dashboard_icon_512))
         .layer(tower_http::compression::CompressionLayer::new())
 }
 
@@ -801,15 +807,20 @@ struct IssueKeyRequest {
     label: Option<String>,
 }
 
-async fn dashboard_manifest() -> impl IntoResponse {
+async fn dashboard_manifest(headers: HeaderMap) -> Response {
     dashboard_asset(
         include_str!("../../static/manifest.webmanifest"),
         "application/manifest+json",
+        &headers,
     )
 }
 
-async fn dashboard_icon_svg() -> impl IntoResponse {
-    dashboard_asset(include_str!("../../static/icon.svg"), "image/svg+xml")
+async fn dashboard_icon_svg(headers: HeaderMap) -> Response {
+    dashboard_asset(
+        include_str!("../../static/icon.svg"),
+        "image/svg+xml",
+        &headers,
+    )
 }
 
 async fn dashboard_icon_192() -> impl IntoResponse {
@@ -1339,8 +1350,10 @@ fn dashboard_asset(body: &'static str, content_type: &'static str, req: &HeaderM
     let mut resp = if req
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.split(',').any(|t| t.trim().trim_start_matches("W/") == etag || t.trim() == "*"))
-    {
+        .is_some_and(|v| {
+            v.split(',')
+                .any(|t| t.trim().trim_start_matches("W/") == etag || t.trim() == "*")
+        }) {
         StatusCode::NOT_MODIFIED.into_response()
     } else {
         (
@@ -1350,12 +1363,21 @@ fn dashboard_asset(body: &'static str, content_type: &'static str, req: &HeaderM
             .into_response()
     };
     let h = resp.headers_mut();
-    h.insert(header::ETAG, HeaderValue::from_str(&etag).expect("etag is ascii"));
+    h.insert(
+        header::ETAG,
+        HeaderValue::from_str(&etag).expect("etag is ascii"),
+    );
     // no-cache: store it, but revalidate every time so updates show at once.
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     h.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
-    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(DASHBOARD_CSP));
-    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(DASHBOARD_CSP),
+    );
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     resp
 }
 
@@ -1364,7 +1386,11 @@ async fn network_info(State(state): State<Arc<AppState>>) -> Json<Value> {
 }
 
 async fn dashboard_i18n(headers: HeaderMap) -> Response {
-    dashboard_asset(DASHBOARD_I18N_JS, "text/javascript; charset=utf-8", &headers)
+    dashboard_asset(
+        DASHBOARD_I18N_JS,
+        "text/javascript; charset=utf-8",
+        &headers,
+    )
 }
 
 async fn dashboard_html(headers: HeaderMap) -> Response {
@@ -1380,27 +1406,51 @@ async fn dashboard_js(headers: HeaderMap) -> Response {
 }
 
 async fn dashboard_format_js(headers: HeaderMap) -> Response {
-    dashboard_asset(DASHBOARD_FORMAT_JS, "text/javascript; charset=utf-8", &headers)
+    dashboard_asset(
+        DASHBOARD_FORMAT_JS,
+        "text/javascript; charset=utf-8",
+        &headers,
+    )
 }
 
 async fn dashboard_session_js(headers: HeaderMap) -> Response {
-    dashboard_asset(DASHBOARD_SESSION_JS, "text/javascript; charset=utf-8", &headers)
+    dashboard_asset(
+        DASHBOARD_SESSION_JS,
+        "text/javascript; charset=utf-8",
+        &headers,
+    )
 }
 
 async fn dashboard_state_js(headers: HeaderMap) -> Response {
-    dashboard_asset(DASHBOARD_STATE_JS, "text/javascript; charset=utf-8", &headers)
+    dashboard_asset(
+        DASHBOARD_STATE_JS,
+        "text/javascript; charset=utf-8",
+        &headers,
+    )
 }
 
 async fn dashboard_keys_js(headers: HeaderMap) -> Response {
-    dashboard_asset(DASHBOARD_KEYS_JS, "text/javascript; charset=utf-8", &headers)
+    dashboard_asset(
+        DASHBOARD_KEYS_JS,
+        "text/javascript; charset=utf-8",
+        &headers,
+    )
 }
 
 async fn dashboard_qrcode_js(headers: HeaderMap) -> Response {
-    dashboard_asset(DASHBOARD_QRCODE_JS, "text/javascript; charset=utf-8", &headers)
+    dashboard_asset(
+        DASHBOARD_QRCODE_JS,
+        "text/javascript; charset=utf-8",
+        &headers,
+    )
 }
 
 async fn dashboard_theme_js(headers: HeaderMap) -> Response {
-    dashboard_asset(DASHBOARD_THEME_JS, "text/javascript; charset=utf-8", &headers)
+    dashboard_asset(
+        DASHBOARD_THEME_JS,
+        "text/javascript; charset=utf-8",
+        &headers,
+    )
 }
 
 async fn dashboard_favicon(headers: HeaderMap) -> Response {
@@ -1411,6 +1461,22 @@ async fn not_found() -> impl IntoResponse {
     (
         StatusCode::NOT_FOUND,
         Json(json!({ "error": "not found", "code": "not_found" })),
+    )
+}
+
+async fn dashboard_admin_html(headers: HeaderMap) -> Response {
+    dashboard_asset(
+        include_str!("../../static/admin.html"),
+        "text/html; charset=utf-8",
+        &headers,
+    )
+}
+
+async fn dashboard_admin_js(headers: HeaderMap) -> Response {
+    dashboard_asset(
+        include_str!("../../static/admin.js"),
+        "text/javascript; charset=utf-8",
+        &headers,
     )
 }
 
@@ -1716,6 +1782,7 @@ mod tests {
         use crate::config::{AcceptedAsset, ListenerMode};
         crate::config::Config {
             port: 0,
+            bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             database_url: "sqlite::memory:".into(),
             network: network.into(),
             horizon_url: "https://horizon.invalid".into(),
@@ -1737,6 +1804,8 @@ mod tests {
             webhook_delivery_retention_days: 30,
             idempotency_retention_days: 7,
             poll_interval_secs: 10,
+            expiry_sweep_interval_secs: 10,
+            trustline_check_interval_secs: 3600,
             poll_max_pages_per_cycle: 50,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 1000,
@@ -1926,20 +1995,4 @@ mod tests {
                 .assert_status(StatusCode::UNAUTHORIZED);
         }
     }
-}
-
-async fn dashboard_admin_html(headers: HeaderMap) -> Response {
-    dashboard_asset(
-        include_str!("../../static/admin.html"),
-        "text/html; charset=utf-8",
-        &headers,
-    )
-}
-
-async fn dashboard_admin_js(headers: HeaderMap) -> Response {
-    dashboard_asset(
-        include_str!("../../static/admin.js"),
-        "text/javascript; charset=utf-8",
-        &headers,
-    )
 }

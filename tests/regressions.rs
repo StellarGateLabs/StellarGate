@@ -43,6 +43,7 @@ async fn app() -> axum::Router {
 
     let config = Config {
         port: 0,
+        bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
         database_url: dsn,
         network: "testnet".into(),
         horizon_url: String::new(),
@@ -64,6 +65,8 @@ async fn app() -> axum::Router {
         webhook_delivery_retention_days: 30,
         idempotency_retention_days: 7,
         poll_interval_secs: 10,
+        expiry_sweep_interval_secs: 10,
+        trustline_check_interval_secs: 3600,
         poll_max_pages_per_cycle: 50,
         payment_ttl_secs: 3600,
         rate_limit_requests_per_sec: 1000,
@@ -96,10 +99,7 @@ async fn app() -> axum::Router {
 
 /// Send a request through the router and return the response status.
 async fn status_of(router: axum::Router, request: Request<Body>) -> StatusCode {
-    let response = router
-        .oneshot(request)
-        .await
-        .expect("router call failed");
+    let response = router.oneshot(request).await.expect("router call failed");
     response.status()
 }
 
@@ -209,5 +209,101 @@ async fn issue_279_low_entropy_memo_is_rejected() {
         status,
         StatusCode::BAD_REQUEST,
         "a low-entropy memo must be rejected"
+    );
+}
+
+/// Send an admin request and return its status and JSON body (`Null` if none).
+async fn admin_call(
+    router: axum::Router,
+    method: &str,
+    uri: &str,
+    content_type: Option<&str>,
+    body: &str,
+) -> (StatusCode, serde_json::Value) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("x-admin-secret", TEST_ADMIN_SECRET);
+    if let Some(ct) = content_type {
+        builder = builder.header("content-type", ct);
+    }
+    let response = router
+        .oneshot(builder.body(Body::from(body.to_owned())).expect("request"))
+        .await
+        .expect("router call failed");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+/// Regression: #1076 — issuing an API key ignored a body that was present but
+/// invalid, answering `201` with an unlabelled key. Only an absent or empty
+/// body may mean "no label"; anything else must be rejected and issue nothing.
+#[tokio::test]
+async fn issue_1076_issue_key_rejects_an_invalid_body() {
+    let router = app().await;
+    let (status, merchant) = admin_call(router.clone(), "POST", "/merchants", None, "").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = merchant["merchant_id"].as_str().expect("merchant_id");
+    let keys_uri = &format!("/merchants/{id}/keys");
+    let json = Some("application/json");
+
+    let rejected = [
+        (json, r#"{"label": 123}"#, StatusCode::BAD_REQUEST),
+        (json, r#"{"label":"ci""#, StatusCode::BAD_REQUEST),
+        (
+            Some("text/plain"),
+            r#"{"label":"ci"}"#,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+        (
+            None,
+            r#"{"label":"ci"}"#,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+    ];
+    for (ct, body, want) in rejected {
+        let (status, err) = admin_call(router.clone(), "POST", keys_uri, ct, body).await;
+        assert_eq!(status, want, "body {body:?} with content type {ct:?}");
+        if want == StatusCode::BAD_REQUEST {
+            assert_eq!(err["code"], "invalid_request", "body {body:?}");
+        }
+    }
+    let (_, listed) = admin_call(router.clone(), "GET", keys_uri, None, "").await;
+    assert_eq!(
+        listed["keys"].as_array().expect("keys").len(),
+        1,
+        "a rejected request must not issue a key"
+    );
+
+    let (status, _) = admin_call(router.clone(), "POST", keys_uri, None, "").await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "no body issues an unlabelled key"
+    );
+    let (status, _) = admin_call(router.clone(), "POST", keys_uri, json, "").await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "an empty JSON body issues an unlabelled key"
+    );
+    let (status, _) = admin_call(router.clone(), "POST", keys_uri, json, r#"{"label":"ci"}"#).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (_, listed) = admin_call(router, "GET", keys_uri, None, "").await;
+    let labels: Vec<_> = listed["keys"]
+        .as_array()
+        .expect("keys")
+        .iter()
+        .map(|k| k["label"].clone())
+        .collect();
+    assert_eq!(labels.len(), 4);
+    assert!(
+        labels.contains(&serde_json::json!("ci")),
+        "labels: {labels:?}"
     );
 }

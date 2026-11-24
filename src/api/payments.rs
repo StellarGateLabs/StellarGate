@@ -1,6 +1,7 @@
 use crate::{AppState, api::AuthenticatedMerchant, db, money};
 use axum::{
     Json,
+    body::{Body, Bytes},
     extract::{
         ConnectInfo, Extension, FromRequest, FromRequestParts, OptionalFromRequest, Path, Query,
         Request, State,
@@ -106,21 +107,35 @@ where
     }
 }
 
-/// Lets handlers take `Option<JsonBody<T>>` for an optional body. axum 0.8
-/// requires an explicit impl for `Option<_>` extractors; this keeps 0.7's
-/// behaviour, where any rejection (missing, empty or invalid body) yields
-/// `None` rather than an error response.
+/// Lets handlers take `Option<JsonBody<T>>` for an optional body. An absent
+/// or empty body yields `None`; a body that is present but malformed, wrongly
+/// typed or sent with the wrong content type is rejected exactly as
+/// `JsonBody<T>` rejects it, so the caller is never told a request succeeded
+/// while its payload was ignored (#1076).
 impl<T, S> OptionalFromRequest<S> for JsonBody<T>
 where
     T: serde::de::DeserializeOwned,
     S: Send + Sync,
 {
-    type Rejection = std::convert::Infallible;
+    type Rejection = AppError;
 
     async fn from_request(req: Request, state: &S) -> Result<Option<Self>, Self::Rejection> {
-        Ok(<Self as FromRequest<S>>::from_request(req, state)
+        let headers = req.headers().clone();
+        let bytes = Bytes::from_request(req, state)
             .await
-            .ok())
+            .map_err(|rejection| AppError {
+                status: rejection.status(),
+                code: "invalid_request",
+                message: rejection.body_text(),
+            })?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        let mut req = Request::new(Body::from(bytes));
+        *req.headers_mut() = headers;
+        <Self as FromRequest<S>>::from_request(req, state)
+            .await
+            .map(Some)
     }
 }
 
