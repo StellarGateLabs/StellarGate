@@ -43,6 +43,7 @@ async fn app() -> axum::Router {
 
     let config = Config {
         port: 0,
+        bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
         database_url: dsn,
         network: "testnet".into(),
         horizon_url: String::new(),
@@ -64,6 +65,8 @@ async fn app() -> axum::Router {
         webhook_delivery_retention_days: 30,
         idempotency_retention_days: 7,
         poll_interval_secs: 10,
+        expiry_sweep_interval_secs: 10,
+        trustline_check_interval_secs: 3600,
         poll_max_pages_per_cycle: 50,
         payment_ttl_secs: 3600,
         rate_limit_requests_per_sec: 1000,
@@ -96,10 +99,7 @@ async fn app() -> axum::Router {
 
 /// Send a request through the router and return the response status.
 async fn status_of(router: axum::Router, request: Request<Body>) -> StatusCode {
-    let response = router
-        .oneshot(request)
-        .await
-        .expect("router call failed");
+    let response = router.oneshot(request).await.expect("router call failed");
     response.status()
 }
 
