@@ -774,6 +774,21 @@ pub async fn list_pending(pool: &Db) -> Result<Vec<Payment>> {
     Ok(rows.iter().map(row_to_payment).collect())
 }
 
+/// `created_at` of the oldest open (`pending`/`underpaid`, not yet overdue)
+/// intent, or `None` when there is none. One aggregate over the same rows as
+/// [`list_pending`], for callers that only need the lower bound (#1077).
+pub async fn earliest_open_created_at(pool: &Db) -> Result<Option<String>> {
+    let earliest: Option<String> = sqlx::query_scalar(
+        "SELECT MIN(created_at)
+         FROM payments
+         WHERE status IN ('pending', 'underpaid')
+           AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(earliest)
+}
+
 /// Transition up to `batch_size` watchable payments whose TTL has elapsed to
 /// `expired`, returning the rows that were swept so the caller can fire
 /// `payment.expired` webhooks. The batch bound keeps each sweep's result set
@@ -1849,6 +1864,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn earliest_open_created_at_is_the_oldest_open_intent() {
+        let pool = memory_db().await;
+        assert_eq!(earliest_open_created_at(&pool).await.unwrap(), None);
+
+        for (id, memo, ttl, created) in [
+            ("newer", "MEMON", 3600, "2026-01-03T00:00:00Z"),
+            ("older", "MEMOO", 3600, "2026-01-02T00:00:00Z"),
+            ("overdue", "MEMOX", -10, "2026-01-01T00:00:00Z"),
+            ("paid", "MEMOP", 3600, "2026-01-01T00:00:00Z"),
+        ] {
+            create_payment(&pool, new_payment(id, memo, ttl))
+                .await
+                .expect("payment should be created");
+            sqlx::query("UPDATE payments SET created_at = ? WHERE id = ?")
+                .bind(created)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("backdate created_at");
+        }
+        update_payment_status(&pool, "paid", "paid", "TX1", "10")
+            .await
+            .expect("payment should transition to paid");
+
+        let earliest = earliest_open_created_at(&pool).await.unwrap();
+        assert_eq!(earliest.as_deref(), Some("2026-01-02T00:00:00Z"));
+        assert_eq!(
+            earliest,
+            list_pending(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .next()
+                .map(|p| p.created_at),
+            "must agree with the first row of list_pending"
+        );
+    }
+
+    #[tokio::test]
     async fn underpaid_payment_remains_findable_for_topup() {
         let pool = memory_db().await;
         create_payment(&pool, new_payment("partial", "MEMOP", 3600))
@@ -2384,7 +2438,10 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(unack_present, 1, "unacknowledged failure must survive pruning");
+        assert_eq!(
+            unack_present, 1,
+            "unacknowledged failure must survive pruning"
+        );
         let unack_payload: String =
             sqlx::query_scalar("SELECT payload FROM webhook_deliveries WHERE id = 'unack'")
                 .fetch_one(&pool)

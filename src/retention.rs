@@ -206,9 +206,21 @@ mod tests {
             // Aged delivered — deleted.
             ("old-delivered", "delivered", 60, None, "{}"),
             // Aged failed, acknowledged — deleted (returned to ordinary retention).
-            ("old-failed-ack", "failed", 60, Some("2024-01-01T00:00:00Z"), "{}"),
+            (
+                "old-failed-ack",
+                "failed",
+                60,
+                Some("2024-01-01T00:00:00Z"),
+                "{}",
+            ),
             // Aged failed, unacknowledged — compacted: row kept, payload cleared.
-            ("old-failed-unack", "failed", 60, None, "{\"event\":\"payment.completed\"}"),
+            (
+                "old-failed-unack",
+                "failed",
+                60,
+                None,
+                "{\"event\":\"payment.completed\"}",
+            ),
             // Aged pending — still owned by the redrive worker, never pruned.
             ("old-pending", "pending", 60, None, "{}"),
             // Recent delivered — inside the window, kept.
@@ -249,11 +261,12 @@ mod tests {
         );
 
         // The unacknowledged failure survives with its payload cleared.
-        let unack_payload: String =
-            sqlx::query_scalar("SELECT payload FROM webhook_deliveries WHERE id = 'old-failed-unack'")
-                .fetch_one(&state.pool)
-                .await
-                .expect("compacted row payload should load");
+        let unack_payload: String = sqlx::query_scalar(
+            "SELECT payload FROM webhook_deliveries WHERE id = 'old-failed-unack'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .expect("compacted row payload should load");
         assert_eq!(
             unack_payload, "",
             "unacknowledged failure must be compacted, not deleted"
@@ -311,7 +324,10 @@ mod tests {
                 .fetch_one(&state.pool)
                 .await
                 .unwrap();
-        assert_eq!(n, 0, "an acknowledged failed row must be deleted after the window");
+        assert_eq!(
+            n, 0,
+            "an acknowledged failed row must be deleted after the window"
+        );
     }
 
     /// Retention ages rows by last activity, not `created_at`: a delivery
@@ -335,11 +351,12 @@ mod tests {
 
         prune_once(&state).await.unwrap();
 
-        let n: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries WHERE id = 'retried-today'")
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM webhook_deliveries WHERE id = 'retried-today'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
         assert_eq!(
             n, 1,
             "a delivery retried today must not be pruned under a 30-day window"

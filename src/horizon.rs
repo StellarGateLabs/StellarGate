@@ -992,14 +992,10 @@ async fn starting_cursor(state: &Arc<AppState>) -> anyhow::Result<String> {
         return Ok(cursor);
     }
 
-    /* `list_pending` returns oldest-first, so the first row (if any) is the
-    earliest `created_at` we must not scan past. A payment settling this
-    intent cannot have landed before the intent existed. */
-    let earliest_open = db::list_pending(&state.pool)
-        .await?
-        .into_iter()
-        .next()
-        .map(|p| p.created_at);
+    /* The earliest `created_at` of an open intent is the point we must not
+    scan past: a payment settling that intent cannot have landed before the
+    intent existed. */
+    let earliest_open = db::earliest_open_created_at(&state.pool).await?;
 
     let mut next_cursor: Option<String> = None;
     let mut skipped = 0usize;

@@ -3,7 +3,6 @@
 //! everything on shutdown.
 
 use anyhow::Result;
-use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,9 +13,7 @@ use stellargate::{
     metrics::{
         AuthMetrics, HorizonMetrics, HttpMetrics, PaymentMetrics, TrustlineMetrics, WebhookMetrics,
     },
-    retention,
-    supervise,
-    webhook,
+    retention, supervise, webhook,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -213,7 +210,7 @@ async fn main() -> Result<()> {
 
     if tokio::time::timeout_at(deadline, shutdown).await.is_err() {
         let running: Vec<String> = health
-            .snapshots()
+            .snapshot()
             .into_iter()
             .filter(|task| task.running)
             .map(|task| task.name)
