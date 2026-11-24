@@ -25,7 +25,6 @@ const DASHBOARD_CSS: &str = include_str!("../static/dashboard.css");
 const DASHBOARD_JS: &str = include_str!("../static/dashboard.js");
 const DASHBOARD_THEME_JS: &str = include_str!("../static/dashboard-theme.js");
 
-
 const DASHBOARD_STATE_JS: &str = include_str!("../static/state.js");
 
 const TEST_ADMIN_SECRET: &str = "test-admin-secret";
@@ -106,6 +105,7 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../static/session.js"),
     ),
     ("/dashboard/state.js", include_str!("../static/state.js")),
+    ("/dashboard/prefs.js", include_str!("../static/prefs.js")),
     ("/dashboard/keys.js", include_str!("../static/keys.js")),
 ];
 
@@ -118,6 +118,7 @@ const JS_ROUTES: &[&str] = &[
     "/dashboard/format.js",
     "/dashboard/session.js",
     "/dashboard/state.js",
+    "/dashboard/prefs.js",
     "/dashboard/keys.js",
     "/dashboard/vendor/qrcode.js",
 ];
@@ -1381,8 +1382,15 @@ async fn favicon_is_served_and_csp_is_tight() {
     let res = server.get("/dashboard/favicon.svg").await;
     res.assert_status_ok();
     assert_eq!(res.header("content-type"), "image/svg+xml");
-    let csp = res.header("content-security-policy").to_str().unwrap().to_owned();
-    assert!(!csp.contains("data:"), "CSP must not allow data: URIs: {csp}");
+    let csp = res
+        .header("content-security-policy")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        !csp.contains("data:"),
+        "CSP must not allow data: URIs: {csp}"
+    );
     assert!(csp.contains("require-trusted-types-for 'script'"), "{csp}");
     assert!(DASHBOARD_HTML.contains("/dashboard/favicon.svg"));
     assert!(!DASHBOARD_HTML.contains("data:image"));
@@ -1391,7 +1399,9 @@ async fn favicon_is_served_and_csp_is_tight() {
 /// Sign-out must empty the DOM containers that held payment data (#797).
 #[test]
 fn sign_out_wipes_payment_data() {
-    let start = DASHBOARD_JS.find("function wipePaymentData").expect("wipe fn");
+    let start = DASHBOARD_JS
+        .find("function wipePaymentData")
+        .expect("wipe fn");
     let body = &DASHBOARD_JS[start..start + 900];
     for id in ["rows", "summary", "detail-fields", "deliveries"] {
         assert!(body.contains(&format!("\"{id}\"")), "{id} not wiped");
