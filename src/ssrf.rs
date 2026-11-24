@@ -3,10 +3,13 @@
 //! `webhook_url` is merchant-supplied and reachable by an unauthenticated caller
 //! via the redeliver endpoint, so before every dispatch we resolve the target
 //! host ourselves and reject loopback / link-local / private / other reserved
-//! ranges. We then pin the connection to the exact address we just validated
-//! (via reqwest's per-host `resolve()`) so a DNS answer that changes between
-//! our check and the actual connect — a DNS-rebinding attack — can't slip a
-//! blocked address past us: the pinned client never re-resolves the host.
+//! ranges. Every address the host resolves to must pass, or the URL is
+//! rejected. We then pin the connection to exactly that validated set (via
+//! reqwest's per-host `resolve_to_addrs()`) so a DNS answer that changes
+//! between our check and the actual connect — a DNS-rebinding attack — can't
+//! slip a blocked address past us: the pinned client never re-resolves the
+//! host. Pinning the whole set, not just the first answer, lets the connector
+//! fall back from an unroutable IPv6 address to the host's IPv4 one (#1078).
 
 use anyhow::{Result, anyhow};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -16,28 +19,29 @@ use std::time::Duration;
 /// DNS server can't stall a request indefinitely.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// A webhook target resolved to one concrete address and confirmed safe (or,
-/// with `allow_private` set, resolved but not range-checked — dev/test only).
+/// A webhook target resolved to its addresses and confirmed safe (or, with
+/// `allow_private` set, resolved but not range-checked — dev/test only).
 #[derive(Debug)]
 pub struct SafeTarget {
     host: String,
-    addr: SocketAddr,
+    /// Non-empty, deduplicated, in resolver order.
+    addrs: Vec<SocketAddr>,
 }
 
 impl SafeTarget {
     /// The host the URL names, as resolved and validated. The client built by
-    /// [`pinned_client`] is pinned to [`addr`](Self::addr) for *this* host, so a
+    /// [`pinned_client`] is pinned to [`addrs`](Self::addrs) for *this* host, so a
     /// cached client must never be reused for a different host that happens to
     /// resolve to the same address.
     pub fn host(&self) -> &str {
         &self.host
     }
 
-    /// The one concrete address `validate` confirmed safe (or, with
-    /// `allow_private`, resolved without the range check). This is the address
-    /// the pinned client connects to regardless of later DNS answers.
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
+    /// Every address `validate` confirmed safe (or, with `allow_private`,
+    /// resolved without the range check). These are the only addresses the
+    /// pinned client connects to, regardless of later DNS answers.
+    pub fn addrs(&self) -> &[SocketAddr] {
+        &self.addrs
     }
 }
 
@@ -60,29 +64,51 @@ pub async fn validate(url: &str, allow_private: bool) -> Result<SafeTarget> {
         .port_or_known_default()
         .ok_or_else(|| anyhow!("webhook_url has no resolvable port"))?;
 
-    let addr = tokio::time::timeout(
+    let resolved = tokio::time::timeout(
         RESOLVE_TIMEOUT,
         tokio::net::lookup_host((host.as_str(), port)),
     )
     .await
     .map_err(|_| anyhow!("timed out resolving webhook host {host:?}"))?
-    .map_err(|e| anyhow!("failed to resolve webhook host {host:?}: {e}"))?
-    .next()
-    .ok_or_else(|| anyhow!("webhook host {host:?} did not resolve to any address"))?;
+    .map_err(|e| anyhow!("failed to resolve webhook host {host:?}: {e}"))?;
 
-    if !allow_private && is_blocked_ip(addr.ip()) {
-        return Err(anyhow!(
-            "webhook_url host {host:?} resolves to a disallowed address ({})",
-            addr.ip()
-        ));
-    }
-
-    Ok(SafeTarget { host, addr })
+    let addrs = check_addrs(&host, resolved, allow_private)?;
+    Ok(SafeTarget { host, addrs })
 }
 
-/// Build a client that connects to `target.addr` for `target.host` regardless
-/// of what a later DNS lookup for that host would return, so the connection
-/// actually made is the one already validated by `validate`.
+/// Deduplicate `resolved` and require every address to be allowed: one blocked
+/// answer rejects the host, so a record set that mixes a public and a private
+/// address cannot be used to reach the private one.
+fn check_addrs(
+    host: &str,
+    resolved: impl IntoIterator<Item = SocketAddr>,
+    allow_private: bool,
+) -> Result<Vec<SocketAddr>> {
+    let mut addrs: Vec<SocketAddr> = Vec::new();
+    for addr in resolved {
+        if !allow_private && is_blocked_ip(addr.ip()) {
+            return Err(anyhow!(
+                "webhook_url host {host:?} resolves to a disallowed address ({})",
+                addr.ip()
+            ));
+        }
+        if !addrs.contains(&addr) {
+            addrs.push(addr);
+        }
+    }
+    if addrs.is_empty() {
+        return Err(anyhow!(
+            "webhook host {host:?} did not resolve to any address"
+        ));
+    }
+    Ok(addrs)
+}
+
+/// Build a client that connects only to `target.addrs` for `target.host`,
+/// regardless of what a later DNS lookup for that host would return, so every
+/// connection attempt goes to an address already validated by `validate`. The
+/// connector tries the addresses in order and falls back to the next one when
+/// a connect fails.
 ///
 /// `timeout` is applied per-attempt. Pass `Duration::from_secs(10)` (the
 /// default `WEBHOOK_TIMEOUT_SECS`) for webhook delivery; use a longer value
@@ -94,7 +120,7 @@ pub fn pinned_client(target: &SafeTarget, timeout: Duration) -> reqwest::Result<
         // of a redirect has not passed the SSRF validation and pinning above.
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("StellarGate/", env!("CARGO_PKG_VERSION")))
-        .resolve(&target.host, target.addr)
+        .resolve_to_addrs(&target.host, &target.addrs)
         .build()
 }
 
@@ -308,6 +334,74 @@ mod tests {
         validate("http://127.0.0.1:1234/hook", true)
             .await
             .expect("loopback must be allowed when allow_private is set");
+    }
+
+    // ── #1078: every resolved address is validated and pinned ────────────
+
+    fn sock(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn keeps_every_public_address_in_order_without_duplicates() {
+        let v6 = sock("[2606:4700::1111]:443");
+        let v4 = sock("1.1.1.1:443");
+        let addrs = check_addrs("dual.example", [v6, v4, v6], false).unwrap();
+        assert_eq!(addrs, vec![v6, v4]);
+    }
+
+    #[test]
+    fn rejects_the_host_when_any_resolved_address_is_blocked() {
+        for blocked in ["10.0.0.5:443", "[::1]:443", "[fd00::1]:443"] {
+            let err = check_addrs("mixed.example", [sock("1.1.1.1:443"), sock(blocked)], false)
+                .unwrap_err();
+            assert!(err.to_string().contains("disallowed"), "{blocked}: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_host_with_no_addresses() {
+        let err = check_addrs("empty.example", [], false).unwrap_err();
+        assert!(err.to_string().contains("did not resolve"), "got: {err}");
+    }
+
+    #[test]
+    fn allow_private_keeps_blocked_addresses() {
+        let addrs = check_addrs("dev.example", [sock("127.0.0.1:80")], true).unwrap();
+        assert_eq!(addrs, vec![sock("127.0.0.1:80")]);
+    }
+
+    /// The first pinned address refuses the connection (nothing listens on
+    /// `[::1]` for the mock server), as an IPv6 address does on an IPv4-only
+    /// network. The client must fall back to the next validated address.
+    #[tokio::test]
+    async fn pinned_client_falls_back_to_the_next_validated_address() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let port = server.address().port();
+        assert!(
+            std::net::TcpStream::connect(("::1", port)).is_err(),
+            "fixture needs [::1]:{port} to refuse connections"
+        );
+
+        let target = SafeTarget {
+            host: "receiver.test".into(),
+            addrs: vec![
+                SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port),
+                *server.address(),
+            ],
+        };
+        let client = pinned_client(&target, Duration::from_secs(5)).unwrap();
+        let res = client
+            .post(format!("http://receiver.test:{port}/hook"))
+            .send()
+            .await
+            .expect("must fall back to the IPv4 address");
+        assert_eq!(res.status(), 200);
     }
 
     // ── #441 new tests ────────────────────────────────────────────────────

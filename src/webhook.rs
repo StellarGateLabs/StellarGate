@@ -330,13 +330,13 @@ fn blocked_delivery_attempts(state: &AppState) -> i64 {
 /// `webhook_allow_private_targets` for local dev/tests that intentionally
 /// target a loopback mock server.
 ///
-/// The pinned client is **cached** keyed by `(host, validated address, timeout)`
+/// The pinned client is **cached** keyed by `(host, validated addresses, timeout)`
 /// (see [`WEBHOOK_CLIENTS`]) so a settlement burst to one receiver reuses one
 /// connection pool instead of paying a fresh TCP handshake and TLS negotiation
 /// per event. SSRF safety is preserved because the cache key embeds the
-/// address `validate` just confirmed: every call still resolves and range-
+/// addresses `validate` just confirmed: every call still resolves and range-
 /// checks DNS first, and a client is only reused when the host resolves to the
-/// same address it was pinned to. A DNS change yields a different key — a miss
+/// same addresses it was pinned to. A DNS change yields a different key — a miss
 /// — and a freshly built, freshly pinned client.
 pub(crate) async fn safe_client(state: &AppState, url: &str) -> anyhow::Result<reqwest::Client> {
     let target = crate::ssrf::validate(url, state.config.webhook_allow_private_targets).await?;
@@ -364,7 +364,7 @@ const WEBHOOK_CLIENT_CACHE_TTL: Duration = Duration::from_secs(300);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct WebhookClientKey {
     host: String,
-    addr: SocketAddr,
+    addrs: Vec<SocketAddr>,
     timeout_secs: u64,
 }
 
@@ -384,12 +384,12 @@ static WEBHOOK_CLIENTS: LazyLock<Cache<WebhookClientKey, reqwest::Client>> = Laz
 });
 
 /// Return a pinned client for `target`, reusing a cached one when `target`
-/// resolves to the same `(host, address)` already in the pool. On a cache miss
+/// resolves to the same `(host, addresses)` already in the pool. On a cache miss
 /// a new client is built and inserted.
 ///
 /// Two deliveries that race the same first-ever resolution can both miss and
 /// both build; last-writer-wins. Both clients are equivalent — pinned to the
-/// same already-validated address — so the discarded pool is merely a wasted
+/// same already-validated addresses — so the discarded pool is merely a wasted
 /// handshake, never a correctness issue.
 fn pinned_client_cached(
     target: &crate::ssrf::SafeTarget,
@@ -397,7 +397,7 @@ fn pinned_client_cached(
 ) -> reqwest::Result<reqwest::Client> {
     let key = WebhookClientKey {
         host: target.host().to_string(),
-        addr: target.addr(),
+        addrs: target.addrs().to_vec(),
         timeout_secs: timeout.as_secs(),
     };
     if let Some(client) = WEBHOOK_CLIENTS.get(&key) {
@@ -825,11 +825,11 @@ mod tests {
     /// cached. `moka::sync::Cache::get` is exact (not an estimate), so this is
     /// a reliable presence check for the tests below.
     #[cfg(test)]
-    fn client_cached_for(host: &str, addr: SocketAddr, timeout_secs: u64) -> bool {
+    fn client_cached_for(host: &str, addrs: &[SocketAddr], timeout_secs: u64) -> bool {
         WEBHOOK_CLIENTS
             .get(&WebhookClientKey {
                 host: host.to_string(),
-                addr,
+                addrs: addrs.to_vec(),
                 timeout_secs,
             })
             .is_some()
@@ -848,10 +848,10 @@ mod tests {
         let timeout = Duration::from_secs(10);
 
         // First delivery: miss → build → cache.
-        let _first = pinned_client_cached(&target, timeout)
-            .expect("first pinned client should build");
+        let _first =
+            pinned_client_cached(&target, timeout).expect("first pinned client should build");
         assert!(
-            client_cached_for("127.0.0.1", target.addr(), 10),
+            client_cached_for("127.0.0.1", target.addrs(), 10),
             "client must be cached after the first delivery"
         );
 
@@ -872,23 +872,27 @@ mod tests {
         let t2 = crate::ssrf::validate("http://127.0.0.1:12/hook", true)
             .await
             .expect("second loopback target should validate");
-        assert_ne!(t1.addr(), t2.addr(), "fixtures must resolve to distinct addresses");
+        assert_ne!(
+            t1.addrs(),
+            t2.addrs(),
+            "fixtures must resolve to distinct addresses"
+        );
 
         let _ = pinned_client_cached(&t1, Duration::from_secs(10))
             .expect("first pinned client should build");
         assert!(
-            client_cached_for("127.0.0.1", t1.addr(), 10),
+            client_cached_for("127.0.0.1", t1.addrs(), 10),
             "the first resolution's client must be cached"
         );
         assert!(
-            !client_cached_for("127.0.0.1", t2.addr(), 10),
+            !client_cached_for("127.0.0.1", t2.addrs(), 10),
             "a different validated address must not reuse the first client's entry"
         );
 
         let _ = pinned_client_cached(&t2, Duration::from_secs(10))
             .expect("second pinned client should build for the new address");
         assert!(
-            client_cached_for("127.0.0.1", t2.addr(), 10),
+            client_cached_for("127.0.0.1", t2.addrs(), 10),
             "the new resolution's client must be cached separately"
         );
     }
@@ -898,17 +902,17 @@ mod tests {
     /// pinning binds a specific host (Host header / SNI) to the address.
     #[tokio::test]
     async fn different_host_at_same_address_is_not_reused() {
-        let addr: SocketAddr = "127.0.0.1:21".parse().unwrap();
+        let addrs: Vec<SocketAddr> = vec!["127.0.0.1:21".parse().unwrap()];
         // Same validated address, two different host names: the cache keys must
         // differ so a client pinned for one host is never served for the other.
         let key_a = WebhookClientKey {
             host: "a.example".into(),
-            addr,
+            addrs: addrs.clone(),
             timeout_secs: 10,
         };
         let key_b = WebhookClientKey {
             host: "b.example".into(),
-            addr,
+            addrs: addrs.clone(),
             timeout_secs: 10,
         };
         assert_ne!(key_a, key_b, "host must be part of the cache key");
