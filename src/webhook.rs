@@ -848,8 +848,8 @@ mod tests {
         let timeout = Duration::from_secs(10);
 
         // First delivery: miss → build → cache.
-        let _first = pinned_client_cached(&target, timeout)
-            .expect("first pinned client should build");
+        let _first =
+            pinned_client_cached(&target, timeout).expect("first pinned client should build");
         assert!(
             client_cached_for("127.0.0.1", target.addr(), 10),
             "client must be cached after the first delivery"
@@ -872,7 +872,11 @@ mod tests {
         let t2 = crate::ssrf::validate("http://127.0.0.1:12/hook", true)
             .await
             .expect("second loopback target should validate");
-        assert_ne!(t1.addr(), t2.addr(), "fixtures must resolve to distinct addresses");
+        assert_ne!(
+            t1.addr(),
+            t2.addr(),
+            "fixtures must resolve to distinct addresses"
+        );
 
         let _ = pinned_client_cached(&t1, Duration::from_secs(10))
             .expect("first pinned client should build");

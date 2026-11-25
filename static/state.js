@@ -70,8 +70,9 @@ import { filterByAmount, filterPayments } from "./format.js";
  * @property {boolean} keysLoading
  * @property {string} keysError
  * @property {string|null} revealedKey
- * @property {string} sortKey
- * @property {string} sortDirection
+ * @property {string|null} revealedKeyPrefix
+ * @property {string|null} sortKey
+ * @property {"asc"|"desc"} sortDir
  */
 
 /**
@@ -127,10 +128,12 @@ export function initialState() {
      * reveal panel closes.
      */
     revealedKey: null,
-    /** Column the payments table is sorted by (issue #770). */
-    sortKey: "",
+    /** Prefix of the revealed key, shown beside it; cleared with it. */
+    revealedKeyPrefix: null,
+    /** Column the payments table is sorted by (issue #770), or null. */
+    sortKey: null,
     /** "asc" or "desc"; only meaningful when `sortKey` is set. */
-    sortDirection: "asc",
+    sortDir: "asc",
   };
 }
 
@@ -243,7 +246,7 @@ export function createStore(seed) {
     var rows = visiblePayments();
     var key = state.sortKey;
     if (!key) return rows;
-    var dir = state.sortDirection === "desc" ? -1 : 1;
+    var dir = state.sortDir === "desc" ? -1 : 1;
     // Decorate with the original index so equal keys keep their load order.
     return rows
       .map(function (row, index) {
@@ -285,17 +288,23 @@ export function createStore(seed) {
   }
 
   /**
-   * Toggle the sort on `key`: a new column starts ascending, the active column
-   * flips direction. Passing the active key twice returns to ascending rather
-   * than clearing the sort, so the header always reflects a known order.
+   * Toggle the sort on `key`: a new column starts ascending, and the active
+   * column goes ascending, then descending, then back to the load order.
    *
    * @param {string} key
    */
   function toggleSort(key) {
-    if (state.sortKey === key) {
-      return update({ sortDirection: state.sortDirection === "asc" ? "desc" : "asc" });
-    }
-    return update({ sortKey: key, sortDirection: "asc" });
+    if (state.sortKey !== key) return update({ sortKey: key, sortDir: "asc" });
+    if (state.sortDir === "asc") return update({ sortDir: "desc" });
+    return update({ sortKey: null, sortDir: "asc" });
+  }
+
+  /**
+   * Whether the sort covers only part of the result set: more pages remain,
+   * so the renderer must label the order as client-side (issue #770).
+   */
+  function sortIsPartial() {
+    return state.cursor !== null && state.cursor !== undefined;
   }
 
   /**
@@ -303,14 +312,44 @@ export function createStore(seed) {
    * Callers must clear it via `clearRevealedKey()` once the panel closes.
    *
    * @param {string|null} material
+   * @param {string|null} [prefix]
    */
-  function revealKey(material) {
-    return update({ revealedKey: material === undefined ? null : material });
+  function revealKey(material, prefix) {
+    return update({
+      revealedKey: material === undefined ? null : material,
+      revealedKeyPrefix: prefix === undefined ? null : prefix,
+    });
   }
 
   /** Drop the revealed key from state so it is not held in memory. */
   function clearRevealedKey() {
-    return update({ revealedKey: null });
+    return update({ revealedKey: null, revealedKeyPrefix: null });
+  }
+
+  /**
+   * Replace the admin key list (issue #767). Only the non-secret fields are
+   * kept, so a response that carried key material cannot leave it in state.
+   *
+   * @param {MerchantKey[]} keys
+   */
+  function setMerchantKeys(keys) {
+    return update({
+      merchantKeys: (keys || []).map(function (k) {
+        return { id: k.id, prefix: k.prefix, created_at: k.created_at, revoked_at: k.revoked_at || null };
+      }),
+    });
+  }
+
+  /**
+   * Whether `typed` confirms revoking key `id` (issue #769): the operator must
+   * retype the prefix exactly, and a revoked key cannot be revoked again.
+   *
+   * @param {string} id
+   * @param {string} typed
+   */
+  function canRevokeKey(id, typed) {
+    var key = (state.merchantKeys || []).filter(function (k) { return k.id === id; })[0];
+    return !!key && !key.revoked_at && typed === key.prefix;
   }
 
   /**
@@ -385,8 +424,11 @@ export function createStore(seed) {
     visiblePayments: visiblePayments,
     sortedPayments: sortedPayments,
     toggleSort: toggleSort,
+    sortIsPartial: sortIsPartial,
     revealKey: revealKey,
     clearRevealedKey: clearRevealedKey,
+    setMerchantKeys: setMerchantKeys,
+    canRevokeKey: canRevokeKey,
     clampActiveRow: clampActiveRow,
     resetPaging: resetPaging,
     selectedPayment: selectedPayment,

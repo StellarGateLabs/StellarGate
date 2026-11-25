@@ -47,7 +47,10 @@
 (function () {
   "use strict";
 
-  var KEY = "stellargate.theme";
+  // The settings panel (#771) persists the theme through state.js savePrefs,
+  // i.e. under PREFS_NAMESPACE + "theme". Reading any other key here means the
+  // stored choice is never seen before first paint and the #713 flash returns.
+  var KEY = "stellargate.prefs.theme";
   var root = document.documentElement;
 
   /**

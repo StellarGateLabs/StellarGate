@@ -38,7 +38,6 @@ import { createSessionStore } from "./session.js";
 import { createStore, parseHash, serializeHash } from "./state.js";
 import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
 import { createPrefsStore, COLUMNS, ALWAYS_VISIBLE } from "./prefs.js";
-import { sortPayments } from "./sort.js";
 
 (function () {
   "use strict";

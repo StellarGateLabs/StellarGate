@@ -466,8 +466,8 @@ test("toggleSort on a new column starts ascending", () => {
 
 test("sorting is labelled as client-side when more pages remain", () => {
   // #770: the sort only covers loaded rows, so the UI must say so.
-  const store = createStore({ loadedPayments: SORT_ROWS, nextCursor: "abc" });
+  const store = createStore({ loadedPayments: SORT_ROWS, cursor: "abc" });
   assert.equal(store.sortIsPartial(), true);
-  store.update({ nextCursor: null });
+  store.update({ cursor: null });
   assert.equal(store.sortIsPartial(), false);
 });
