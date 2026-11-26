@@ -400,7 +400,11 @@
         <p id="rate-limit" class="error" role="status" hidden></p>
 
         <section id="summary" class="summary" aria-label="Payment summary"></section>
+        <!-- #792: stacked status breakdown bar. Rendered by renderStatusBreakdownBar(). -->
+        <div id="status-breakdown-bar" aria-label="Payment status breakdown" hidden></div>
         <section id="asset-totals" class="summary" aria-label="Completed total per asset"></section>
+        <!-- #791: payment volume chart. Rendered by renderVolumeChart(). -->
+        <section id="volume-chart" class="card volume-chart-card" aria-label="Payment volume over time" hidden></section>
         <div id="idle-warning" class="card" role="alertdialog" aria-live="assertive" hidden>
           <span>You will be signed out in 60 seconds due to inactivity.</span>
           <button id="idle-stay" type="button" class="primary">Stay signed in</button>

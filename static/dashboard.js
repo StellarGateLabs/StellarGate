@@ -559,6 +559,11 @@ import { sortPayments } from "./sort.js";
       var n = $(id);
       if (n) n.textContent = "";
     });
+    /* Hide and clear the chart and breakdown containers (#791, #792). */
+    ["volume-chart", "status-breakdown-bar"].forEach(function (id) {
+      var n = $(id);
+      if (n) { clear(n); n.hidden = true; }
+    });
     show($("payment-invoice"), false);
     clearListState();
     currentDetailPayment = null;
@@ -796,6 +801,7 @@ import { sortPayments } from "./sort.js";
         collectAssets(payments);
         renderRows();
         renderAssetTotals();
+        renderVolumeChart(store.get().loadedPayments);
 
         var more = payments.length === store.get().pageSize && !!body.next_cursor;
         store.update({ cursor: more ? body.next_cursor : null });
@@ -867,11 +873,181 @@ import { sortPayments } from "./sort.js";
           card.appendChild(el("strong", null, row[1]));
           summary.appendChild(card);
         });
+
+        /* #792: stacked status breakdown bar. */
+        renderStatusBreakdownBar(body.summary || []);
       })
       .catch(function (err) {
         clear($("summary"));
         announce("Error loading summary: " + err.message);
       });
+  }
+
+  /**
+   * Render a stacked status breakdown bar from the summary counts (#792).
+   *
+   * Each segment is labelled with text and a percentage, not colour alone, and
+   * clicking a segment applies that status filter. The bar is built from plain
+   * <div> elements so it needs no SVG and no chart library.
+   */
+  function renderStatusBreakdownBar(summaryRows) {
+    var container = $("status-breakdown-bar");
+    if (!container) return;
+    clear(container);
+
+    /* Map summary rows to { status, count } objects. The summary API returns
+       rows like ["pending", "12"] or ["Pending", 12]. */
+    var STATUS_ORDER = ["pending", "completed", "underpaid", "expired"];
+    var counts = {};
+    summaryRows.forEach(function (row) {
+      var label = String(row[0]).toLowerCase();
+      var n = parseInt(row[1], 10);
+      if (STATUS_ORDER.indexOf(label) >= 0 && isFinite(n)) counts[label] = n;
+    });
+    var total = STATUS_ORDER.reduce(function (s, k) { return s + (counts[k] || 0); }, 0);
+    if (total === 0) {
+      container.hidden = true;
+      return;
+    }
+    container.hidden = false;
+
+    var bar = el("div", "breakdown-bar");
+    bar.setAttribute("role", "group");
+    bar.setAttribute("aria-label", "Payment status breakdown");
+    container.appendChild(bar);
+
+    /* Accessible fallback table. */
+    var table = el("table", "breakdown-table visually-hidden");
+    table.setAttribute("aria-label", "Payment status breakdown");
+    var thead = document.createElement("thead");
+    var tr = document.createElement("tr");
+    tr.appendChild(el("th", null, "Status"));
+    tr.appendChild(el("th", null, "Count"));
+    tr.appendChild(el("th", null, "Percent"));
+    thead.appendChild(tr);
+    table.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    table.appendChild(tbody);
+    container.appendChild(table);
+
+    STATUS_ORDER.forEach(function (status) {
+      var count = counts[status] || 0;
+      if (count === 0) return;
+      var pct = Math.round((count / total) * 100);
+
+      var seg = el("button", "breakdown-seg breakdown-seg-" + status);
+      seg.type = "button";
+      seg.style.width = pct + "%";
+      seg.setAttribute("aria-label", status + ": " + count + " (" + pct + "%)");
+      seg.addEventListener("click", function () {
+        store.update({ status: status });
+        onFilterChange();
+      });
+
+      var text = el("span", "breakdown-seg-text");
+      text.setAttribute("aria-hidden", "true");
+      text.textContent = status.charAt(0).toUpperCase() + status.slice(1) + " " + pct + "%";
+      seg.appendChild(text);
+      bar.appendChild(seg);
+
+      var row = document.createElement("tr");
+      row.appendChild(el("td", null, status));
+      row.appendChild(el("td", null, String(count)));
+      row.appendChild(el("td", null, pct + "%"));
+      tbody.appendChild(row);
+    });
+  }
+
+  /**
+   * Bucket loaded payments by day and render an inline SVG bar chart (#791).
+   *
+   * The chart shows completed-payment volume over the last N days (up to 30).
+   * A hidden <table> provides the data for assistive technology and browsers
+   * that do not render SVG. Theme tokens are used throughout so the chart
+   * follows both light and dark palettes without extra CSS.
+   */
+  function renderVolumeChart(payments) {
+    var container = $("volume-chart");
+    if (!container) return;
+    clear(container);
+
+    /* Bucket payments by YYYY-MM-DD in local time. */
+    var buckets = {};
+    payments.forEach(function (p) {
+      if (p.status !== "completed" && p.status !== "underpaid") return;
+      var d = new Date(p.created_at);
+      if (isNaN(d.getTime())) return;
+      var key = d.getFullYear() + "-" +
+        String(d.getMonth() + 1).padStart(2, "0") + "-" +
+        String(d.getDate()).padStart(2, "0");
+      buckets[key] = (buckets[key] || 0) + 1;
+    });
+
+    var keys = Object.keys(buckets).sort();
+    if (keys.length === 0) {
+      container.hidden = true;
+      return;
+    }
+    container.hidden = false;
+
+    container.appendChild(el("h3", null, "Payment volume"));
+
+    /* Limit to the last 30 days for readability. */
+    if (keys.length > 30) keys = keys.slice(keys.length - 30);
+
+    var maxCount = keys.reduce(function (m, k) { return Math.max(m, buckets[k]); }, 0);
+
+    var W = 320, H = 80;
+    var barW = Math.max(2, Math.floor((W - 4) / keys.length) - 2);
+    var gap = Math.floor((W - 4) / keys.length);
+
+    var svgNS = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(svgNS, "svg");
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    svg.setAttribute("width", W);
+    svg.setAttribute("height", H);
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("focusable", "false");
+    svg.className = "volume-svg";
+
+    keys.forEach(function (key, i) {
+      var count = buckets[key];
+      var barH = maxCount > 0 ? Math.max(2, Math.round((count / maxCount) * (H - 10))) : 2;
+      var x = 2 + i * gap;
+      var y = H - barH;
+      var rect = document.createElementNS(svgNS, "rect");
+      rect.setAttribute("x", x);
+      rect.setAttribute("y", y);
+      rect.setAttribute("width", barW);
+      rect.setAttribute("height", barH);
+      rect.setAttribute("class", "volume-bar");
+      rect.setAttribute("rx", "2");
+      var title = document.createElementNS(svgNS, "title");
+      title.textContent = key + ": " + count;
+      rect.appendChild(title);
+      svg.appendChild(rect);
+    });
+
+    container.appendChild(svg);
+
+    /* Accessible data table. */
+    var table = el("table", "volume-table visually-hidden");
+    table.setAttribute("aria-label", "Payment volume by day");
+    var thead = document.createElement("thead");
+    var tr = document.createElement("tr");
+    tr.appendChild(el("th", null, "Date"));
+    tr.appendChild(el("th", null, "Payments"));
+    thead.appendChild(tr);
+    table.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    keys.forEach(function (key) {
+      var row = document.createElement("tr");
+      row.appendChild(el("td", null, key));
+      row.appendChild(el("td", null, String(buckets[key])));
+      tbody.appendChild(row);
+    });
+    table.appendChild(tbody);
+    container.appendChild(table);
   }
 
   // ── New-since-refresh highlight (#781) ────────────────────────────────────
@@ -1501,7 +1677,11 @@ import { sortPayments } from "./sort.js";
         }
         show($("deliveries-empty"), deliveries.length === 0);
         if (deliveries.length > 0) {
-          deliveries.forEach(function (d) { list.appendChild(deliveryItem(paymentId, d)); });
+          /* #789: Group deliveries by event and show only the latest per event. */
+          var grouped = groupDeliveriesByEvent(deliveries);
+          grouped.forEach(function (group) {
+            list.appendChild(deliveryGroupItem(paymentId, group));
+          });
         }
       })
       .catch(function (err) {
@@ -1516,13 +1696,75 @@ import { sortPayments } from "./sort.js";
       });
   }
 
-  function deliveryItem(paymentId, d) {
+  /**
+   * Group deliveries by event name (#789). Each group contains all attempts
+   * for one event, sorted newest-first, with a summary of total attempts and
+   * last status.
+   */
+  function groupDeliveriesByEvent(deliveries) {
+    var byEvent = {};
+    deliveries.forEach(function (d) {
+      var event = d.event || "webhook";
+      if (!byEvent[event]) byEvent[event] = [];
+      byEvent[event].push(d);
+    });
+    return Object.keys(byEvent).map(function (event) {
+      var items = byEvent[event];
+      items.sort(function (a, b) {
+        return new Date(b.last_attempt || b.created_at) - new Date(a.last_attempt || a.created_at);
+      });
+      var latest = items[0];
+      var totalAttempts = items.reduce(function (sum, d) { return sum + (d.attempts || 0); }, 0);
+      return { event: event, items: items, latest: latest, totalAttempts: totalAttempts };
+    });
+  }
+
+  /**
+   * Render a grouped delivery with collapse/expand for older attempts (#789).
+   */
+  function deliveryGroupItem(paymentId, group) {
+    var wrapper = el("li", "delivery-group");
+    var head = el("div", "delivery-group-head");
+    var eventName = el("strong", null, group.event);
+    head.appendChild(eventName);
+    head.appendChild(statusPill(group.latest.status));
+    wrapper.appendChild(head);
+
+    var summary = el("div", "delivery-group-summary muted small");
+    summary.textContent = group.totalAttempts + " attempt" + (group.totalAttempts === 1 ? "" : "s") + 
+                          " · last " + group.latest.status;
+    wrapper.appendChild(summary);
+
+    wrapper.appendChild(deliveryItem(paymentId, group.latest, true));
+
+    if (group.items.length > 1) {
+      var toggle = el("button", "ghost delivery-toggle", "Show " + (group.items.length - 1) + " older attempt" + (group.items.length === 2 ? "" : "s"));
+      toggle.type = "button";
+      var olderList = el("ul", "delivery-older");
+      olderList.hidden = true;
+      group.items.slice(1).forEach(function (d) {
+        olderList.appendChild(deliveryItem(paymentId, d, false));
+      });
+      toggle.addEventListener("click", function () {
+        olderList.hidden = !olderList.hidden;
+        toggle.textContent = olderList.hidden 
+          ? "Show " + (group.items.length - 1) + " older attempt" + (group.items.length === 2 ? "" : "s")
+          : "Hide older attempts";
+      });
+      wrapper.appendChild(toggle);
+      wrapper.appendChild(olderList);
+    }
+
+    return wrapper;
+  }
+
+  function deliveryItem(paymentId, d, isLatest) {
     var li = el("li", "delivery");
     var head = el("div", "delivery-head");
-    head.appendChild(el("strong", null, d.event || "webhook"));
+    if (isLatest) head.appendChild(el("strong", null, d.event || "webhook"));
     head.appendChild(statusPill(d.status));
     li.appendChild(head);
-    li.appendChild(el("div", "mono", d.url));
+    if (isLatest) li.appendChild(el("div", "mono", d.url));
     li.appendChild(el("div", "delivery-meta", "attempt " + d.attempts + " · manual " + (d.manual_attempts || 0)));
     li.appendChild(el("div", "delivery-meta", "last: " + relativeTime(d.last_attempt)));
     li.lastChild.title = fmtTime(d.last_attempt);
@@ -1534,27 +1776,63 @@ import { sortPayments } from "./sort.js";
     if (d.status !== "delivered") {
       li.appendChild(el("div", "delivery-meta", "retry state: queued for redrive if attempts remain"));
     }
-    var button = el("button", "ghost", "Redeliver");
-    button.addEventListener("click", function () {
-      if (!window.confirm("Redeliver this webhook now?")) return;
-      button.disabled = true;
-      button.textContent = "Sending\u2026";
-      api(
-        "/payments/" + encodeURIComponent(paymentId) +
-        "/webhooks/" + encodeURIComponent(d.id) + "/redeliver",
-        { method: "POST" }
-      )
-        .then(function () { loadDeliveries(paymentId); })
-        .catch(function (err) {
-          button.disabled = false;
-          button.textContent = "Redeliver";
-          if (err.message !== "unauthorized") {
-            setError($("deliveries-error"),
-              err.message.indexOf("429") >= 0 ? "Rate limited. Try again shortly." : err.message);
-          }
-        });
-    });
-    li.appendChild(button);
+
+    /* #790: Force redeliver — only on successfully delivered attempts, with a
+       clear warning that the same event will be sent twice. */
+    if (d.status === "delivered") {
+      var forceBtn = el("button", "ghost delivery-force", "Force redeliver");
+      forceBtn.type = "button";
+      forceBtn.addEventListener("click", function () {
+        if (!window.confirm(
+          "Force redeliver?\n\n" +
+          "This event was already delivered successfully. Sending it again may cause " +
+          "duplicate processing on the receiving end (e.g. a duplicate order or charge). " +
+          "Only proceed if you know the receiver handles duplicates safely.\n\n" +
+          "Press OK to send the duplicate, or Cancel to abort."
+        )) return;
+        forceBtn.disabled = true;
+        forceBtn.textContent = "Sending\u2026";
+        api(
+          "/payments/" + encodeURIComponent(paymentId) +
+          "/webhooks/" + encodeURIComponent(d.id) + "/redeliver?force=true",
+          { method: "POST" }
+        )
+          .then(function () { loadDeliveries(paymentId); })
+          .catch(function (err) {
+            forceBtn.disabled = false;
+            forceBtn.textContent = "Force redeliver";
+            if (err.message !== "unauthorized") {
+              setError($("deliveries-error"),
+                err.message.indexOf("429") >= 0 ? "Rate limited \u2014 try again shortly." : err.message);
+            }
+          });
+      });
+      li.appendChild(forceBtn);
+    } else {
+      var button = el("button", "ghost", "Redeliver");
+      button.type = "button";
+      button.addEventListener("click", function () {
+        if (!window.confirm("Redeliver this webhook now?")) return;
+        button.disabled = true;
+        button.textContent = "Sending\u2026";
+        api(
+          "/payments/" + encodeURIComponent(paymentId) +
+          "/webhooks/" + encodeURIComponent(d.id) + "/redeliver",
+          { method: "POST" }
+        )
+          .then(function () { loadDeliveries(paymentId); })
+          .catch(function (err) {
+            button.disabled = false;
+            button.textContent = "Redeliver";
+            if (err.message !== "unauthorized") {
+              setError($("deliveries-error"),
+                err.message.indexOf("429") >= 0 ? "Rate limited \u2014 try again shortly." : err.message);
+            }
+          });
+      });
+      li.appendChild(button);
+    }
+
     return li;
   }
 

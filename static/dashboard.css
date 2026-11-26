@@ -1580,3 +1580,171 @@ tr.row-new { background: color-mix(in srgb, var(--accent, #3b82f6) 18%, transpar
 .timeline li.timeline-failed { color: #b00020; font-weight: 600; }
 .raw-json pre { max-width: 100%; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 #detail-shortfall { margin-block-end: 1rem; }
+
+/* ── #789: Grouped webhook delivery attempts ───────────────────────────────
+ *
+ * Deliveries are grouped by event name. Each group shows a summary line and
+ * the latest attempt; older attempts are hidden behind a toggle button so a
+ * payment with many retries does not produce a wall of items. */
+.delivery-group {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.7rem 0.8rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.delivery-group-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.delivery-group-summary {
+  margin-bottom: 0.25rem;
+}
+
+/* The toggle button for showing/hiding older attempts. */
+.delivery-toggle {
+  align-self: flex-start;
+  padding: 0.2rem 0.6rem;
+  font-size: 0.82rem;
+  margin-top: 0.25rem;
+}
+
+/* Older-attempts list sits inside the group, visually indented. */
+.delivery-older {
+  list-style: none;
+  margin: 0.25rem 0 0;
+  padding: 0;
+  padding-inline-start: 0.75rem;
+  border-inline-start: 2px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+/* ── #790: Force redeliver button ──────────────────────────────────────────
+ *
+ * Styled as a secondary destructive action: ghost base with a warning border
+ * so it is visually distinct from the standard Redeliver button. */
+.delivery-force {
+  color: var(--err);
+  border-color: var(--err);
+  margin-top: 0.5rem;
+  padding: 0.3rem 0.7rem;
+  font-size: 0.85rem;
+}
+.delivery-force:hover {
+  background: var(--err-bg);
+  border-color: var(--err);
+}
+@media (forced-colors: active) {
+  .delivery-force {
+    border: 2px solid ButtonText;
+  }
+}
+
+/* ── #792: Stacked status breakdown bar ────────────────────────────────────
+ *
+ * A horizontal bar whose segments are proportional to their status count.
+ * Each segment is a <button> so clicking applies the status filter, and each
+ * carries inline text so the state is not communicated by colour alone. */
+#status-breakdown-bar {
+  margin-bottom: 1rem;
+}
+
+.breakdown-bar {
+  display: flex;
+  width: 100%;
+  height: 2rem;
+  border-radius: var(--radius);
+  overflow: hidden;
+  gap: 2px;
+}
+
+.breakdown-seg {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 2rem;
+  overflow: hidden;
+  border: none;
+  border-radius: 0;
+  padding: 0 0.4rem;
+  cursor: pointer;
+  font-size: 0.75rem;
+  font-weight: 600;
+  white-space: nowrap;
+  transition: filter 0.1s;
+}
+.breakdown-seg:hover { filter: brightness(0.92); }
+.breakdown-seg:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+.breakdown-seg-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.breakdown-seg-pending   { background: var(--warn-bg); color: var(--warn); }
+.breakdown-seg-completed { background: var(--ok-bg);   color: var(--ok); }
+.breakdown-seg-underpaid { background: var(--warn-bg); color: var(--warn); }
+.breakdown-seg-expired   { background: var(--idle-bg); color: var(--idle); }
+
+/* Accessible fallback table (visually hidden, read by AT). */
+.breakdown-table { border-collapse: collapse; }
+.breakdown-table th,
+.breakdown-table td { padding: 0.25rem 0.5rem; text-align: start; }
+
+@media (forced-colors: active) {
+  .breakdown-seg {
+    border: 1px solid ButtonText;
+    forced-color-adjust: none;
+  }
+}
+
+/* ── #791: Payment volume chart ────────────────────────────────────────────
+ *
+ * A small inline SVG bar chart bucketed by day. The card is hidden when there
+ * are no completed payments to show; the accessible data table is visually
+ * hidden but always present in the DOM so AT can read it. */
+.volume-chart-card {
+  padding: 0.75rem 1rem 0.5rem;
+  margin-bottom: 1rem;
+  overflow: hidden;
+}
+
+.volume-chart-card h3 {
+  margin-top: 0;
+  margin-bottom: 0.5rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.volume-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+
+/* Bars use the accent colour and follow both themes automatically. */
+.volume-bar {
+  fill: var(--accent);
+  opacity: 0.75;
+}
+.volume-bar:hover {
+  opacity: 1;
+}
+
+/* Accessible fallback table (visually hidden). */
+.volume-table { border-collapse: collapse; }
+.volume-table th,
+.volume-table td { padding: 0.2rem 0.5rem; text-align: start; }
