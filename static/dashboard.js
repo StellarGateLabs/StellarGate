@@ -54,15 +54,33 @@ import { sortPayments } from "./sort.js";
 
   // ── Session store ─────────────────────────────────────────────────────────
   var session = createSessionStore({
-    session: (function () { try { return window.sessionStorage; } catch (e) { return null; } })(),
-    local: (function () { try { return window.localStorage; } catch (e) { return null; } })(),
+    session: (function () {
+      try {
+        return window.sessionStorage;
+      } catch (e) {
+        return null;
+      }
+    })(),
+    local: (function () {
+      try {
+        return window.localStorage;
+      } catch (e) {
+        return null;
+      }
+    })(),
   });
 
   // ── Preferences store (#771 / #772) ───────────────────────────────────────
   // Persisted under its own namespace ("stellargate.prefs."), separate from the
   // API key. Never stores the key, and never writes it anywhere.
   var prefs = createPrefsStore({
-    local: (function () { try { return window.localStorage; } catch (e) { return null; } })(),
+    local: (function () {
+      try {
+        return window.localStorage;
+      } catch (e) {
+        return null;
+      }
+    })(),
   });
 
   // ── View-state store ──────────────────────────────────────────────────────
@@ -96,7 +114,9 @@ import { sortPayments } from "./sort.js";
     if (!markup) return;
     if (window.trustedTypes && !qrPolicy) {
       qrPolicy = window.trustedTypes.createPolicy("stellargate-qr", {
-        createHTML: function (s) { return s; },
+        createHTML: function (s) {
+          return s;
+        },
       });
     }
     node.innerHTML = qrPolicy ? qrPolicy.createHTML(markup) : markup;
@@ -140,16 +160,24 @@ import { sortPayments } from "./sort.js";
   }
 
   /** Timestamp in the active zone, zone name included. @see format.js */
-  function fmtTime(iso) { return _fmtTime(iso, activeZone()); }
+  function fmtTime(iso) {
+    return _fmtTime(iso, activeZone());
+  }
 
   /** Coarse countdown to an ISO instant. @see format.js */
-  function countdown(iso, now) { return _countdown(iso, now); }
+  function countdown(iso, now) {
+    return _countdown(iso, now);
+  }
 
   /** Coarse time elapsed since an ISO instant. @see format.js */
-  function relativeTime(iso, now) { return _relativeTime(iso, now); }
+  function relativeTime(iso, now) {
+    return _relativeTime(iso, now);
+  }
 
   /** Stellar expert explorer URL for a transaction hash. @see format.js */
-  function explorerTx(hash) { return _explorerTx(hash); }
+  function explorerTx(hash) {
+    return _explorerTx(hash);
+  }
 
   // ── Hash-state persistence (#696) ──────────────────────────────────────────
 
@@ -200,7 +228,9 @@ import { sortPayments } from "./sort.js";
   // ── Date range presets ─────────────────────────────────────────────────────
 
   function localDateValue(d) {
-    function pad(n) { return (n < 10 ? "0" : "") + n; }
+    function pad(n) {
+      return (n < 10 ? "0" : "") + n;
+    }
     return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
   }
 
@@ -221,7 +251,8 @@ import { sortPayments } from "./sort.js";
   function syncPresetUi() {
     Array.prototype.forEach.call(document.querySelectorAll(".preset"), function (btn) {
       var range = presetRange(Number(btn.getAttribute("data-days")));
-      var isActive = store.get().createdAfter === range.from && store.get().createdBefore === range.to;
+      var isActive =
+        store.get().createdAfter === range.from && store.get().createdBefore === range.to;
       btn.className = isActive ? "ghost preset preset-on" : "ghost preset";
       btn.setAttribute("aria-pressed", isActive ? "true" : "false");
     });
@@ -248,7 +279,8 @@ import { sortPayments } from "./sort.js";
 
   function syncThemeUi() {
     var current = document.documentElement.getAttribute("data-theme");
-    var dark = current === "dark" ||
+    var dark =
+      current === "dark" ||
       (!current && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
     Array.prototype.forEach.call(
       document.querySelectorAll("[data-theme-toggle]"),
@@ -272,8 +304,11 @@ import { sortPayments } from "./sort.js";
       function (button) {
         button.addEventListener("click", function () {
           var cur = document.documentElement.getAttribute("data-theme");
-          var isDark = cur === "dark" ||
-            (!cur && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+          var isDark =
+            cur === "dark" ||
+            (!cur &&
+              window.matchMedia &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
           applyTheme(isDark ? "light" : "dark");
         });
       }
@@ -366,7 +401,10 @@ import { sortPayments } from "./sort.js";
       box.checked = isColumnVisible(key);
       box.disabled = ALWAYS_VISIBLE.indexOf(key) >= 0;
       box.addEventListener("change", function () {
-        if (ALWAYS_VISIBLE.indexOf(key) >= 0) { box.checked = true; return; }
+        if (ALWAYS_VISIBLE.indexOf(key) >= 0) {
+          box.checked = true;
+          return;
+        }
         var cols = Object.assign({}, prefs.get().columns || {});
         cols[key] = box.checked;
         prefs.update({ columns: cols });
@@ -381,14 +419,22 @@ import { sortPayments } from "./sort.js";
 
   function columnLabel(key) {
     switch (key) {
-      case "status":   return "Status";
-      case "amount":   return "Amount";
-      case "asset":    return "Asset";
-      case "webhook":  return "Webhook";
-      case "memo":     return "Memo";
-      case "created":  return "Created";
-      case "id":       return "Payment ID";
-      default:         return key;
+      case "status":
+        return "Status";
+      case "amount":
+        return "Amount";
+      case "asset":
+        return "Asset";
+      case "webhook":
+        return "Webhook";
+      case "memo":
+        return "Memo";
+      case "created":
+        return "Created";
+      case "id":
+        return "Payment ID";
+      default:
+        return key;
     }
   }
 
@@ -430,8 +476,10 @@ import { sortPayments } from "./sort.js";
         if (ev.target !== settings) return;
         var rect = settings.getBoundingClientRect();
         var outside =
-          ev.clientX < rect.left || ev.clientX > rect.right ||
-          ev.clientY < rect.top  || ev.clientY > rect.bottom;
+          ev.clientX < rect.left ||
+          ev.clientX > rect.right ||
+          ev.clientY < rect.top ||
+          ev.clientY > rect.bottom;
         if (outside) closeSettings();
       });
     }
@@ -511,23 +559,28 @@ import { sortPayments } from "./sort.js";
     var key = store.get().key;
     if (key) headers.Authorization = "Bearer " + key;
 
-    return fetch(API_BASE + path, { method: opts.method || "GET", headers: headers, body: opts.body || undefined, signal: opts.signal }).then(
-      function (res) {
-        if (res.status === 401) {
-          signOut(t("error.rejected"));
-          throw new Error("unauthorized");
-        }
-        return res
-          .json()
-          .catch(function () { return {}; })
-          .then(function (body) {
-            if (!res.ok) {
-              throw new Error(body.error || t("error.requestFailed", { status: res.status }));
-            }
-            return body;
-          });
+    return fetch(API_BASE + path, {
+      method: opts.method || "GET",
+      headers: headers,
+      body: opts.body || undefined,
+      signal: opts.signal,
+    }).then(function (res) {
+      if (res.status === 401) {
+        signOut(t("error.rejected"));
+        throw new Error("unauthorized");
       }
-    );
+      return res
+        .json()
+        .catch(function () {
+          return {};
+        })
+        .then(function (body) {
+          if (!res.ok) {
+            throw new Error(body.error || t("error.requestFailed", { status: res.status }));
+          }
+          return body;
+        });
+    });
   }
 
   // ── Session ───────────────────────────────────────────────────────────────
@@ -551,13 +604,39 @@ import { sortPayments } from "./sort.js";
   /** Empty every container that can hold payment data (#797). Hidden is not
    *  gone: a hidden table, summary or drawer would still be in the DOM. */
   function wipePaymentData() {
-    ["rows", "summary", "detail-fields", "deliveries", "invoice-fields",
-      "invoice-qr", "instr-qr"].forEach(function (id) { clear($(id)); });
-    ["invoice-uri", "instr-qr-alt", "instr-destination", "instr-memo",
-      "instr-amount", "instr-asset", "instr-expiry", "instr-id", "rows-status",
-      "deliveries-error"].forEach(function (id) {
+    [
+      "rows",
+      "summary",
+      "detail-fields",
+      "deliveries",
+      "invoice-fields",
+      "invoice-qr",
+      "instr-qr",
+    ].forEach(function (id) {
+      clear($(id));
+    });
+    [
+      "invoice-uri",
+      "instr-qr-alt",
+      "instr-destination",
+      "instr-memo",
+      "instr-amount",
+      "instr-asset",
+      "instr-expiry",
+      "instr-id",
+      "rows-status",
+      "deliveries-error",
+    ].forEach(function (id) {
       var n = $(id);
       if (n) n.textContent = "";
+    });
+    /* Hide and clear the chart and breakdown containers (#791, #792). */
+    ["volume-chart", "status-breakdown-bar"].forEach(function (id) {
+      var n = $(id);
+      if (n) {
+        clear(n);
+        n.hidden = true;
+      }
     });
     show($("payment-invoice"), false);
     clearListState();
@@ -576,9 +655,13 @@ import { sortPayments } from "./sort.js";
   try {
     if (typeof BroadcastChannel === "function") {
       signoutChannel = new BroadcastChannel(SIGNOUT_SIGNAL);
-      signoutChannel.onmessage = function () { localSignOut(null); };
+      signoutChannel.onmessage = function () {
+        localSignOut(null);
+      };
     }
-  } catch (e) { signoutChannel = null; }
+  } catch (e) {
+    signoutChannel = null;
+  }
 
   window.addEventListener("storage", function (ev) {
     if (ev.key === SIGNOUT_SIGNAL && ev.newValue) localSignOut(null);
@@ -586,12 +669,19 @@ import { sortPayments } from "./sort.js";
 
   function broadcastSignOut() {
     if (signoutChannel) {
-      try { signoutChannel.postMessage("signout"); return; } catch (e) { /* fall through */ }
+      try {
+        signoutChannel.postMessage("signout");
+        return;
+      } catch (e) {
+        /* fall through */
+      }
     }
     try {
       window.localStorage.setItem(SIGNOUT_SIGNAL, String(Date.now()));
       window.localStorage.removeItem(SIGNOUT_SIGNAL);
-    } catch (e) { /* non-fatal */ }
+    } catch (e) {
+      /* non-fatal */
+    }
   }
 
   function localSignOut(message) {
@@ -631,11 +721,16 @@ import { sortPayments } from "./sort.js";
     hideIdleWarning();
     if (!store.get().key) return;
     var total = idleMs();
-    idleWarnTimer = window.setTimeout(function () {
-      var w = $("idle-warning");
-      if (w) show(w, true);
-    }, Math.max(0, total - IDLE_WARN_MS));
-    idleTimer = window.setTimeout(function () { signOut("Signed out after a period of inactivity."); }, total);
+    idleWarnTimer = window.setTimeout(
+      function () {
+        var w = $("idle-warning");
+        if (w) show(w, true);
+      },
+      Math.max(0, total - IDLE_WARN_MS)
+    );
+    idleTimer = window.setTimeout(function () {
+      signOut("Signed out after a period of inactivity.");
+    }, total);
   }
 
   function onActivity(ev) {
@@ -650,7 +745,9 @@ import { sortPayments } from "./sort.js";
     if (!idleListening) {
       idleListening = true;
       ["keydown", "pointerdown", "pointermove", "visibilitychange"].forEach(function (name) {
-        (name === "visibilitychange" ? document : window).addEventListener(name, onActivity, { passive: true });
+        (name === "visibilitychange" ? document : window).addEventListener(name, onActivity, {
+          passive: true,
+        });
       });
       var stay = $("idle-stay");
       if (stay) stay.addEventListener("click", resetIdleTimer);
@@ -751,7 +848,11 @@ import { sortPayments } from "./sort.js";
     autoRefreshTimer = window.setInterval(function () {
       var stateSnap = store.get();
       if (document.hidden) return; // #803: no polling from background tabs
-      if (stateSnap.key && stateSnap.autoRefresh && (!stateSnap.status || stateSnap.status === "pending")) {
+      if (
+        stateSnap.key &&
+        stateSnap.autoRefresh &&
+        (!stateSnap.status || stateSnap.status === "pending")
+      ) {
         reload();
       }
     }, intervalMs);
@@ -796,6 +897,7 @@ import { sortPayments } from "./sort.js";
         collectAssets(payments);
         renderRows();
         renderAssetTotals();
+        renderVolumeChart(store.get().loadedPayments);
 
         var more = payments.length === store.get().pageSize && !!body.next_cursor;
         store.update({ cursor: more ? body.next_cursor : null });
@@ -803,11 +905,25 @@ import { sortPayments } from "./sort.js";
 
         var visible = store.visiblePayments();
         if (store.get().loadedPayments.length === 0) {
-          setListState(buildEmptyState("📭", "No payments found",
-            emptyMessageForFilter(store.get().status), null));
+          setListState(
+            buildEmptyState(
+              "📭",
+              "No payments found",
+              emptyMessageForFilter(store.get().status),
+              null
+            )
+          );
         } else if (visible.length === 0) {
-          setListState(buildEmptyState("🔍", "No matches",
-            'Nothing matches "' + store.get().search + '". Clear the search box to see every loaded payment.', null));
+          setListState(
+            buildEmptyState(
+              "🔍",
+              "No matches",
+              'Nothing matches "' +
+                store.get().search +
+                '". Clear the search box to see every loaded payment.',
+              null
+            )
+          );
         } else {
           clearListState();
         }
@@ -816,10 +932,12 @@ import { sortPayments } from "./sort.js";
         if (controller && controller.signal.aborted) return;
         clearSkeletonRows();
         if (err.message !== "unauthorized") {
-          setListState(buildErrorState(err.message, function () {
-            clearListState();
-            reload();
-          }));
+          setListState(
+            buildErrorState(err.message, function () {
+              clearListState();
+              reload();
+            })
+          );
         }
       })
       .then(function () {
@@ -848,12 +966,14 @@ import { sortPayments } from "./sort.js";
       if (!isFinite(n)) return;
       totals[p.asset] = (totals[p.asset] || 0) + n;
     });
-    Object.keys(totals).sort().forEach(function (asset) {
-      var card = el("div", "summary-card");
-      card.appendChild(el("span", "muted small", "Received " + asset));
-      card.appendChild(el("strong", null, formatAmount(totals[asset], asset)));
-      box.appendChild(card);
-    });
+    Object.keys(totals)
+      .sort()
+      .forEach(function (asset) {
+        var card = el("div", "summary-card");
+        card.appendChild(el("span", "muted small", "Received " + asset));
+        card.appendChild(el("strong", null, formatAmount(totals[asset], asset)));
+        box.appendChild(card);
+      });
   }
 
   function loadSummary() {
@@ -867,6 +987,9 @@ import { sortPayments } from "./sort.js";
           card.appendChild(el("strong", null, row[1]));
           summary.appendChild(card);
         });
+
+        /* #792: stacked status breakdown bar. */
+        renderStatusBreakdownBar(body.summary || []);
       })
       .catch(function (err) {
         clear($("summary"));
@@ -874,20 +997,201 @@ import { sortPayments } from "./sort.js";
       });
   }
 
+  /**
+   * Render a stacked status breakdown bar from the summary counts (#792).
+   *
+   * Each segment is labelled with text and a percentage, not colour alone, and
+   * clicking a segment applies that status filter. The bar is built from plain
+   * <div> elements so it needs no SVG and no chart library.
+   */
+  function renderStatusBreakdownBar(summaryRows) {
+    var container = $("status-breakdown-bar");
+    if (!container) return;
+    clear(container);
+
+    /* Map summary rows to { status, count } objects. The summary API returns
+       rows like ["pending", "12"] or ["Pending", 12]. */
+    var STATUS_ORDER = ["pending", "completed", "underpaid", "expired"];
+    var counts = {};
+    summaryRows.forEach(function (row) {
+      var label = String(row[0]).toLowerCase();
+      var n = parseInt(row[1], 10);
+      if (STATUS_ORDER.indexOf(label) >= 0 && isFinite(n)) counts[label] = n;
+    });
+    var total = STATUS_ORDER.reduce(function (s, k) {
+      return s + (counts[k] || 0);
+    }, 0);
+    if (total === 0) {
+      container.hidden = true;
+      return;
+    }
+    container.hidden = false;
+
+    var bar = el("div", "breakdown-bar");
+    bar.setAttribute("role", "group");
+    bar.setAttribute("aria-label", "Payment status breakdown");
+    container.appendChild(bar);
+
+    /* Accessible fallback table. */
+    var table = el("table", "breakdown-table visually-hidden");
+    table.setAttribute("aria-label", "Payment status breakdown");
+    var thead = document.createElement("thead");
+    var tr = document.createElement("tr");
+    tr.appendChild(el("th", null, "Status"));
+    tr.appendChild(el("th", null, "Count"));
+    tr.appendChild(el("th", null, "Percent"));
+    thead.appendChild(tr);
+    table.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    table.appendChild(tbody);
+    container.appendChild(table);
+
+    STATUS_ORDER.forEach(function (status) {
+      var count = counts[status] || 0;
+      if (count === 0) return;
+      var pct = Math.round((count / total) * 100);
+
+      var seg = el("button", "breakdown-seg breakdown-seg-" + status);
+      seg.type = "button";
+      seg.style.width = pct + "%";
+      seg.setAttribute("aria-label", status + ": " + count + " (" + pct + "%)");
+      seg.addEventListener("click", function () {
+        store.update({ status: status });
+        onFilterChange();
+      });
+
+      var text = el("span", "breakdown-seg-text");
+      text.setAttribute("aria-hidden", "true");
+      text.textContent = status.charAt(0).toUpperCase() + status.slice(1) + " " + pct + "%";
+      seg.appendChild(text);
+      bar.appendChild(seg);
+
+      var row = document.createElement("tr");
+      row.appendChild(el("td", null, status));
+      row.appendChild(el("td", null, String(count)));
+      row.appendChild(el("td", null, pct + "%"));
+      tbody.appendChild(row);
+    });
+  }
+
+  /**
+   * Bucket loaded payments by day and render an inline SVG bar chart (#791).
+   *
+   * The chart shows completed-payment volume over the last N days (up to 30).
+   * A hidden <table> provides the data for assistive technology and browsers
+   * that do not render SVG. Theme tokens are used throughout so the chart
+   * follows both light and dark palettes without extra CSS.
+   */
+  function renderVolumeChart(payments) {
+    var container = $("volume-chart");
+    if (!container) return;
+    clear(container);
+
+    /* Bucket payments by YYYY-MM-DD in local time. */
+    var buckets = {};
+    payments.forEach(function (p) {
+      if (p.status !== "completed" && p.status !== "underpaid") return;
+      var d = new Date(p.created_at);
+      if (isNaN(d.getTime())) return;
+      var key =
+        d.getFullYear() +
+        "-" +
+        String(d.getMonth() + 1).padStart(2, "0") +
+        "-" +
+        String(d.getDate()).padStart(2, "0");
+      buckets[key] = (buckets[key] || 0) + 1;
+    });
+
+    var keys = Object.keys(buckets).sort();
+    if (keys.length === 0) {
+      container.hidden = true;
+      return;
+    }
+    container.hidden = false;
+
+    container.appendChild(el("h3", null, "Payment volume"));
+
+    /* Limit to the last 30 days for readability. */
+    if (keys.length > 30) keys = keys.slice(keys.length - 30);
+
+    var maxCount = keys.reduce(function (m, k) {
+      return Math.max(m, buckets[k]);
+    }, 0);
+
+    var W = 320,
+      H = 80;
+    var barW = Math.max(2, Math.floor((W - 4) / keys.length) - 2);
+    var gap = Math.floor((W - 4) / keys.length);
+
+    var svgNS = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(svgNS, "svg");
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    svg.setAttribute("width", W);
+    svg.setAttribute("height", H);
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("focusable", "false");
+    svg.className = "volume-svg";
+
+    keys.forEach(function (key, i) {
+      var count = buckets[key];
+      var barH = maxCount > 0 ? Math.max(2, Math.round((count / maxCount) * (H - 10))) : 2;
+      var x = 2 + i * gap;
+      var y = H - barH;
+      var rect = document.createElementNS(svgNS, "rect");
+      rect.setAttribute("x", x);
+      rect.setAttribute("y", y);
+      rect.setAttribute("width", barW);
+      rect.setAttribute("height", barH);
+      rect.setAttribute("class", "volume-bar");
+      rect.setAttribute("rx", "2");
+      var title = document.createElementNS(svgNS, "title");
+      title.textContent = key + ": " + count;
+      rect.appendChild(title);
+      svg.appendChild(rect);
+    });
+
+    container.appendChild(svg);
+
+    /* Accessible data table. */
+    var table = el("table", "volume-table visually-hidden");
+    table.setAttribute("aria-label", "Payment volume by day");
+    var thead = document.createElement("thead");
+    var tr = document.createElement("tr");
+    tr.appendChild(el("th", null, "Date"));
+    tr.appendChild(el("th", null, "Payments"));
+    thead.appendChild(tr);
+    table.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    keys.forEach(function (key) {
+      var row = document.createElement("tr");
+      row.appendChild(el("td", null, key));
+      row.appendChild(el("td", null, String(buckets[key])));
+      tbody.appendChild(row);
+    });
+    table.appendChild(tbody);
+    container.appendChild(table);
+  }
+
   // ── New-since-refresh highlight (#781) ────────────────────────────────────
-  var seenIds = null;     // ids known before the current refresh; null on first load
+  var seenIds = null; // ids known before the current refresh; null on first load
   var newIds = {};
   var seenAccum = {};
 
   /** Record this page's ids; flag ones unseen before the refresh and announce the count. */
   function markNewRows(payments, isFirstPage) {
     var fresh = seenIds && isFirstPage ? newPaymentIds(seenIds, payments) : [];
-    fresh.forEach(function (id) { newIds[id] = true; });
-    payments.forEach(function (p) { seenAccum[p.id] = true; });
+    fresh.forEach(function (id) {
+      newIds[id] = true;
+    });
+    payments.forEach(function (p) {
+      seenAccum[p.id] = true;
+    });
     if (fresh.length) {
       announce(fresh.length + (fresh.length === 1 ? " new payment" : " new payments"));
       window.setTimeout(function () {
-        fresh.forEach(function (id) { delete newIds[id]; });
+        fresh.forEach(function (id) {
+          delete newIds[id];
+        });
         Array.prototype.forEach.call(document.querySelectorAll("tr.row-new"), function (tr) {
           tr.classList.remove("row-new");
         });
@@ -918,8 +1222,17 @@ import { sortPayments } from "./sort.js";
       return;
     }
     var p = visible[active];
-    node.textContent = "Row " + (active + 1) + " of " + visible.length + ": " +
-      p.status + ", " + formatAmount(p.amount, p.asset) + ", memo " + p.memo;
+    node.textContent =
+      "Row " +
+      (active + 1) +
+      " of " +
+      visible.length +
+      ": " +
+      p.status +
+      ", " +
+      formatAmount(p.amount, p.asset) +
+      ", memo " +
+      p.memo;
   }
 
   // ── Skeleton helpers (#719) ───────────────────────────────────────────────
@@ -931,14 +1244,14 @@ import { sortPayments } from "./sort.js";
       tr.className = "skeleton-row";
       tr.setAttribute("aria-hidden", "true");
       var cols = [
-        { label: "Select",     cls: "sk-select",     key: null },
-        { label: "Status",     cls: "sk-status",     key: "status" },
-        { label: "Amount",     cls: "sk-amount",     key: "amount" },
-        { label: "Asset",      cls: "sk-asset",      key: "asset" },
-        { label: "Webhook",    cls: "sk-webhook",    key: "webhook" },
-        { label: "Memo",       cls: "sk-memo",       key: "memo" },
-        { label: "Created",    cls: "sk-date",       key: "created" },
-        { label: "Payment ID", cls: "sk-id",         key: "id" },
+        { label: "Select", cls: "sk-select", key: null },
+        { label: "Status", cls: "sk-status", key: "status" },
+        { label: "Amount", cls: "sk-amount", key: "amount" },
+        { label: "Asset", cls: "sk-asset", key: "asset" },
+        { label: "Webhook", cls: "sk-webhook", key: "webhook" },
+        { label: "Memo", cls: "sk-memo", key: "memo" },
+        { label: "Created", cls: "sk-date", key: "created" },
+        { label: "Payment ID", cls: "sk-id", key: "id" },
       ];
       cols.forEach(function (col) {
         var td = document.createElement("td");
@@ -1017,11 +1330,16 @@ import { sortPayments } from "./sort.js";
 
   function emptyMessageForFilter(status) {
     switch (status) {
-      case "pending":   return "No pending payments. New payments will appear here once created.";
-      case "completed": return "No completed payments match your current filters.";
-      case "underpaid": return "No underpaid payments. Underpaid intents appear here until topped up.";
-      case "expired":   return "No expired payments in this date range.";
-      default:          return "No payments have been created yet. Create a payment intent to get started.";
+      case "pending":
+        return "No pending payments. New payments will appear here once created.";
+      case "completed":
+        return "No completed payments match your current filters.";
+      case "underpaid":
+        return "No underpaid payments. Underpaid intents appear here until topped up.";
+      case "expired":
+        return "No expired payments in this date range.";
+      default:
+        return "No payments have been created yet. Create a payment intent to get started.";
     }
   }
 
@@ -1043,7 +1361,8 @@ import { sortPayments } from "./sort.js";
   var selectedPayments = {};
 
   function setSelected(p, on) {
-    if (on) selectedPayments[p.id] = p; else delete selectedPayments[p.id];
+    if (on) selectedPayments[p.id] = p;
+    else delete selectedPayments[p.id];
   }
 
   function syncSelectionUi() {
@@ -1073,12 +1392,18 @@ import { sortPayments } from "./sort.js";
    */
   function statusGlyph(status) {
     switch (status) {
-      case "pending":   return "\u25CF"; // ● filled circle
-      case "completed": return "\u2714"; // ✔ check mark
-      case "underpaid": return "\u25B2"; // ▲ up triangle
-      case "expired":   return "\u2716"; // ✖ ballot X
-      case "failed":    return "\u2716"; // ✖ ballot X
-      default:          return "\u25CB"; // ○ hollow circle
+      case "pending":
+        return "\u25CF"; // ● filled circle
+      case "completed":
+        return "\u2714"; // ✔ check mark
+      case "underpaid":
+        return "\u25B2"; // ▲ up triangle
+      case "expired":
+        return "\u2716"; // ✖ ballot X
+      case "failed":
+        return "\u2716"; // ✖ ballot X
+      default:
+        return "\u25CB"; // ○ hollow circle
     }
   }
 
@@ -1115,8 +1440,12 @@ import { sortPayments } from "./sort.js";
     box.setAttribute("data-id", p.id);
     box.setAttribute("aria-label", "Select payment " + p.id);
     box.checked = !!selectedPayments[p.id];
-    box.addEventListener("click", function (ev) { ev.stopPropagation(); });
-    box.addEventListener("keydown", function (ev) { ev.stopPropagation(); });
+    box.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+    });
+    box.addEventListener("keydown", function (ev) {
+      ev.stopPropagation();
+    });
     box.addEventListener("change", function () {
       setSelected(p, box.checked);
       syncSelectionUi();
@@ -1170,7 +1499,9 @@ import { sortPayments } from "./sort.js";
     idCell.appendChild(openButton);
     tr.appendChild(idCell);
 
-    tr.addEventListener("click", function () { openDetail(p.id, openButton); });
+    tr.addEventListener("click", function () {
+      openDetail(p.id, openButton);
+    });
     return tr;
   }
 
@@ -1221,7 +1552,8 @@ import { sortPayments } from "./sort.js";
 
     $("invoice-print").disabled = true;
     $("payment-invoice").hidden = true;
-    clear($("invoice-fields")); clear($("invoice-qr"));
+    clear($("invoice-fields"));
+    clear($("invoice-qr"));
     $("invoice-uri").textContent = "";
     show($("detail-notify"), false);
     clear($("detail-timeline"));
@@ -1256,8 +1588,11 @@ import { sortPayments } from "./sort.js";
           [t("field.merchant"), p.merchant_id],
           [t("field.created"), fmtTime(p.created_at)],
           [t("field.updated"), fmtTime(p.updated_at)],
-          [t("field.expires"), fmtTime(p.expires_at) +
-            (p.status === "pending" ? " (" + countdown(p.expires_at) + " left)" : "")],
+          [
+            t("field.expires"),
+            fmtTime(p.expires_at) +
+              (p.status === "pending" ? " (" + countdown(p.expires_at) + " left)" : ""),
+          ],
         ].forEach(function (pair) {
           fields.appendChild(el("dt", null, pair[0]));
           if (pair[2]) {
@@ -1280,7 +1615,9 @@ import { sortPayments } from "./sort.js";
       .catch(function (err) {
         clear(fields);
         if (err.message !== "unauthorized") {
-          var errNode = buildErrorState(err.message, function () { openDetail(id); });
+          var errNode = buildErrorState(err.message, function () {
+            openDetail(id);
+          });
           var wrapper = document.createElement("dd");
           wrapper.appendChild(errNode);
           fields.appendChild(el("dt", null, "Error"));
@@ -1343,9 +1680,15 @@ import { sortPayments } from "./sort.js";
     });
     (deliveries || []).forEach(function (d) {
       var failed = d.status === "failed";
-      var li = el("li", failed ? "timeline-failed" : null,
+      var li = el(
+        "li",
+        failed ? "timeline-failed" : null,
         (failed ? "\u2716 Webhook failed" : "Webhook " + (d.status || "queued")) +
-        " (" + (d.event || "webhook") + ") \u00b7 " + fmtTime(d.last_attempt || d.created_at));
+          " (" +
+          (d.event || "webhook") +
+          ") \u00b7 " +
+          fmtTime(d.last_attempt || d.created_at)
+      );
       list.appendChild(li);
     });
   }
@@ -1354,7 +1697,9 @@ import { sortPayments } from "./sort.js";
   function stepDetail(delta) {
     var id = store.get().selectedPaymentId;
     var rows = sortedVisiblePayments();
-    var i = rows.findIndex(function (r) { return r.id === id; });
+    var i = rows.findIndex(function (r) {
+      return r.id === id;
+    });
     var next = rows[i + delta];
     if (i < 0 || !next) return;
     openDetail(next.id, state.detailTrigger);
@@ -1363,7 +1708,9 @@ import { sortPayments } from "./sort.js";
   function updateDrawerNav() {
     var id = store.get().selectedPaymentId;
     var rows = sortedVisiblePayments();
-    var i = rows.findIndex(function (r) { return r.id === id; });
+    var i = rows.findIndex(function (r) {
+      return r.id === id;
+    });
     $("detail-prev").disabled = i <= 0;
     $("detail-next").disabled = i < 0 || i >= rows.length - 1;
   }
@@ -1411,10 +1758,12 @@ import { sortPayments } from "./sort.js";
     if (ev.key !== "Tab") return;
     var detail = $("detail");
     if (!detail) return;
-    var focusable = Array.prototype.slice.call(detail.querySelectorAll(
-      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), ' +
-      'textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
-    ));
+    var focusable = Array.prototype.slice.call(
+      detail.querySelectorAll(
+        "button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), " +
+          'textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      )
+    );
     if (!focusable.length) return;
     var first = focusable[0];
     var last = focusable[focusable.length - 1];
@@ -1483,8 +1832,10 @@ import { sortPayments } from "./sort.js";
     if (ev.target !== $("detail")) return;
     var rect = $("detail").getBoundingClientRect();
     var outside =
-      ev.clientX < rect.left || ev.clientX > rect.right ||
-      ev.clientY < rect.top  || ev.clientY > rect.bottom;
+      ev.clientX < rect.left ||
+      ev.clientX > rect.right ||
+      ev.clientY < rect.top ||
+      ev.clientY > rect.bottom;
     if (outside) closeDetail();
   }
 
@@ -1501,7 +1852,11 @@ import { sortPayments } from "./sort.js";
         }
         show($("deliveries-empty"), deliveries.length === 0);
         if (deliveries.length > 0) {
-          deliveries.forEach(function (d) { list.appendChild(deliveryItem(paymentId, d)); });
+          /* #789: Group deliveries by event and show only the latest per event. */
+          var grouped = groupDeliveriesByEvent(deliveries);
+          grouped.forEach(function (group) {
+            list.appendChild(deliveryGroupItem(paymentId, group));
+          });
         }
       })
       .catch(function (err) {
@@ -1516,14 +1871,94 @@ import { sortPayments } from "./sort.js";
       });
   }
 
-  function deliveryItem(paymentId, d) {
+  /**
+   * Group deliveries by event name (#789). Each group contains all attempts
+   * for one event, sorted newest-first, with a summary of total attempts and
+   * last status.
+   */
+  function groupDeliveriesByEvent(deliveries) {
+    var byEvent = {};
+    deliveries.forEach(function (d) {
+      var event = d.event || "webhook";
+      if (!byEvent[event]) byEvent[event] = [];
+      byEvent[event].push(d);
+    });
+    return Object.keys(byEvent).map(function (event) {
+      var items = byEvent[event];
+      items.sort(function (a, b) {
+        return new Date(b.last_attempt || b.created_at) - new Date(a.last_attempt || a.created_at);
+      });
+      var latest = items[0];
+      var totalAttempts = items.reduce(function (sum, d) {
+        return sum + (d.attempts || 0);
+      }, 0);
+      return { event: event, items: items, latest: latest, totalAttempts: totalAttempts };
+    });
+  }
+
+  /**
+   * Render a grouped delivery with collapse/expand for older attempts (#789).
+   */
+  function deliveryGroupItem(paymentId, group) {
+    var wrapper = el("li", "delivery-group");
+    var head = el("div", "delivery-group-head");
+    var eventName = el("strong", null, group.event);
+    head.appendChild(eventName);
+    head.appendChild(statusPill(group.latest.status));
+    wrapper.appendChild(head);
+
+    var summary = el("div", "delivery-group-summary muted small");
+    summary.textContent =
+      group.totalAttempts +
+      " attempt" +
+      (group.totalAttempts === 1 ? "" : "s") +
+      " · last " +
+      group.latest.status;
+    wrapper.appendChild(summary);
+
+    wrapper.appendChild(deliveryItem(paymentId, group.latest, true));
+
+    if (group.items.length > 1) {
+      var toggle = el(
+        "button",
+        "ghost delivery-toggle",
+        "Show " +
+          (group.items.length - 1) +
+          " older attempt" +
+          (group.items.length === 2 ? "" : "s")
+      );
+      toggle.type = "button";
+      var olderList = el("ul", "delivery-older");
+      olderList.hidden = true;
+      group.items.slice(1).forEach(function (d) {
+        olderList.appendChild(deliveryItem(paymentId, d, false));
+      });
+      toggle.addEventListener("click", function () {
+        olderList.hidden = !olderList.hidden;
+        toggle.textContent = olderList.hidden
+          ? "Show " +
+            (group.items.length - 1) +
+            " older attempt" +
+            (group.items.length === 2 ? "" : "s")
+          : "Hide older attempts";
+      });
+      wrapper.appendChild(toggle);
+      wrapper.appendChild(olderList);
+    }
+
+    return wrapper;
+  }
+
+  function deliveryItem(paymentId, d, isLatest) {
     var li = el("li", "delivery");
     var head = el("div", "delivery-head");
-    head.appendChild(el("strong", null, d.event || "webhook"));
+    if (isLatest) head.appendChild(el("strong", null, d.event || "webhook"));
     head.appendChild(statusPill(d.status));
     li.appendChild(head);
-    li.appendChild(el("div", "mono", d.url));
-    li.appendChild(el("div", "delivery-meta", "attempt " + d.attempts + " · manual " + (d.manual_attempts || 0)));
+    if (isLatest) li.appendChild(el("div", "mono", d.url));
+    li.appendChild(
+      el("div", "delivery-meta", "attempt " + d.attempts + " · manual " + (d.manual_attempts || 0))
+    );
     li.appendChild(el("div", "delivery-meta", "last: " + relativeTime(d.last_attempt)));
     li.lastChild.title = fmtTime(d.last_attempt);
     li.appendChild(el("div", "delivery-meta", "created: " + relativeTime(d.created_at)));
@@ -1532,29 +1967,88 @@ import { sortPayments } from "./sort.js";
       li.appendChild(el("div", "error", "Last delivery failed; check receiver logs or redeliver."));
     }
     if (d.status !== "delivered") {
-      li.appendChild(el("div", "delivery-meta", "retry state: queued for redrive if attempts remain"));
+      li.appendChild(
+        el("div", "delivery-meta", "retry state: queued for redrive if attempts remain")
+      );
     }
-    var button = el("button", "ghost", "Redeliver");
-    button.addEventListener("click", function () {
-      if (!window.confirm("Redeliver this webhook now?")) return;
-      button.disabled = true;
-      button.textContent = "Sending\u2026";
-      api(
-        "/payments/" + encodeURIComponent(paymentId) +
-        "/webhooks/" + encodeURIComponent(d.id) + "/redeliver",
-        { method: "POST" }
-      )
-        .then(function () { loadDeliveries(paymentId); })
-        .catch(function (err) {
-          button.disabled = false;
-          button.textContent = "Redeliver";
-          if (err.message !== "unauthorized") {
-            setError($("deliveries-error"),
-              err.message.indexOf("429") >= 0 ? "Rate limited. Try again shortly." : err.message);
-          }
-        });
-    });
-    li.appendChild(button);
+
+    /* #790: Force redeliver — only on successfully delivered attempts, with a
+       clear warning that the same event will be sent twice. */
+    if (d.status === "delivered") {
+      var forceBtn = el("button", "ghost delivery-force", "Force redeliver");
+      forceBtn.type = "button";
+      forceBtn.addEventListener("click", function () {
+        if (
+          !window.confirm(
+            "Force redeliver?\n\n" +
+              "This event was already delivered successfully. Sending it again may cause " +
+              "duplicate processing on the receiving end (e.g. a duplicate order or charge). " +
+              "Only proceed if you know the receiver handles duplicates safely.\n\n" +
+              "Press OK to send the duplicate, or Cancel to abort."
+          )
+        )
+          return;
+        forceBtn.disabled = true;
+        forceBtn.textContent = "Sending\u2026";
+        api(
+          "/payments/" +
+            encodeURIComponent(paymentId) +
+            "/webhooks/" +
+            encodeURIComponent(d.id) +
+            "/redeliver?force=true",
+          { method: "POST" }
+        )
+          .then(function () {
+            loadDeliveries(paymentId);
+          })
+          .catch(function (err) {
+            forceBtn.disabled = false;
+            forceBtn.textContent = "Force redeliver";
+            if (err.message !== "unauthorized") {
+              setError(
+                $("deliveries-error"),
+                err.message.indexOf("429") >= 0
+                  ? "Rate limited \u2014 try again shortly."
+                  : err.message
+              );
+            }
+          });
+      });
+      li.appendChild(forceBtn);
+    } else {
+      var button = el("button", "ghost", "Redeliver");
+      button.type = "button";
+      button.addEventListener("click", function () {
+        if (!window.confirm("Redeliver this webhook now?")) return;
+        button.disabled = true;
+        button.textContent = "Sending\u2026";
+        api(
+          "/payments/" +
+            encodeURIComponent(paymentId) +
+            "/webhooks/" +
+            encodeURIComponent(d.id) +
+            "/redeliver",
+          { method: "POST" }
+        )
+          .then(function () {
+            loadDeliveries(paymentId);
+          })
+          .catch(function (err) {
+            button.disabled = false;
+            button.textContent = "Redeliver";
+            if (err.message !== "unauthorized") {
+              setError(
+                $("deliveries-error"),
+                err.message.indexOf("429") >= 0
+                  ? "Rate limited \u2014 try again shortly."
+                  : err.message
+              );
+            }
+          });
+      });
+      li.appendChild(button);
+    }
+
     return li;
   }
 
@@ -1567,14 +2061,19 @@ import { sortPayments } from "./sort.js";
   function copyButton(value, label) {
     var btn = el("button", "ghost copy", "Copy");
     btn.type = "button";
-    btn.setAttribute("aria-label", label || ("Copy " + value));
+    btn.setAttribute("aria-label", label || "Copy " + value);
     btn.addEventListener("click", function () {
-      navigator.clipboard.writeText(value).then(function () {
-        btn.textContent = "Copied";
-        window.setTimeout(function () { btn.textContent = "Copy"; }, 1500);
-      }).catch(function () {
-        /* clipboard API unavailable — silently ignore */
-      });
+      navigator.clipboard
+        .writeText(value)
+        .then(function () {
+          btn.textContent = "Copied";
+          window.setTimeout(function () {
+            btn.textContent = "Copy";
+          }, 1500);
+        })
+        .catch(function () {
+          /* clipboard API unavailable — silently ignore */
+        });
     });
     return btn;
   }
@@ -1605,8 +2104,11 @@ import { sortPayments } from "./sort.js";
     fillField("instr-memo", payment.memo);
     fillField("instr-amount", formatAmount(payment.amount, payment.asset));
     fillField("instr-asset", payment.asset || "XLM");
-    fillField("instr-expiry", fmtTime(payment.expires_at) +
-      (payment.expires_at ? " (" + countdown(payment.expires_at) + " left)" : ""));
+    fillField(
+      "instr-expiry",
+      fmtTime(payment.expires_at) +
+        (payment.expires_at ? " (" + countdown(payment.expires_at) + " left)" : "")
+    );
 
     /* Copy buttons (#698). */
     function attachCopyBtn(containerId, value, label) {
@@ -1684,26 +2186,36 @@ import { sortPayments } from "./sort.js";
     }
 
     if (cancelBtn) {
-      cancelBtn.addEventListener("click", function () { closeModal(dialog); });
+      cancelBtn.addEventListener("click", function () {
+        closeModal(dialog);
+      });
     }
 
     if (createAnotherBtn) {
-      createAnotherBtn.addEventListener("click", function () { resetCreateForm(); });
+      createAnotherBtn.addEventListener("click", function () {
+        resetCreateForm();
+      });
     }
 
     var doneBtn = $("create-done");
     if (doneBtn) {
-      doneBtn.addEventListener("click", function () { closeModal(dialog); });
+      doneBtn.addEventListener("click", function () {
+        closeModal(dialog);
+      });
     }
 
     var cancelBtn2 = $("create-cancel-2");
     if (cancelBtn2) {
-      cancelBtn2.addEventListener("click", function () { closeModal(dialog); });
+      cancelBtn2.addEventListener("click", function () {
+        closeModal(dialog);
+      });
     }
 
     var instrCloseBtn = $("create-instr-close");
     if (instrCloseBtn) {
-      instrCloseBtn.addEventListener("click", function () { closeModal(dialog); });
+      instrCloseBtn.addEventListener("click", function () {
+        closeModal(dialog);
+      });
     }
 
     /* Backdrop click dismissal. */
@@ -1711,8 +2223,10 @@ import { sortPayments } from "./sort.js";
       if (ev.target !== dialog) return;
       var rect = dialog.getBoundingClientRect();
       var outside =
-        ev.clientX < rect.left || ev.clientX > rect.right ||
-        ev.clientY < rect.top  || ev.clientY > rect.bottom;
+        ev.clientX < rect.left ||
+        ev.clientX > rect.right ||
+        ev.clientY < rect.top ||
+        ev.clientY > rect.bottom;
       if (outside) closeModal(dialog);
     });
 
@@ -1723,7 +2237,7 @@ import { sortPayments } from "./sort.js";
       if (submitBtn && submitBtn.disabled) return;
 
       var amount = ($("create-amount") || {}).value || "";
-      var asset  = ($("create-asset")  || {}).value || "XLM";
+      var asset = ($("create-asset") || {}).value || "XLM";
       var webhookUrl = ($("create-webhook") || {}).value || "";
 
       if (!amount.trim()) {
@@ -1818,7 +2332,9 @@ import { sortPayments } from "./sort.js";
 
   function loadVersion() {
     fetch("/")
-      .then(function (res) { return res.text(); })
+      .then(function (res) {
+        return res.text();
+      })
       .then(function (text) {
         var version = versionFrom(text);
         if (!version || loadedVersion) return;
@@ -1826,24 +2342,32 @@ import { sortPayments } from "./sort.js";
         var node = $("version");
         if (node) node.textContent = version;
       })
-      .catch(function () { /* cosmetic only */ });
+      .catch(function () {
+        /* cosmetic only */
+      });
   }
 
   /** Show the testnet badge when the gateway isn't on the public network (#812). */
   function loadNetworkBadge() {
     fetch("/network")
-      .then(function (res) { return res.json(); })
+      .then(function (res) {
+        return res.json();
+      })
       .then(function (body) {
         var badge = $("network-badge");
         if (badge) badge.hidden = body.network === "public";
       })
-      .catch(function () { /* cosmetic only */ });
+      .catch(function () {
+        /* cosmetic only */
+      });
   }
 
   /* Compare the version served by / with the one captured at start. */
   function checkDeployedVersion() {
     fetch("/")
-      .then(function (res) { return res.text(); })
+      .then(function (res) {
+        return res.text();
+      })
       .then(function (text) {
         var version = versionFrom(text);
         if (!version) return;
@@ -1855,7 +2379,9 @@ import { sortPayments } from "./sort.js";
         }
         if (version !== loadedVersion) showReloadBanner();
       })
-      .catch(function () { /* health poll still owns the pill */ });
+      .catch(function () {
+        /* health poll still owns the pill */
+      });
   }
 
   // ── Health ────────────────────────────────────────────────────────────────
@@ -1864,7 +2390,10 @@ import { sortPayments } from "./sort.js";
     var expiresAt = session.expiresAt();
     var node = $("session-expiry");
     if (!node) return;
-    if (expiresAt === null) { node.textContent = ""; return; }
+    if (expiresAt === null) {
+      node.textContent = "";
+      return;
+    }
     node.textContent = "session " + countdown(new Date(expiresAt).toISOString());
     node.title = "Saved " + fmtTime(new Date(session.savedAt()).toISOString());
   }
@@ -1872,7 +2401,9 @@ import { sortPayments } from "./sort.js";
   function pollHealth() {
     fetch("/ready", { headers: { Accept: "application/json" } })
       .then(function (res) {
-        return res.json().then(function (body) { return { ok: res.ok, body: body }; });
+        return res.json().then(function (body) {
+          return { ok: res.ok, body: body };
+        });
       })
       .then(function (r) {
         var pill = $("health");
@@ -1882,7 +2413,9 @@ import { sortPayments } from "./sort.js";
         var glyph = el("span", "pill-glyph", r.ok ? "\u2714" : "\u2716");
         glyph.setAttribute("aria-hidden", "true");
         pill.appendChild(glyph);
-        pill.appendChild(el("span", "pill-text", r.ok ? "healthy" : r.body.reason || "unavailable"));
+        pill.appendChild(
+          el("span", "pill-text", r.ok ? "healthy" : r.body.reason || "unavailable")
+        );
         pill.title = JSON.stringify(r.body);
       })
       .catch(function () {
@@ -1920,7 +2453,10 @@ import { sortPayments } from "./sort.js";
     var changed = false;
     payments.forEach(function (p) {
       var a = p.asset || "XLM";
-      if (known.indexOf(a) < 0) { known.push(a); changed = true; }
+      if (known.indexOf(a) < 0) {
+        known.push(a);
+        changed = true;
+      }
     });
     if (!changed) return;
     known.sort();
@@ -1963,10 +2499,13 @@ import { sortPayments } from "./sort.js";
     var state = store.get();
     Array.prototype.forEach.call(document.querySelectorAll(".chip"), function (chip) {
       var status = chip.getAttribute("data-status") || "";
-      var isActive = status ? state.statuses
-        ? state.statuses.indexOf(status) >= 0
-        : status === state.status
-      : (state.statuses ? state.statuses.length === 0 : !state.status);
+      var isActive = status
+        ? state.statuses
+          ? state.statuses.indexOf(status) >= 0
+          : status === state.status
+        : state.statuses
+          ? state.statuses.length === 0
+          : !state.status;
       chip.className = isActive ? "chip chip-on" : "chip";
       chip.setAttribute("aria-pressed", isActive ? "true" : "false");
     });
@@ -2041,7 +2580,10 @@ import { sortPayments } from "./sort.js";
 
   function onKeydown(ev) {
     if (store.get().helpOpen) {
-      if (ev.key === "Escape" || ev.key === "?") { ev.preventDefault(); closeHelp(); }
+      if (ev.key === "Escape" || ev.key === "?") {
+        ev.preventDefault();
+        closeHelp();
+      }
       return;
     }
     var action = matchShortcut(ev, { activeElement: document.activeElement });
@@ -2057,11 +2599,23 @@ import { sortPayments } from "./sort.js";
     ev.preventDefault();
     var drawerOpen = $("detail") && $("detail").open;
     switch (action) {
-      case "refresh":    reload(); break;
-      case "nextRow":    if (drawerOpen) stepDetail(1); else moveActiveRow(1); break;
-      case "prevRow":    if (drawerOpen) stepDetail(-1); else moveActiveRow(-1); break;
-      case "closeDrawer": closeDetail(); break;
-      case "toggleHelp": toggleHelp(); break;
+      case "refresh":
+        reload();
+        break;
+      case "nextRow":
+        if (drawerOpen) stepDetail(1);
+        else moveActiveRow(1);
+        break;
+      case "prevRow":
+        if (drawerOpen) stepDetail(-1);
+        else moveActiveRow(-1);
+        break;
+      case "closeDrawer":
+        closeDetail();
+        break;
+      case "toggleHelp":
+        toggleHelp();
+        break;
     }
   }
 
@@ -2096,7 +2650,8 @@ import { sortPayments } from "./sort.js";
   }
 
   function toggleHelp() {
-    if (store.get().helpOpen) closeHelp(); else openHelp();
+    if (store.get().helpOpen) closeHelp();
+    else openHelp();
   }
 
   // ── Internal mutable state not in store ───────────────────────────────────
@@ -2125,7 +2680,9 @@ import { sortPayments } from "./sort.js";
       });
     });
 
-    $("sign-out").addEventListener("click", function () { signOut(null); });
+    $("sign-out").addEventListener("click", function () {
+      signOut(null);
+    });
 
     var keyToggle = $("api-key-toggle");
     if (keyToggle) {
@@ -2140,10 +2697,15 @@ import { sortPayments } from "./sort.js";
 
     var versionReload = $("version-reload");
     if (versionReload) {
-      versionReload.addEventListener("click", function () { window.location.reload(); });
+      versionReload.addEventListener("click", function () {
+        window.location.reload();
+      });
     }
 
-    $("refresh").addEventListener("click", function () { loadSummary(); reload(); });
+    $("refresh").addEventListener("click", function () {
+      loadSummary();
+      reload();
+    });
 
     $("export-csv").addEventListener("click", function () {
       exportCsv(store.get().loadedPayments, "stellargate-payments.csv");
@@ -2158,7 +2720,9 @@ import { sortPayments } from "./sort.js";
 
     $("select-all").addEventListener("change", function () {
       var on = $("select-all").checked;
-      store.get().loadedPayments.forEach(function (p) { setSelected(p, on); });
+      store.get().loadedPayments.forEach(function (p) {
+        setSelected(p, on);
+      });
       syncSelectionUi();
     });
 
@@ -2186,7 +2750,8 @@ import { sortPayments } from "./sort.js";
       btn.addEventListener("click", function () {
         var range = presetRange(Number(btn.getAttribute("data-days")));
         store.update({ createdAfter: range.from, createdBefore: range.to });
-        var afterEl = $("created-after"), beforeEl = $("created-before");
+        var afterEl = $("created-after"),
+          beforeEl = $("created-before");
         if (afterEl) afterEl.value = range.from;
         if (beforeEl) beforeEl.value = range.to;
         onFilterChange();
@@ -2212,7 +2777,10 @@ import { sortPayments } from "./sort.js";
       var input = $(id);
       if (!input) return;
       input.addEventListener("input", function () {
-        store.update({ minAmount: $("min-amount").value.trim(), maxAmount: $("max-amount").value.trim() });
+        store.update({
+          minAmount: $("min-amount").value.trim(),
+          maxAmount: $("max-amount").value.trim(),
+        });
         store.clampActiveRow();
         renderRows();
         var note = $("amount-filter-note");
@@ -2250,19 +2818,30 @@ import { sortPayments } from "./sort.js";
         });
       }
       $("detail-close").addEventListener("click", closeDetail);
-      $("detail-prev").addEventListener("click", function () { stepDetail(-1); });
-      $("detail-next").addEventListener("click", function () { stepDetail(1); });
+      $("detail-prev").addEventListener("click", function () {
+        stepDetail(-1);
+      });
+      $("detail-next").addEventListener("click", function () {
+        stepDetail(1);
+      });
       $("detail-raw-copy").addEventListener("click", function () {
         var btn = $("detail-raw-copy");
-        navigator.clipboard.writeText($("detail-raw-body").textContent).then(function () {
-          btn.textContent = "Copied";
-          window.setTimeout(function () { btn.textContent = "Copy"; }, 1500);
-        }).catch(function () {});
+        navigator.clipboard
+          .writeText($("detail-raw-body").textContent)
+          .then(function () {
+            btn.textContent = "Copied";
+            window.setTimeout(function () {
+              btn.textContent = "Copy";
+            }, 1500);
+          })
+          .catch(function () {});
       });
       $("detail").addEventListener("click", dismissOnBackdrop);
       $("detail").addEventListener("keydown", trapDetailFocus);
       $("detail").addEventListener("close", onDetailClosed);
-      document.addEventListener("focusin", function (ev) { keepFocusInDetail(ev); });
+      document.addEventListener("focusin", function (ev) {
+        keepFocusInDetail(ev);
+      });
     }
 
     $("help-close").addEventListener("click", closeHelp);
@@ -2298,12 +2877,18 @@ import { sortPayments } from "./sort.js";
     $("clear-filters").addEventListener("click", clearFilters);
 
     window.addEventListener("hashchange", function () {
-      if (store.get().key) { applyHash(); reload(); }
+      if (store.get().key) {
+        applyHash();
+        reload();
+      }
     });
 
     window.setInterval(function () {
       if (document.hidden) return; // #803: pause health polling while hidden
-      if (store.get().key) { pollHealth(); checkDeployedVersion(); }
+      if (store.get().key) {
+        pollHealth();
+        checkDeployedVersion();
+      }
     }, 30000);
 
     // #803: refresh once as soon as the tab becomes visible again.
@@ -2324,7 +2909,10 @@ import { sortPayments } from "./sort.js";
     window.addEventListener("offline", syncOnlineState);
     window.addEventListener("online", function () {
       syncOnlineState();
-      if (store.get().key) { loadSummary(); reload(); }
+      if (store.get().key) {
+        loadSummary();
+        reload();
+      }
     });
     syncOnlineState();
 
@@ -2333,7 +2921,8 @@ import { sortPayments } from "./sort.js";
     var existing = session.read();
     if (existing) {
       signIn(existing, null).catch(function (err) {
-        if (err.message !== "unauthorized") showGate("Could not restore your session: " + err.message);
+        if (err.message !== "unauthorized")
+          showGate("Could not restore your session: " + err.message);
       });
     }
   }
