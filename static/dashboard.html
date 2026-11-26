@@ -79,10 +79,7 @@
          file rather than an inline block because the dashboard CSP is
          `script-src 'self'` with no `unsafe-inline`. See #713. -->
     <script src="/dashboard/theme.js"></script>
-    <link
-      rel="icon"
-      href="/dashboard/favicon.svg"
-    />
+    <link rel="icon" href="/dashboard/favicon.svg" />
   </head>
   <body>
     <!-- Sign-in gate. The dashboard holds no session of its own: it calls the
@@ -114,7 +111,9 @@
             <span class="visually-hidden">Dark theme</span>
           </button>
         </div>
-        <p class="muted" data-i18n="gate.intro">Sign in with a merchant API key to view payments.</p>
+        <p class="muted" data-i18n="gate.intro">
+          Sign in with a merchant API key to view payments.
+        </p>
         <label for="api-key" data-i18n="gate.apiKey">API key</label>
         <input
           id="api-key"
@@ -126,7 +125,15 @@
           spellcheck="false"
           required
         />
-        <button id="api-key-toggle" type="button" class="ghost" aria-pressed="false" aria-controls="api-key">Show</button>
+        <button
+          id="api-key-toggle"
+          type="button"
+          class="ghost"
+          aria-pressed="false"
+          aria-controls="api-key"
+        >
+          Show
+        </button>
         <label class="checkbox">
           <input id="remember" type="checkbox" />
           <span data-i18n="gate.remember">Keep me signed in on this device</span>
@@ -134,8 +141,8 @@
         <button type="submit" class="primary" data-i18n="gate.signIn">Sign in</button>
         <p id="gate-error" class="error" role="alert" hidden></p>
         <p class="muted small" data-i18n="gate.notice">
-          The key is held in your browser only and sent as a bearer token
-          directly to this gateway. It is never stored on the server.
+          The key is held in your browser only and sent as a bearer token directly to this gateway.
+          It is never stored on the server.
         </p>
       </form>
     </section>
@@ -234,9 +241,16 @@
         </div>
         <div class="topbar-right">
           <span id="session-expiry" class="muted small"></span>
-          <span id="health" class="pill pill-idle" title="Gateway health"
-            data-i18n="health.checking" data-i18n-title="health.title">
-            <svg class="status-glyph" aria-hidden="true" focusable="false"><use href="#status-glyph-idle" /></svg>
+          <span
+            id="health"
+            class="pill pill-idle"
+            title="Gateway health"
+            data-i18n="health.checking"
+            data-i18n-title="health.title"
+          >
+            <svg class="status-glyph" aria-hidden="true" focusable="false">
+              <use href="#status-glyph-idle" />
+            </svg>
             <span class="pill-text">checking&hellip;</span>
           </span>
           <label class="visually-hidden" for="language" data-i18n="nav.language">Language</label>
@@ -271,39 +285,79 @@
               autocomplete="off"
               spellcheck="false"
             />
-            <button
-              id="search-clear"
-              class="ghost"
-              type="button"
-              aria-label="Clear search"
-              hidden
-            >
+            <button id="search-clear" class="ghost" type="button" aria-label="Clear search" hidden>
               &times;
             </button>
           </div>
-          <div class="filters" role="group" aria-label="Filter by status"
-            data-i18n-aria-label="filter.label">
-            <button class="chip chip-on" data-status="" data-label="All" aria-pressed="true" data-i18n="filter.all">All</button>
-            <button class="chip" data-status="pending" data-label="Pending" aria-pressed="false" data-i18n="filter.pending">
-              <svg class="status-glyph" aria-hidden="true" focusable="false"><use href="#status-glyph-pending" /></svg>
+          <div
+            class="filters"
+            role="group"
+            aria-label="Filter by status"
+            data-i18n-aria-label="filter.label"
+          >
+            <button
+              class="chip chip-on"
+              data-status=""
+              data-label="All"
+              aria-pressed="true"
+              data-i18n="filter.all"
+            >
+              All
+            </button>
+            <button
+              class="chip"
+              data-status="pending"
+              data-label="Pending"
+              aria-pressed="false"
+              data-i18n="filter.pending"
+            >
+              <svg class="status-glyph" aria-hidden="true" focusable="false">
+                <use href="#status-glyph-pending" />
+              </svg>
               <span class="pill-text">Pending</span>
             </button>
-            <button class="chip" data-status="completed" data-label="Completed" aria-pressed="false" data-i18n="filter.completed">
-              <svg class="status-glyph" aria-hidden="true" focusable="false"><use href="#status-glyph-completed" /></svg>
+            <button
+              class="chip"
+              data-status="completed"
+              data-label="Completed"
+              aria-pressed="false"
+              data-i18n="filter.completed"
+            >
+              <svg class="status-glyph" aria-hidden="true" focusable="false">
+                <use href="#status-glyph-completed" />
+              </svg>
               <span class="pill-text">Completed</span>
             </button>
-            <button class="chip" data-status="underpaid" data-label="Underpaid" aria-pressed="false" data-i18n="filter.underpaid">
-              <svg class="status-glyph" aria-hidden="true" focusable="false"><use href="#status-glyph-underpaid" /></svg>
+            <button
+              class="chip"
+              data-status="underpaid"
+              data-label="Underpaid"
+              aria-pressed="false"
+              data-i18n="filter.underpaid"
+            >
+              <svg class="status-glyph" aria-hidden="true" focusable="false">
+                <use href="#status-glyph-underpaid" />
+              </svg>
               <span class="pill-text">Underpaid</span>
             </button>
-            <button class="chip" data-status="expired" data-label="Expired" aria-pressed="false" data-i18n="filter.expired">
-              <svg class="status-glyph" aria-hidden="true" focusable="false"><use href="#status-glyph-expired" /></svg>
+            <button
+              class="chip"
+              data-status="expired"
+              data-label="Expired"
+              aria-pressed="false"
+              data-i18n="filter.expired"
+            >
+              <svg class="status-glyph" aria-hidden="true" focusable="false">
+                <use href="#status-glyph-expired" />
+              </svg>
               <span class="pill-text">Expired</span>
             </button>
           </div>
           <div class="filters" role="group" aria-label="Filter by asset">
             <label class="small" for="asset-filter">Asset</label>
-            <select id="asset-filter"><option value="">All assets</option></select>
+            <select id="asset-filter">
+              <option value="">All assets</option>
+            </select>
           </div>
           <button id="clear-filters" class="ghost" type="button" hidden>Clear filters</button>
           <div class="filters" role="group" aria-label="Filter by creation date">
@@ -311,15 +365,33 @@
             <input id="created-after" type="date" />
             <label class="small" for="created-before">To</label>
             <input id="created-before" type="date" />
-            <button class="ghost preset" type="button" data-days="1" aria-pressed="false">Today</button>
-            <button class="ghost preset" type="button" data-days="7" aria-pressed="false">Last 7 days</button>
-            <button class="ghost preset" type="button" data-days="30" aria-pressed="false">Last 30 days</button>
+            <button class="ghost preset" type="button" data-days="1" aria-pressed="false">
+              Today
+            </button>
+            <button class="ghost preset" type="button" data-days="7" aria-pressed="false">
+              Last 7 days
+            </button>
+            <button class="ghost preset" type="button" data-days="30" aria-pressed="false">
+              Last 30 days
+            </button>
           </div>
           <div class="filters" role="group" aria-label="Filter by amount">
             <label class="small" for="min-amount">Min amount</label>
-            <input id="min-amount" type="text" inputmode="decimal" autocomplete="off" placeholder="0" />
+            <input
+              id="min-amount"
+              type="text"
+              inputmode="decimal"
+              autocomplete="off"
+              placeholder="0"
+            />
             <label class="small" for="max-amount">Max amount</label>
-            <input id="max-amount" type="text" inputmode="decimal" autocomplete="off" placeholder="any" />
+            <input
+              id="max-amount"
+              type="text"
+              inputmode="decimal"
+              autocomplete="off"
+              placeholder="any"
+            />
             <span id="amount-filter-note" class="muted small" hidden>Filters loaded rows only</span>
           </div>
           <label class="small checkbox" for="auto-refresh">
@@ -355,7 +427,13 @@
             >
               Columns
             </button>
-            <div id="columns-menu" class="columns-menu" role="group" aria-label="Visible columns" hidden>
+            <div
+              id="columns-menu"
+              class="columns-menu"
+              role="group"
+              aria-label="Visible columns"
+              hidden
+            >
               <label class="checkbox small">
                 <input type="checkbox" data-column-toggle="status" checked disabled />
                 <span>Status</span>
@@ -404,7 +482,12 @@
         <div id="status-breakdown-bar" aria-label="Payment status breakdown" hidden></div>
         <section id="asset-totals" class="summary" aria-label="Completed total per asset"></section>
         <!-- #791: payment volume chart. Rendered by renderVolumeChart(). -->
-        <section id="volume-chart" class="card volume-chart-card" aria-label="Payment volume over time" hidden></section>
+        <section
+          id="volume-chart"
+          class="card volume-chart-card"
+          aria-label="Payment volume over time"
+          hidden
+        ></section>
         <div id="idle-warning" class="card" role="alertdialog" aria-live="assertive" hidden>
           <span>You will be signed out in 60 seconds due to inactivity.</span>
           <button id="idle-stay" type="button" class="primary">Stay signed in</button>
@@ -458,8 +541,8 @@
           >
             <h3 id="key-reveal-title">New API key</h3>
             <p class="error" role="alert">
-              This key is shown only once. Copy it now and store it securely.
-              It cannot be retrieved again.
+              This key is shown only once. Copy it now and store it securely. It cannot be retrieved
+              again.
             </p>
             <div class="key-reveal-value">
               <code id="key-reveal-value" class="key-value" aria-label="New API key"></code>
@@ -473,29 +556,36 @@
 
         <section class="card table-card">
           <div class="table-scroll">
-          <table id="payments" class="payments" tabindex="-1" aria-label="Payments">
-            <caption id="payments-caption" class="visually-hidden">Payments: all statuses</caption>
-            <thead>
-              <tr>
-                <th scope="col" class="select-col">
-                  <input id="select-all" type="checkbox" aria-label="Select all loaded payments" />
-                </th>
-                <th scope="col">Status</th>
-                <th scope="col">Amount</th>
-                <th scope="col">Memo</th>
-                <th scope="col">Created</th>
-                <th scope="col">Payment ID</th>
-              </tr>
-            </thead>
-            <tbody id="rows"></tbody>
-          </table>
-          <p id="empty" class="empty" hidden>No payments match this filter.</p>
-          <p id="list-error" class="error" hidden></p>
-          <!-- Announces the j/k highlight. Without it the row selection is a
+            <table id="payments" class="payments" tabindex="-1" aria-label="Payments">
+              <caption id="payments-caption" class="visually-hidden">
+                Payments: all statuses
+              </caption>
+              <thead>
+                <tr>
+                  <th scope="col" class="select-col">
+                    <input
+                      id="select-all"
+                      type="checkbox"
+                      aria-label="Select all loaded payments"
+                    />
+                  </th>
+                  <th scope="col">Status</th>
+                  <th scope="col">Amount</th>
+                  <th scope="col">Memo</th>
+                  <th scope="col">Created</th>
+                  <th scope="col">Payment ID</th>
+                </tr>
+              </thead>
+              <tbody id="rows"></tbody>
+            </table>
+            <p id="empty" class="empty" hidden>No payments match this filter.</p>
+            <p id="list-error" class="error" hidden></p>
+            <!-- Announces the j/k highlight. Without it the row selection is a
                purely visual change that a screen-reader user cannot perceive. -->
-          <p id="rows-status" class="muted small" role="status" aria-live="polite"></p>
-          <div class="table-foot">
-            <button id="load-more" class="ghost" hidden>Load more</button>
+            <p id="rows-status" class="muted small" role="status" aria-live="polite"></p>
+            <div class="table-foot">
+              <button id="load-more" class="ghost" hidden>Load more</button>
+            </div>
           </div>
         </section>
       </main>
@@ -515,40 +605,60 @@
 
            The explicit Tab trap from #714 stays: a modal dialog does not wrap
            Tab at the ends in any current browser. -->
-      <dialog
-        id="detail"
-        class="detail"
-        aria-modal="true"
-        aria-labelledby="detail-title"
-      >
+      <dialog id="detail" class="detail" aria-modal="true" aria-labelledby="detail-title">
         <div class="detail-head">
           <h2 id="detail-title">Payment</h2>
-          <button id="detail-prev" type="button" class="ghost" aria-label="Previous payment (k)" title="Previous (k)">&larr; Prev</button>
-          <button id="detail-next" type="button" class="ghost" aria-label="Next payment (j)" title="Next (j)">Next &rarr;</button>
+          <button
+            id="detail-prev"
+            type="button"
+            class="ghost"
+            aria-label="Previous payment (k)"
+            title="Previous (k)"
+          >
+            &larr; Prev
+          </button>
+          <button
+            id="detail-next"
+            type="button"
+            class="ghost"
+            aria-label="Next payment (j)"
+            title="Next (j)"
+          >
+            Next &rarr;
+          </button>
           <button id="detail-close" class="ghost" aria-label="Close">&times;</button>
         </div>
         <button id="invoice-print" type="button" class="primary" disabled>Print invoice</button>
-        <button id="detail-notify" type="button" class="ghost" hidden>Notify me when this completes</button>
-          <section id="payment-invoice" aria-label="Payment invoice" hidden>
-            <h2>Payment invoice</h2>
-            <dl id="invoice-fields" class="fields"></dl>
-            <div id="invoice-qr" aria-hidden="true"></div>
-            <p id="invoice-uri" class="mono"></p>
-          </section>
-          <section id="detail-shortfall" aria-label="Underpayment" hidden>
-            <h3>Underpaid</h3>
-            <dl id="shortfall-fields" class="fields"></dl>
-            <p class="muted small">Payments sent as several operations are summed; see
-              <a href="https://github.com/StellarGateLabs/StellarGate/blob/main/WEBHOOK_REFERENCE.md" target="_blank" rel="noopener noreferrer">the multi-op credit behaviour</a>.</p>
-          </section>
-          <dl id="detail-fields" class="fields"></dl>
-          <h3>Timeline</h3>
-          <ol id="detail-timeline" class="timeline"></ol>
-          <details id="detail-raw" class="raw-json">
-            <summary>View raw JSON</summary>
-            <button id="detail-raw-copy" type="button" class="ghost copy">Copy</button>
-            <pre id="detail-raw-body" class="mono"></pre>
-          </details>
+        <button id="detail-notify" type="button" class="ghost" hidden>
+          Notify me when this completes
+        </button>
+        <section id="payment-invoice" aria-label="Payment invoice" hidden>
+          <h2>Payment invoice</h2>
+          <dl id="invoice-fields" class="fields"></dl>
+          <div id="invoice-qr" aria-hidden="true"></div>
+          <p id="invoice-uri" class="mono"></p>
+        </section>
+        <section id="detail-shortfall" aria-label="Underpayment" hidden>
+          <h3>Underpaid</h3>
+          <dl id="shortfall-fields" class="fields"></dl>
+          <p class="muted small">
+            Payments sent as several operations are summed; see
+            <a
+              href="https://github.com/StellarGateLabs/StellarGate/blob/main/WEBHOOK_REFERENCE.md"
+              target="_blank"
+              rel="noopener noreferrer"
+              >the multi-op credit behaviour</a
+            >.
+          </p>
+        </section>
+        <dl id="detail-fields" class="fields"></dl>
+        <h3>Timeline</h3>
+        <ol id="detail-timeline" class="timeline"></ol>
+        <details id="detail-raw" class="raw-json">
+          <summary>View raw JSON</summary>
+          <button id="detail-raw-copy" type="button" class="ghost copy">Copy</button>
+          <pre id="detail-raw-body" class="mono"></pre>
+        </details>
 
         <h3>Webhook deliveries</h3>
         <p id="deliveries-empty" class="muted small" hidden>
@@ -564,14 +674,7 @@
          cannot exist without appearing here and cannot be documented with the
          wrong key. Rendered as a dialog so it is announced as one, and kept out
          of #app so it is reachable from anywhere the app is. -->
-    <div
-      id="help"
-      class="help"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="help-title"
-      hidden
-    >
+    <div id="help" class="help" role="dialog" aria-modal="true" aria-labelledby="help-title" hidden>
       <div class="help-panel card">
         <div class="detail-head">
           <h2 id="help-title">Keyboard shortcuts</h2>
@@ -618,7 +721,9 @@
             <option value="XLM" selected>XLM (native)</option>
             <option value="USDC">USDC</option>
           </select>
-          <label class="field-label" for="create-webhook">Webhook URL <span class="muted small">(optional)</span></label>
+          <label class="field-label" for="create-webhook"
+            >Webhook URL <span class="muted small">(optional)</span></label
+          >
           <input
             id="create-webhook"
             name="webhook_url"
@@ -689,21 +794,59 @@
     <svg class="status-sprite" aria-hidden="true" focusable="false" width="0" height="0">
       <symbol id="status-glyph-pending" viewBox="0 0 16 16">
         <circle cx="8" cy="8" r="6.5" fill="none" stroke="currentColor" stroke-width="1.5" />
-        <path d="M8 4.5V8l2.5 1.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+        <path
+          d="M8 4.5V8l2.5 1.5"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.5"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
       </symbol>
       <symbol id="status-glyph-completed" viewBox="0 0 16 16">
-        <path d="M3 8.5l3.5 3.5L13 4.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+        <path
+          d="M3 8.5l3.5 3.5L13 4.5"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
       </symbol>
       <symbol id="status-glyph-underpaid" viewBox="0 0 16 16">
-        <path d="M8 2.5L14.5 13.5H1.5z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
-        <path d="M8 6.5v3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+        <path
+          d="M8 2.5L14.5 13.5H1.5z"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.5"
+          stroke-linejoin="round"
+        />
+        <path
+          d="M8 6.5v3"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.5"
+          stroke-linecap="round"
+        />
         <circle cx="8" cy="11.5" r="0.9" fill="currentColor" />
       </symbol>
       <symbol id="status-glyph-expired" viewBox="0 0 16 16">
-        <path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+        <path
+          d="M4 4l8 8M12 4l-8 8"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+        />
       </symbol>
       <symbol id="status-glyph-idle" viewBox="0 0 16 16">
-        <path d="M3.5 8h9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+        <path
+          d="M3.5 8h9"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+        />
       </symbol>
     </svg>
 

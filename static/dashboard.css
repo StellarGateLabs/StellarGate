@@ -313,7 +313,13 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
+  font:
+    15px/1.5 system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    Helvetica,
+    Arial,
     sans-serif;
 }
 
@@ -1052,12 +1058,24 @@ kbd {
 
 /* Widths for each column skeleton — keeps the placeholder proportions
    plausible without showing real data. */
-.skeleton-row .sk-status  { width: 5rem; }
-.skeleton-row .sk-amount  { width: 6rem; }
-.skeleton-row .sk-memo    { width: 7rem; }
-.skeleton-row .sk-date    { width: 9rem; }
-.skeleton-row .sk-id      { width: 8rem; }
-.skeleton-row .sk-select  { width: 1rem; }
+.skeleton-row .sk-status {
+  width: 5rem;
+}
+.skeleton-row .sk-amount {
+  width: 6rem;
+}
+.skeleton-row .sk-memo {
+  width: 7rem;
+}
+.skeleton-row .sk-date {
+  width: 9rem;
+}
+.skeleton-row .sk-id {
+  width: 8rem;
+}
+.skeleton-row .sk-select {
+  width: 1rem;
+}
 
 /* Detail panel skeleton blocks */
 .skeleton-field {
@@ -1066,15 +1084,25 @@ kbd {
   background: var(--skeleton-base);
   display: block;
 }
-.skeleton-field-short { width: 60%; }
-.skeleton-field-long  { width: 90%; }
-.skeleton-field-full  { width: 100%; }
+.skeleton-field-short {
+  width: 60%;
+}
+.skeleton-field-long {
+  width: 90%;
+}
+.skeleton-field-full {
+  width: 100%;
+}
 
 /* #719 + #722: shimmer animation is gated behind the no-preference query
    so users who opted into reduced motion see a static skeleton instead. */
 @keyframes skeleton-shimmer {
-  0%   { background-position: -400px 0; }
-  100% { background-position:  400px 0; }
+  0% {
+    background-position: -400px 0;
+  }
+  100% {
+    background-position: 400px 0;
+  }
 }
 
 @media (prefers-reduced-motion: no-preference) {
@@ -1082,9 +1110,9 @@ kbd {
   .skeleton-field {
     background: linear-gradient(
       90deg,
-      var(--skeleton-base)  25%,
+      var(--skeleton-base) 25%,
       var(--skeleton-shine) 50%,
-      var(--skeleton-base)  75%
+      var(--skeleton-base) 75%
     );
     background-size: 800px 100%;
     animation: skeleton-shimmer 1.6s ease-in-out infinite;
@@ -1540,46 +1568,130 @@ dialog::backdrop {
 }
 
 /* #765: print only the loaded invoice, including the payment QR. */
-#payment-invoice { margin-block: 1rem; }
-#invoice-uri, #payment-invoice dd { overflow-wrap: anywhere; white-space: normal; min-width: 0; }
-#invoice-qr svg { width: 220px; max-width: 100%; height: auto; }
+#payment-invoice {
+  margin-block: 1rem;
+}
+#invoice-uri,
+#payment-invoice dd {
+  overflow-wrap: anywhere;
+  white-space: normal;
+  min-width: 0;
+}
+#invoice-qr svg {
+  width: 220px;
+  max-width: 100%;
+  height: auto;
+}
 @media print {
-  @page { margin: 15mm; }
-  html, body { background: white !important; color: black !important; }
-  body > :not(#app), #app > :not(#detail),
-  #detail > :not(#payment-invoice) { display: none !important; }
-  #app, main { display: block !important; margin: 0 !important; padding: 0 !important; }
-  #detail[open] {
-    position: static !important; display: block !important; inset: auto !important;
-    width: 100% !important; max-width: none !important; height: auto !important;
-    max-height: none !important; margin: 0 !important; padding: 0 !important;
-    overflow: visible !important; border: 0 !important; border-radius: 0 !important; box-shadow: none !important;
-    background: white !important; color: black !important;
+  @page {
+    margin: 15mm;
   }
-  #detail::backdrop { display: none !important; background: transparent !important; opacity: 0 !important; }
-  #payment-invoice[hidden] { display: none !important; }
-  #payment-invoice:not([hidden]) { display: block !important; }
-  #payment-invoice .fields { display: grid; grid-template-columns: 7rem minmax(0, 1fr); }
-  #payment-invoice, #payment-invoice * { color: black !important; }
-  #invoice-qr { break-inside: avoid; }
+  html,
+  body {
+    background: white !important;
+    color: black !important;
+  }
+  body > :not(#app),
+  #app > :not(#detail),
+  #detail > :not(#payment-invoice) {
+    display: none !important;
+  }
+  #app,
+  main {
+    display: block !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+  #detail[open] {
+    position: static !important;
+    display: block !important;
+    inset: auto !important;
+    width: 100% !important;
+    max-width: none !important;
+    height: auto !important;
+    max-height: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: visible !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    background: white !important;
+    color: black !important;
+  }
+  #detail::backdrop {
+    display: none !important;
+    background: transparent !important;
+    opacity: 0 !important;
+  }
+  #payment-invoice[hidden] {
+    display: none !important;
+  }
+  #payment-invoice:not([hidden]) {
+    display: block !important;
+  }
+  #payment-invoice .fields {
+    display: grid;
+    grid-template-columns: 7rem minmax(0, 1fr);
+  }
+  #payment-invoice,
+  #payment-invoice * {
+    color: black !important;
+  }
+  #invoice-qr {
+    break-inside: avoid;
+  }
 }
 
 /* #781: briefly highlight rows that arrived in the latest refresh. */
-tr.row-new { background: color-mix(in srgb, var(--accent, #3b82f6) 18%, transparent); }
+tr.row-new {
+  background: color-mix(in srgb, var(--accent, #3b82f6) 18%, transparent);
+}
 @media (prefers-reduced-motion: no-preference) {
-  tr.row-new { animation: row-new-fade 4s ease-out; }
+  tr.row-new {
+    animation: row-new-fade 4s ease-out;
+  }
 }
 @keyframes row-new-fade {
-  from { background: color-mix(in srgb, var(--accent, #3b82f6) 35%, transparent); }
+  from {
+    background: color-mix(in srgb, var(--accent, #3b82f6) 35%, transparent);
+  }
 }
 
 /* Detail drawer: timeline, shortfall, raw JSON, prev/next (#785-#788) */
-.timeline { list-style: none; margin: 0 0 1rem; padding-inline-start: 1rem; border-inline-start: 2px solid var(--border, #ccc); }
-.timeline li { position: relative; padding: 0.25rem 0 0.5rem 0.5rem; }
-.timeline li::before { content: ""; position: absolute; inset-inline-start: -1.4rem; top: 0.6rem; width: 0.6rem; height: 0.6rem; border-radius: 50%; background: currentColor; }
-.timeline li.timeline-failed { color: #b00020; font-weight: 600; }
-.raw-json pre { max-width: 100%; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
-#detail-shortfall { margin-block-end: 1rem; }
+.timeline {
+  list-style: none;
+  margin: 0 0 1rem;
+  padding-inline-start: 1rem;
+  border-inline-start: 2px solid var(--border, #ccc);
+}
+.timeline li {
+  position: relative;
+  padding: 0.25rem 0 0.5rem 0.5rem;
+}
+.timeline li::before {
+  content: "";
+  position: absolute;
+  inset-inline-start: -1.4rem;
+  top: 0.6rem;
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  background: currentColor;
+}
+.timeline li.timeline-failed {
+  color: #b00020;
+  font-weight: 600;
+}
+.raw-json pre {
+  max-width: 100%;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+#detail-shortfall {
+  margin-block-end: 1rem;
+}
 
 /* ── #789: Grouped webhook delivery attempts ───────────────────────────────
  *
@@ -1680,7 +1792,9 @@ tr.row-new { background: color-mix(in srgb, var(--accent, #3b82f6) 18%, transpar
   white-space: nowrap;
   transition: filter 0.1s;
 }
-.breakdown-seg:hover { filter: brightness(0.92); }
+.breakdown-seg:hover {
+  filter: brightness(0.92);
+}
 .breakdown-seg:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: -2px;
@@ -1691,15 +1805,32 @@ tr.row-new { background: color-mix(in srgb, var(--accent, #3b82f6) 18%, transpar
   text-overflow: ellipsis;
 }
 
-.breakdown-seg-pending   { background: var(--warn-bg); color: var(--warn); }
-.breakdown-seg-completed { background: var(--ok-bg);   color: var(--ok); }
-.breakdown-seg-underpaid { background: var(--warn-bg); color: var(--warn); }
-.breakdown-seg-expired   { background: var(--idle-bg); color: var(--idle); }
+.breakdown-seg-pending {
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+.breakdown-seg-completed {
+  background: var(--ok-bg);
+  color: var(--ok);
+}
+.breakdown-seg-underpaid {
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+.breakdown-seg-expired {
+  background: var(--idle-bg);
+  color: var(--idle);
+}
 
 /* Accessible fallback table (visually hidden, read by AT). */
-.breakdown-table { border-collapse: collapse; }
+.breakdown-table {
+  border-collapse: collapse;
+}
 .breakdown-table th,
-.breakdown-table td { padding: 0.25rem 0.5rem; text-align: start; }
+.breakdown-table td {
+  padding: 0.25rem 0.5rem;
+  text-align: start;
+}
 
 @media (forced-colors: active) {
   .breakdown-seg {
@@ -1745,6 +1876,11 @@ tr.row-new { background: color-mix(in srgb, var(--accent, #3b82f6) 18%, transpar
 }
 
 /* Accessible fallback table (visually hidden). */
-.volume-table { border-collapse: collapse; }
+.volume-table {
+  border-collapse: collapse;
+}
 .volume-table th,
-.volume-table td { padding: 0.2rem 0.5rem; text-align: start; }
+.volume-table td {
+  padding: 0.2rem 0.5rem;
+  text-align: start;
+}
